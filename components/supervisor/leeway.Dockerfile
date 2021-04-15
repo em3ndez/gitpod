@@ -14,5 +14,6 @@ COPY components-supervisor--app/supervisor /.supervisor/supervisor
 COPY supervisor-config.json /.supervisor/supervisor-config.json
 COPY components-workspacekit--app/workspacekit /.supervisor/workspacekit
 COPY components-workspacekit--fuse-overlayfs/fuse-overlayfs /.supervisor/fuse-overlayfs
+COPY components-supervisor--dropbear/dropbear /.supervisor/dropbear
 
 ENTRYPOINT ["/.supervisor/supervisor"]
