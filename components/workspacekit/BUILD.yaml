@@ -14,12 +14,7 @@ packages:
       - ["sh", "-c", "pkg-config --atleast-version=2.5.0 libseccomp || (echo \"requires libseccomp > 2.5.0\"; exit 1)"]
     config:
       packaging: app
-      buildCommand: ["go", "build", "-ldflags", "-w -extldflags \"-static\""]
-  - name: fuse-overlayfs
-    type: generic
-    config:
-      commands:
-        - ["sh", "-c", "curl -o fuse-overlayfs -L https://github.com/containers/fuse-overlayfs/releases/download/v1.7.1/fuse-overlayfs-x86_64 && chmod +x fuse-overlayfs"]
+      buildCommand: ["go", "build", "-ldflags", "-w -extldflags \"-static\" -X 'github.com/gitpod-io/gitpod/workspacekit/cmd.Version=commit-${__git_commit}'"]
   - name: lib
     type: go
     srcs:
@@ -34,3 +29,18 @@ packages:
     config:
       packaging: library
       dontTest: true
+  - name: docker
+    type: docker
+    deps:
+      - :app
+    argdeps:
+      - imageRepoBase
+    config:
+      buildArgs:
+        VERSION: ${version}
+      dockerfile: leeway.Dockerfile
+      metadata:
+        helm-component: workspace.workspacekit
+      image:
+        - ${imageRepoBase}/workspacekit:${version}
+        - ${imageRepoBase}/workspacekit:commit-${__git_commit}

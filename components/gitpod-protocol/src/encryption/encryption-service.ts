@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { injectable, inject } from "inversify";
@@ -9,12 +9,11 @@ import { injectable, inject } from "inversify";
 import { EncryptedData, EncryptionEngine } from "./encryption-engine";
 import { KeyProvider, KeyMetadata } from "./key-provider";
 
-
 export interface Encrypted<_T> extends EncryptedData {
-    keyMetadata: KeyMetadata
+    keyMetadata: KeyMetadata;
 }
 
-export const EncryptionService = Symbol('EncryptionService');
+export const EncryptionService = Symbol("EncryptionService");
 export interface EncryptionService {
     encrypt<T>(data: T): Encrypted<T>;
     decrypt<T>(encrypted: Encrypted<T>): T;
@@ -32,7 +31,7 @@ export class EncryptionServiceImpl implements EncryptionService {
         const encryptedData = this.engine.encrypt(dataStr, key.material);
         return {
             ...encryptedData,
-            keyMetadata: key.metadata
+            keyMetadata: key.metadata,
         };
     }
 
@@ -49,4 +48,13 @@ export class EncryptionServiceImpl implements EncryptionService {
     protected deserialize<T>(data: string): T {
         return JSON.parse(data) as T;
     }
+}
+
+/** HACK ahead: Some entities - namely DBTokenEntry for now - need access to an EncryptionService so we publish it here */
+export namespace GlobalEncryptionService {
+    export let encryptionService: EncryptionService;
+}
+
+export function getGlobalEncryptionService() {
+    return GlobalEncryptionService.encryptionService;
 }

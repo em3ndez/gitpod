@@ -1,11 +1,16 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package proxy
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -16,12 +21,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitpod-io/golang-crypto/ssh"
 	"github.com/google/go-cmp/cmp"
 	"github.com/sirupsen/logrus"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/util"
+	server_lib "github.com/gitpod-io/gitpod/server/go/pkg/lib"
 	"github.com/gitpod-io/gitpod/ws-manager/api"
+	"github.com/gitpod-io/gitpod/ws-proxy/pkg/common"
+	"github.com/gitpod-io/gitpod/ws-proxy/pkg/sshproxy"
 )
 
 const (
@@ -31,29 +40,34 @@ const (
 )
 
 var (
-	workspaces = []WorkspaceInfo{
+	debugWorkspaceURL = "https://debug-amaranth-smelt-9ba20cc1.test-domain.com/"
+	workspaces        = []common.WorkspaceInfo{
 		{
-			IDEImage: "gitpod-io/ide:latest",
+			IDEImage:        "gitpod-io/ide:latest",
+			SupervisorImage: "gitpod-io/supervisor:latest",
 			Auth: &api.WorkspaceAuthentication{
 				Admission:  api.AdmissionLevel_ADMIT_OWNER_ONLY,
 				OwnerToken: "owner-token",
 			},
 			IDEPublicPort: "23000",
 			InstanceID:    "1943c611-a014-4f4d-bf5d-14ccf0123c60",
-			Ports: []PortInfo{
-				{PortSpec: api.PortSpec{Port: 28080, Target: 38080, Url: "https://28080-amaranth-smelt-9ba20cc1.test-domain.com/", Visibility: api.PortVisibility_PORT_VISIBILITY_PUBLIC}},
+			Ports: []*api.PortSpec{
+				{Port: 28080, Url: "https://28080-amaranth-smelt-9ba20cc1.test-domain.com/", Visibility: api.PortVisibility_PORT_VISIBILITY_PUBLIC},
 			},
 			URL:         "https://amaranth-smelt-9ba20cc1.test-domain.com/",
 			WorkspaceID: "amaranth-smelt-9ba20cc1",
 		},
 	}
 
-	ideServerHost  = "localhost:20000"
-	workspacePort  = uint16(20001)
-	supervisorPort = uint16(20002)
-	workspaceHost  = fmt.Sprintf("localhost:%d", workspacePort)
-	portServeHost  = fmt.Sprintf("localhost:%d", workspaces[0].Ports[0].Port)
-	blobServeHost  = "localhost:20003"
+	ideServerHost           = "localhost:20000"
+	workspacePort           = uint16(20001)
+	supervisorPort          = uint16(20002)
+	workspaceDebugPort      = uint16(20004)
+	supervisorDebugPort     = uint16(20005)
+	debugWorkspaceProxyPort = uint16(20006)
+	workspaceHost           = fmt.Sprintf("localhost:%d", workspacePort)
+	portServeHost           = fmt.Sprintf("localhost:%d", workspaces[0].Ports[0].Port)
+	blobServeHost           = "localhost:20003"
 
 	config = Config{
 		TransportConfig: &TransportConfig{
@@ -72,11 +86,11 @@ var (
 			Scheme: "http",
 		},
 		WorkspacePodConfig: &WorkspacePodConfig{
-			ServiceTemplate:     "http://localhost:{{ .port }}",
-			PortServiceTemplate: "http://localhost:{{ .port }}",
-			TheiaPort:           workspacePort,
-			SupervisorPort:      supervisorPort,
-			SupervisorImage:     "gitpod-io/supervisor:latest",
+			TheiaPort:               workspacePort,
+			SupervisorPort:          supervisorPort,
+			IDEDebugPort:            workspaceDebugPort,
+			SupervisorDebugPort:     supervisorDebugPort,
+			DebugWorkspaceProxyPort: debugWorkspaceProxyPort,
 		},
 		BuiltinPages: BuiltinPagesConfig{
 			Location: "../../public",
@@ -88,6 +102,7 @@ type Target struct {
 	Status  int
 	Handler func(w http.ResponseWriter, r *http.Request, requestCount uint8)
 }
+
 type testTarget struct {
 	Target       *Target
 	RequestCount uint8
@@ -96,12 +111,14 @@ type testTarget struct {
 }
 
 func (tt *testTarget) Close() {
-	tt.listener.Close()
-	tt.server.Shutdown(context.Background())
+	_ = tt.listener.Close()
+	_ = tt.server.Shutdown(context.Background())
 }
 
-// startTestTarget starts a new HTTP server that serves as some test target during the unit tests
-func startTestTarget(t *testing.T, host, name string) *testTarget {
+// startTestTarget starts a new HTTP server that serves as some test target during the unit tests.
+func startTestTarget(t *testing.T, host, name string, checkedHost bool) *testTarget {
+	t.Helper()
+
 	l, err := net.Listen("tcp", host)
 	if err != nil {
 		t.Fatalf("cannot start fake IDE host: %q", err)
@@ -127,10 +144,9 @@ func startTestTarget(t *testing.T, host, name string) *testTarget {
 			w.WriteHeader(http.StatusOK)
 			format := "%s hit: %s\n"
 			args := []interface{}{name, r.URL.String()}
-			readonly := r.Header.Get("X-BlobServe-ReadOnly")
-			if readonly != "" {
-				format += "readOnly: %s\n"
-				args = append(args, readonly)
+			if checkedHost {
+				format += "host: %s\n"
+				args = append(args, r.Host)
 			}
 			inlineVars := r.Header.Get("X-BlobServe-InlineVars")
 			if inlineVars != "" {
@@ -147,7 +163,7 @@ func startTestTarget(t *testing.T, host, name string) *testTarget {
 		}
 		w.WriteHeader(http.StatusOK)
 	})}
-	go srv.Serve(l)
+	go func() { _ = srv.Serve(l) }()
 	tt.server = srv
 
 	return tt
@@ -165,9 +181,9 @@ func addHostHeader(r *http.Request) {
 	r.Header.Add(hostBasedHeader, r.Host)
 }
 
-func addOwnerToken(instanceID, token string) requestModifier {
+func addOwnerToken(domain, instanceID, token string) requestModifier {
 	return func(r *http.Request) {
-		setOwnerTokenCookie(r, instanceID, token)
+		setOwnerTokenCookie(r, domain, instanceID, token)
 	}
 }
 
@@ -192,17 +208,21 @@ func TestRoutes(t *testing.T) {
 		Body   string
 	}
 	type Targets struct {
-		IDE        *Target
-		Blobserve  *Target
-		Workspace  *Target
-		Supervisor *Target
-		Port       *Target
+		IDE                 *Target
+		Blobserve           *Target
+		Workspace           *Target
+		DebugWorkspace      *Target
+		Supervisor          *Target
+		DebugSupervisor     *Target
+		Port                *Target
+		DebugWorkspaceProxy *Target
 	}
+
+	domain := "test-domain.com"
 	tests := []struct {
 		Desc        string
 		Config      *Config
 		Request     *http.Request
-		Workspaces  []WorkspaceInfo
 		Router      RouterFactory
 		Targets     *Targets
 		IgnoreBody  bool
@@ -218,11 +238,22 @@ func TestRoutes(t *testing.T) {
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
 					"Location": {
-						"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/favicon.ico",
+						"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/favicon.ico",
 					},
 					"Vary": {"Accept-Encoding"},
 				},
-				Body: "<a href=\"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/favicon.ico\">See Other</a>.\n\n",
+				Body: "<a href=\"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/favicon.ico\">See Other</a>.\n\n",
+			},
+		},
+		{
+			Desc: "/health",
+			Request: modifyRequest(httptest.NewRequest("GET", "/health", nil),
+				addHostHeader,
+			),
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: nil,
+				Body:   "",
 			},
 		},
 		{
@@ -235,10 +266,10 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusSeeOther,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://blobserve.ws.test-domain.com/gitpod-io/ide:latest/__files__/"},
+					"Location":     {"https://ide.test-domain.com/blobserve/gitpod-io/ide:latest/__files__/"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: "<a href=\"https://blobserve.ws.test-domain.com/gitpod-io/ide:latest/__files__/\">See Other</a>.\n\n",
+				Body: "<a href=\"https://ide.test-domain.com/blobserve/gitpod-io/ide:latest/__files__/\">See Other</a>.\n\n",
 			},
 		},
 		{
@@ -251,11 +282,11 @@ func TestRoutes(t *testing.T) {
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
-					"Content-Length": {"218"},
+					"Content-Length": {"242"},
 					"Content-Type":   {"text/plain; charset=utf-8"},
 					"Vary":           {"Accept-Encoding"},
 				},
-				Body: "blobserve hit: /gitpod-io/ide:latest/\ninlineVars: {\"ide\":\"https://blobserve.ws.test-domain.com/gitpod-io/ide:latest/__files__\",\"supervisor\":\"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__\"}\n",
+				Body: "blobserve hit: /gitpod-io/ide:latest/\nhost: localhost:20003\ninlineVars: {\"ide\":\"https://ide.test-domain.com/blobserve/gitpod-io/ide:latest/__files__\",\"supervisor\":\"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__\"}\n",
 			},
 		},
 		{
@@ -268,11 +299,11 @@ func TestRoutes(t *testing.T) {
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
-					"Content-Length": {"218"},
+					"Content-Length": {"242"},
 					"Content-Type":   {"text/plain; charset=utf-8"},
 					"Vary":           {"Accept-Encoding"},
 				},
-				Body: "blobserve hit: /gitpod-io/ide:latest/\ninlineVars: {\"ide\":\"https://blobserve.ws.test-domain.com/gitpod-io/ide:latest/__files__\",\"supervisor\":\"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__\"}\n",
+				Body: "blobserve hit: /gitpod-io/ide:latest/\nhost: localhost:20003\ninlineVars: {\"ide\":\"https://ide.test-domain.com/blobserve/gitpod-io/ide:latest/__files__\",\"supervisor\":\"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__\"}\n",
 			},
 		},
 		{
@@ -280,7 +311,7 @@ func TestRoutes(t *testing.T) {
 			Config: &config,
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"?foobar", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}},
 			Expectation: Expectation{
@@ -298,7 +329,7 @@ func TestRoutes(t *testing.T) {
 			Config: &config,
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"not-from-blobserve", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}, Blobserve: &Target{Status: http.StatusNotFound}},
 			Expectation: Expectation{
@@ -316,7 +347,7 @@ func TestRoutes(t *testing.T) {
 			Config: &config,
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"not-from-failed-blobserve", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Targets: &Targets{Workspace: &Target{Status: http.StatusOK}, Blobserve: &Target{Status: http.StatusInternalServerError}},
 			Expectation: Expectation{
@@ -330,11 +361,100 @@ func TestRoutes(t *testing.T) {
 			},
 		},
 		{
-			Desc:   "CORS preflight",
+			Desc:   "blobserve foreign resource",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", "https://v--sr1o1nu24nqdf809l0u27jk5t7"+wsHostSuffix+"/image/__files__/test.html", nil),
+				addHostHeader,
+				addHeader("Sec-Fetch-Mode", "navigate"),
+			),
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: http.Header{
+					"Cache-Control":  {"public, max-age=31536000"},
+					"Content-Length": {"54"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
+				Body: "blobserve hit: /image/test.html\nhost: localhost:20003\n",
+			},
+		},
+		{
+			Desc:   "port foreign resource",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", "https://v--sr1o1nu24nqdf809l0u27jk5t7"+wsHostSuffix+"/28080-amaranth-smelt-9ba20cc1/test.html", nil),
+				addHostHeader,
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+			),
+			Targets: &Targets{
+				Port: &Target{
+					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+						fmt.Fprintf(w, "host: %s\n", r.Host)
+						fmt.Fprintf(w, "path: %s\n", r.URL.Path)
+					},
+				},
+			},
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": {"69"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
+				Body: "host: v--sr1o1nu24nqdf809l0u27jk5t7.test-domain.com\npath: /test.html\n",
+			},
+		},
+		{
+			Desc:   "debug foreign resource",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", "https://v--sr1o1nu24nqdf809l0u27jk5t7"+wsHostSuffix+"/debug-amaranth-smelt-9ba20cc1/test.html", nil),
+				addHostHeader,
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+			),
+			Targets: &Targets{
+				DebugWorkspace: &Target{
+					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+						fmt.Fprintf(w, "host: %s\n", r.Host)
+						fmt.Fprintf(w, "path: %s\n", r.URL.Path)
+					},
+				},
+			},
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": {"69"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
+				Body: "host: v--sr1o1nu24nqdf809l0u27jk5t7.test-domain.com\npath: /test.html\n",
+			},
+		},
+		{
+			Desc:   "port debug foreign resource",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", "https://v--sr1o1nu24nqdf809l0u27jk5t7"+wsHostSuffix+"/28080-debug-amaranth-smelt-9ba20cc1/test.html", nil),
+				addHostHeader,
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+			),
+			Targets: &Targets{
+				DebugWorkspaceProxy: &Target{
+					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+						fmt.Fprintf(w, "host: %s\n", r.Host)
+						fmt.Fprintf(w, "path: %s\n", r.URL.Path)
+					},
+				},
+			},
+			Expectation: Expectation{
+				Status: http.StatusOK,
+				Header: http.Header{
+					"Content-Length": {"69"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
+				Body: "host: v--sr1o1nu24nqdf809l0u27jk5t7.test-domain.com\npath: /test.html\n",
+			},
+		},
+		{
+			Desc:   "no CORS allow in workspace urls",
 			Config: &config,
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"somewhere/in/the/ide", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 				addHeader("Origin", config.GitpodInstallation.HostName),
 				addHeader("Access-Control-Request-Method", "OPTIONS"),
 			),
@@ -342,12 +462,9 @@ func TestRoutes(t *testing.T) {
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
-					"Access-Control-Allow-Credentials": {"true"},
-					"Access-Control-Allow-Origin":      {"test-domain.com"},
-					"Access-Control-Expose-Headers":    {"Authorization"},
-					"Content-Length":                   {"37"},
-					"Content-Type":                     {"text/plain; charset=utf-8"},
-					"Vary":                             {"Accept-Encoding"},
+					"Content-Length": {"37"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+					"Vary":           {"Accept-Encoding"},
 				},
 				Body: "workspace hit: /somewhere/in/the/ide\n",
 			},
@@ -393,7 +510,7 @@ func TestRoutes(t *testing.T) {
 			Desc: "authenticated supervisor API (content status)",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_supervisor/v1/status/content", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Expectation: Expectation{
 				Status: http.StatusOK,
@@ -408,16 +525,16 @@ func TestRoutes(t *testing.T) {
 			Desc: "non-existent authorized GET /",
 			Request: modifyRequest(httptest.NewRequest("GET", strings.ReplaceAll(workspaces[0].URL, "amaranth", "blabla"), nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Expectation: Expectation{
 				Status: http.StatusFound,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://test-domain.com/start/#blabla-smelt-9ba20cc1"},
+					"Location":     {"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: ("<a href=\"https://test-domain.com/start/#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
+				Body: ("<a href=\"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
 			},
 		},
 		{
@@ -429,10 +546,10 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusFound,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://test-domain.com/start/#blabla-smelt-9ba20cc1"},
+					"Location":     {"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: ("<a href=\"https://test-domain.com/start/#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
+				Body: ("<a href=\"https://test-domain.com/start/?not_found=true#blabla-smelt-9ba20cc1\">Found</a>.\n\n"),
 			},
 		},
 		{
@@ -444,11 +561,11 @@ func TestRoutes(t *testing.T) {
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
-					"Content-Length": {"60"},
+					"Content-Length": {"82"},
 					"Content-Type":   {"text/plain; charset=utf-8"},
 					"Vary":           {"Accept-Encoding"},
 				},
-				Body: "blobserve hit: /gitpod-io/supervisor:latest/worker-proxy.js\n",
+				Body: "blobserve hit: /gitpod-io/supervisor:latest/worker-proxy.js\nhost: localhost:20003\n",
 			},
 		},
 		{
@@ -461,10 +578,10 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusSeeOther,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/main.js"},
+					"Location":     {"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/main.js"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: "<a href=\"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/main.js\">See Other</a>.\n\n",
+				Body: "<a href=\"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/main.js\">See Other</a>.\n\n",
 			},
 		},
 		{
@@ -477,7 +594,7 @@ func TestRoutes(t *testing.T) {
 				Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
 					if requestCount == 0 {
 						w.WriteHeader(http.StatusServiceUnavailable)
-						io.WriteString(w, "timeout")
+						_, _ = io.WriteString(w, "timeout")
 						return
 					}
 					w.WriteHeader(http.StatusOK)
@@ -487,29 +604,55 @@ func TestRoutes(t *testing.T) {
 				Status: http.StatusSeeOther,
 				Header: http.Header{
 					"Content-Type": {"text/html; charset=utf-8"},
-					"Location":     {"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/main.js"},
+					"Location":     {"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/main.js"},
 					"Vary":         {"Accept-Encoding"},
 				},
-				Body: "<a href=\"https://blobserve.ws.test-domain.com/gitpod-io/supervisor:latest/__files__/main.js\">See Other</a>.\n\n",
+				Body: "<a href=\"https://ide.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/main.js\">See Other</a>.\n\n",
 			},
 		},
 		{
 			Desc: "port GET 404",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].Ports[0].Url+"this-does-not-exist", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
-			Targets: &Targets{Port: &Target{Status: http.StatusNotFound}},
+			Targets: &Targets{Port: &Target{
+				Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+					w.WriteHeader(http.StatusNotFound)
+					fmt.Fprintf(w, "host: %s\n", r.Host)
+				},
+			}},
 			Expectation: Expectation{
-				Header: http.Header{"Content-Length": {"0"}},
+				Header: http.Header{"Content-Length": {"52"}, "Content-Type": {"text/plain; charset=utf-8"}},
 				Status: http.StatusNotFound,
+				Body:   "host: 28080-amaranth-smelt-9ba20cc1.test-domain.com\n",
+			},
+		},
+		{
+			Desc: "debug port GET 404",
+			Request: modifyRequest(httptest.NewRequest("GET", "https://28080-debug-amaranth-smelt-9ba20cc1.test-domain.com/this-does-not-exist", nil),
+				addHostHeader,
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+			),
+			Targets: &Targets{
+				DebugWorkspaceProxy: &Target{
+					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+						w.WriteHeader(http.StatusNotFound)
+						fmt.Fprintf(w, "host: %s\n", r.Host)
+					},
+				},
+			},
+			Expectation: Expectation{
+				Header: http.Header{"Content-Length": {"58"}, "Content-Type": {"text/plain; charset=utf-8"}},
+				Status: http.StatusNotFound,
+				Body:   "host: 28080-debug-amaranth-smelt-9ba20cc1.test-domain.com\n",
 			},
 		},
 		{
 			Desc: "port GET unexposed",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].Ports[0].Url+"this-does-not-exist", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Targets:    &Targets{},
 			IgnoreBody: true,
@@ -522,76 +665,81 @@ func TestRoutes(t *testing.T) {
 			Desc: "port cookies",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].Ports[0].Url+"this-does-not-exist", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 				addCookie(http.Cookie{Name: "foobar", Value: "baz"}),
 				addCookie(http.Cookie{Name: "another", Value: "cookie"}),
 			),
 			Targets: &Targets{
 				Port: &Target{
 					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
+						fmt.Fprintf(w, "host: %s\n", r.Host)
 						fmt.Fprintf(w, "%+q\n", r.Header["Cookie"])
 					},
 				},
 			},
 			Expectation: Expectation{
 				Status: http.StatusOK,
-				Header: http.Header{"Content-Length": {"30"}, "Content-Type": {"text/plain; charset=utf-8"}},
-				Body:   "[\"foobar=baz;another=cookie\"]\n",
+				Header: http.Header{"Content-Length": {"82"}, "Content-Type": {"text/plain; charset=utf-8"}},
+				Body:   "host: 28080-amaranth-smelt-9ba20cc1.test-domain.com\n[\"foobar=baz;another=cookie\"]\n",
 			},
 		},
 		{
 			Desc: "port GET 200 w/o X-Frame-Options header",
 			Request: modifyRequest(httptest.NewRequest("GET", workspaces[0].Ports[0].Url+"returns-200-with-frame-options-header", nil),
 				addHostHeader,
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
 			Targets: &Targets{
 				Port: &Target{
 					Handler: func(w http.ResponseWriter, r *http.Request, requestCount uint8) {
 						w.Header().Add("X-Frame-Options", "sameorigin")
+						fmt.Fprintf(w, "host: %s\n", r.Host)
 						w.WriteHeader(http.StatusOK)
 					},
 				},
 			},
 			Expectation: Expectation{
-				Header: http.Header{"Content-Length": {"0"}},
+				Header: http.Header{
+					"Content-Length": {"52"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+				},
 				Status: http.StatusOK,
+				Body:   "host: 28080-amaranth-smelt-9ba20cc1.test-domain.com\n",
 			},
 		},
 		{
-			Desc: "blobserve route GET",
-			Request: modifyRequest(httptest.NewRequest("GET", "https://blobserve.test-domain.com/blobserve/gitpod-io/supervisor:latest/__files__/main.js", nil),
+			Desc:   "debug IDE authorized GE",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", debugWorkspaceURL, nil),
 				addHostHeader,
+				addOwnerToken(domain, workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
+			Targets: &Targets{DebugWorkspace: &Target{Status: http.StatusOK}},
 			Expectation: Expectation{
+				Status: http.StatusOK,
 				Header: http.Header{
-					"Cache-Control":  {"public, max-age=31536000"},
-					"Content-Length": {"77"},
+					"Content-Length": {"23"},
 					"Content-Type":   {"text/plain; charset=utf-8"},
 					"Vary":           {"Accept-Encoding"},
 				},
-				Status: http.StatusOK,
-				Body:   "blobserve hit: /blobserve/gitpod-io/supervisor:latest/main.js\nreadOnly: true\n",
+				Body: "debug workspace hit: /\n",
 			},
 		},
 		{
-			Desc: "extensions route GET",
-			Request: modifyRequest(httptest.NewRequest("GET", "https://extensions-foreign.test-domain.com/"+workspaces[0].WorkspaceID+"/extensions.js", nil),
+			Desc:   "debug supervisor frontend /main.js",
+			Config: &config,
+			Request: modifyRequest(httptest.NewRequest("GET", debugWorkspaceURL+"_supervisor/frontend/main.js", nil),
 				addHostHeader,
-				addHeader("Origin", config.GitpodInstallation.HostName),
-				addOwnerToken(workspaces[0].InstanceID, workspaces[0].Auth.OwnerToken),
 			),
+			Targets: &Targets{DebugSupervisor: &Target{Status: http.StatusOK}},
 			Expectation: Expectation{
 				Status: http.StatusOK,
 				Header: http.Header{
-					"Access-Control-Allow-Credentials": {"true"},
-					"Access-Control-Allow-Origin":      {"test-domain.com"},
-					"Access-Control-Expose-Headers":    {"Authorization"},
-					"Content-Length":                   {"30"},
-					"Content-Type":                     {"text/plain; charset=utf-8"},
-					"Vary":                             {"Accept-Encoding"},
+					"Content-Length": {"52"},
+					"Content-Type":   {"text/plain; charset=utf-8"},
+					"Vary":           {"Accept-Encoding"},
 				},
-				Body: "workspace hit: /extensions.js\n",
+				Body: "supervisor debug hit: /_supervisor/frontend/main.js\n",
 			},
 		},
 	}
@@ -607,7 +755,7 @@ func TestRoutes(t *testing.T) {
 		Workspace:  &Target{Status: http.StatusOK},
 	}
 	targets := make(map[string]*testTarget)
-	controlTarget := func(target *Target, name, host string) {
+	controlTarget := func(target *Target, name, host string, checkedHost bool) {
 		_, runs := targets[name]
 		if runs && target == nil {
 			targets[name].Close()
@@ -616,7 +764,7 @@ func TestRoutes(t *testing.T) {
 		}
 
 		if !runs && target != nil {
-			targets[name] = startTestTarget(t, host, name)
+			targets[name] = startTestTarget(t, host, name, checkedHost)
 			runs = true
 		}
 
@@ -637,15 +785,22 @@ func TestRoutes(t *testing.T) {
 		}
 
 		t.Run(test.Desc, func(t *testing.T) {
-			controlTarget(test.Targets.IDE, "IDE", ideServerHost)
-			controlTarget(test.Targets.Blobserve, "blobserve", blobServeHost)
-			controlTarget(test.Targets.Port, "port", portServeHost)
-			controlTarget(test.Targets.Workspace, "workspace", workspaceHost)
-			controlTarget(test.Targets.Supervisor, "supervisor", fmt.Sprintf("localhost:%d", supervisorPort))
+			controlTarget(test.Targets.IDE, "IDE", ideServerHost, false)
+			controlTarget(test.Targets.Blobserve, "blobserve", blobServeHost, true)
+			controlTarget(test.Targets.Port, "port", portServeHost, true)
+			controlTarget(test.Targets.DebugWorkspaceProxy, "debug workspace proxy", fmt.Sprintf("localhost:%d", debugWorkspaceProxyPort), false)
+			controlTarget(test.Targets.Workspace, "workspace", workspaceHost, false)
+			controlTarget(test.Targets.DebugWorkspace, "debug workspace", fmt.Sprintf("localhost:%d", workspaceDebugPort), false)
+			controlTarget(test.Targets.Supervisor, "supervisor", fmt.Sprintf("localhost:%d", supervisorPort), false)
+			controlTarget(test.Targets.DebugSupervisor, "supervisor debug", fmt.Sprintf("localhost:%d", supervisorDebugPort), false)
 
 			cfg := config
 			if test.Config != nil {
 				cfg = *test.Config
+				err := cfg.Validate()
+				if err != nil {
+					t.Fatalf("invalid configuration: %q", err)
+				}
 			}
 			router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
 			if test.Router != nil {
@@ -653,12 +808,12 @@ func TestRoutes(t *testing.T) {
 			}
 
 			ingress := HostBasedIngressConfig{
-				HttpAddress:  "8080",
-				HttpsAddress: "9090",
+				HTTPAddress:  "8080",
+				HTTPSAddress: "9090",
 				Header:       "",
 			}
 
-			proxy := NewWorkspaceProxy(ingress, cfg, router, &fakeWsInfoProvider{infos: workspaces})
+			proxy := NewWorkspaceProxy(ingress, cfg, router, &fakeWsInfoProvider{infos: workspaces}, nil)
 			handler, err := proxy.Handler()
 			if err != nil {
 				t.Fatalf("cannot create proxy handler: %q", err)
@@ -692,11 +847,11 @@ func TestRoutes(t *testing.T) {
 }
 
 type fakeWsInfoProvider struct {
-	infos []WorkspaceInfo
+	infos []common.WorkspaceInfo
 }
 
-// GetWsInfoByID returns the workspace for the given ID
-func (p *fakeWsInfoProvider) WorkspaceInfo(ctx context.Context, workspaceID string) *WorkspaceInfo {
+// GetWsInfoByID returns the workspace for the given ID.
+func (p *fakeWsInfoProvider) WorkspaceInfo(workspaceID string) *common.WorkspaceInfo {
 	for _, nfo := range p.infos {
 		if nfo.WorkspaceID == workspaceID {
 			return &nfo
@@ -706,19 +861,25 @@ func (p *fakeWsInfoProvider) WorkspaceInfo(ctx context.Context, workspaceID stri
 	return nil
 }
 
-// WorkspaceCoords returns the workspace coords for a public port
-func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *WorkspaceCoords {
+func (p *fakeWsInfoProvider) AcquireContext(ctx context.Context, workspaceID string, port string) (context.Context, string, error) {
+	return ctx, "", nil
+}
+func (p *fakeWsInfoProvider) ReleaseContext(id string) {
+}
+
+// WorkspaceCoords returns the workspace coords for a public port.
+func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *common.WorkspaceCoords {
 	for _, info := range p.infos {
 		if info.IDEPublicPort == wsProxyPort {
-			return &WorkspaceCoords{
+			return &common.WorkspaceCoords{
 				ID:   info.WorkspaceID,
 				Port: "",
 			}
 		}
 
 		for _, portInfo := range info.Ports {
-			if portInfo.PublicPort == wsProxyPort {
-				return &WorkspaceCoords{
+			if fmt.Sprint(portInfo.Port) == wsProxyPort {
+				return &common.WorkspaceCoords{
 					ID:   info.WorkspaceID,
 					Port: strconv.Itoa(int(portInfo.Port)),
 				}
@@ -729,14 +890,109 @@ func (p *fakeWsInfoProvider) WorkspaceCoords(wsProxyPort string) *WorkspaceCoord
 	return nil
 }
 
+func TestSSHGatewayRouter(t *testing.T) {
+	generatePrivateKey := func() ssh.Signer {
+		prik, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil
+		}
+		b := pem.EncodeToMemory(&pem.Block{
+			Bytes: x509.MarshalPKCS1PrivateKey(prik),
+			Type:  "RSA PRIVATE KEY",
+		})
+		signal, err := ssh.ParsePrivateKey(b)
+		if err != nil {
+			return nil
+		}
+		return signal
+	}
+
+	tests := []struct {
+		Name     string
+		Input    []ssh.Signer
+		Expected int
+	}{
+		{"one hostkey", []ssh.Signer{generatePrivateKey()}, 1},
+		{"multi hostkey", []ssh.Signer{generatePrivateKey(), generatePrivateKey()}, 2},
+	}
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
+			ingress := HostBasedIngressConfig{
+				HTTPAddress:  "8080",
+				HTTPSAddress: "9090",
+				Header:       "",
+			}
+
+			proxy := NewWorkspaceProxy(ingress, config, router, &fakeWsInfoProvider{infos: workspaces}, &sshproxy.Server{HostKeys: test.Input})
+			handler, err := proxy.Handler()
+			if err != nil {
+				t.Fatalf("cannot create proxy handler: %q", err)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_ssh/host_keys", nil),
+				addHostHeader,
+			))
+			resp := rec.Result()
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				t.Fatalf("status code should be 200, but got %d", resp.StatusCode)
+			}
+			var hostkeys []map[string]interface{}
+			fmt.Println(string(body))
+			err = json.Unmarshal(body, &hostkeys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Log(hostkeys, len(hostkeys), test.Expected)
+
+			if len(hostkeys) != test.Expected {
+				t.Fatalf("hostkey length is not expected")
+			}
+		})
+	}
+}
+
+func TestNoSSHGatewayRouter(t *testing.T) {
+	t.Run("TestNoSSHGatewayRouter", func(t *testing.T) {
+		router := HostBasedRouter(hostBasedHeader, wsHostSuffix, wsHostNameRegex)
+		ingress := HostBasedIngressConfig{
+			HTTPAddress:  "8080",
+			HTTPSAddress: "9090",
+			Header:       "",
+		}
+
+		proxy := NewWorkspaceProxy(ingress, config, router, &fakeWsInfoProvider{infos: workspaces}, nil)
+		handler, err := proxy.Handler()
+		if err != nil {
+			t.Fatalf("cannot create proxy handler: %q", err)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, modifyRequest(httptest.NewRequest("GET", workspaces[0].URL+"_ssh/host_keys", nil),
+			addHostHeader,
+		))
+		resp := rec.Result()
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("status code should be 401, but got %d", resp.StatusCode)
+		}
+	})
+
+}
+
 func TestRemoveSensitiveCookies(t *testing.T) {
 	var (
-		domain            = "test-domain.com"
-		sessionCookie     = &http.Cookie{Domain: domain, Name: "_test_domain_com_", Value: "fobar"}
-		portAuthCookie    = &http.Cookie{Domain: domain, Name: "_test_domain_com_ws_77f6b236_3456_4b88_8284_81ca543a9d65_port_auth_", Value: "some-token"}
-		ownerCookie       = &http.Cookie{Domain: domain, Name: "_test_domain_com_ws_77f6b236_3456_4b88_8284_81ca543a9d65_owner_", Value: "some-other-token"}
-		miscCookie        = &http.Cookie{Domain: domain, Name: "some-other-cookie", Value: "I like cookies"}
-		invalidCookieName = &http.Cookie{Domain: domain, Name: "foobar[0]", Value: "violates RFC6266"}
+		domain                  = "test-domain.com"
+		sessionCookie           = &http.Cookie{Domain: domain, Name: "_test_domain_com_", Value: "fobar"}
+		sessionCookieJwt2       = &http.Cookie{Domain: domain, Name: "__Host-_test_domain_com_jwt2_", Value: "fobar"}
+		realGitpodSessionCookie = &http.Cookie{Domain: domain, Name: server_lib.CookieNameFromDomain(domain), Value: "fobar"}
+		portAuthCookie          = &http.Cookie{Domain: domain, Name: "_test_domain_com_ws_77f6b236_3456_4b88_8284_81ca543a9d65_port_auth_", Value: "some-token"}
+		ownerCookie             = &http.Cookie{Domain: domain, Name: "_test_domain_com_ws_77f6b236_3456_4b88_8284_81ca543a9d65_owner_", Value: "some-other-token"}
+		ownerCookieGen          = ownerTokenCookie(domain, "77f6b236_3456_4b88_8284_81ca543a9d65", "owner-token-gen")
+		miscCookie              = &http.Cookie{Domain: domain, Name: "some-other-cookie", Value: "I like cookies"}
+		invalidCookieName       = &http.Cookie{Domain: domain, Name: "foobar[0]", Value: "violates RFC6266"}
 	)
 
 	tests := []struct {
@@ -744,12 +1000,15 @@ func TestRemoveSensitiveCookies(t *testing.T) {
 		Input    []*http.Cookie
 		Expected []*http.Cookie
 	}{
-		{"no cookies", []*http.Cookie{}, []*http.Cookie{}},
-		{"session cookie", []*http.Cookie{sessionCookie, miscCookie}, []*http.Cookie{miscCookie}},
-		{"portAuth cookie", []*http.Cookie{portAuthCookie, miscCookie}, []*http.Cookie{miscCookie}},
-		{"owner cookie", []*http.Cookie{ownerCookie, miscCookie}, []*http.Cookie{miscCookie}},
-		{"misc cookie", []*http.Cookie{miscCookie}, []*http.Cookie{miscCookie}},
-		{"invalid cookie name", []*http.Cookie{invalidCookieName}, []*http.Cookie{invalidCookieName}},
+		{Name: "no cookies", Input: []*http.Cookie{}, Expected: []*http.Cookie{}},
+		{Name: "session cookie", Input: []*http.Cookie{sessionCookie, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "session cookie ending on _jwt2_", Input: []*http.Cookie{sessionCookieJwt2, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "real Gitpod session cookie", Input: []*http.Cookie{realGitpodSessionCookie, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "portAuth cookie", Input: []*http.Cookie{portAuthCookie, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "owner cookie", Input: []*http.Cookie{ownerCookie, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "owner cookie generated", Input: []*http.Cookie{ownerCookieGen, miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "misc cookie", Input: []*http.Cookie{miscCookie}, Expected: []*http.Cookie{miscCookie}},
+		{Name: "invalid cookie name", Input: []*http.Cookie{invalidCookieName}, Expected: []*http.Cookie{invalidCookieName}},
 	}
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
@@ -771,13 +1030,12 @@ func TestSensitiveCookieHandler(t *testing.T) {
 		Input    string
 		Expected string
 	}{
-		{"no cookies", "", ""},
-		{"valid cookie", miscCookie.String(), `some-other-cookie="I like cookies";Domain=test-domain.com`},
-		{"invalid cookie", `foobar[0]="violates RFC6266"`, `foobar[0]="violates RFC6266"`},
+		{Name: "no cookies", Input: "", Expected: ""},
+		{Name: "valid cookie", Input: miscCookie.String(), Expected: `some-other-cookie="I like cookies";Domain=test-domain.com`},
+		{Name: "invalid cookie", Input: `foobar[0]="violates RFC6266"`, Expected: `foobar[0]="violates RFC6266"`},
 	}
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-
 			req := httptest.NewRequest("GET", "http://"+domain, nil)
 			if test.Input != "" {
 				req.Header.Set("cookie", test.Input)

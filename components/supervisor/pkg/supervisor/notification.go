@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package supervisor
 
@@ -11,6 +11,7 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -20,9 +21,10 @@ import (
 const (
 	NotifierMaxPendingNotifications   = 120
 	SubscriberMaxPendingNotifications = 100
+	SubscriberMaxSubscriptions        = 10
 )
 
-// NewNotificationService creates a new notification service
+// NewNotificationService creates a new notification service.
 func NewNotificationService() *NotificationService {
 	return &NotificationService{
 		subscriptions:        make(map[uint64]*subscription),
@@ -30,7 +32,7 @@ func NewNotificationService() *NotificationService {
 	}
 }
 
-// NotificationService implements the notification service API
+// NotificationService implements the notification service API.
 type NotificationService struct {
 	mutex                sync.Mutex
 	nextSubscriptionID   uint64
@@ -71,19 +73,20 @@ func (subscription *subscription) close() {
 	})
 }
 
-// RegisterGRPC registers a gRPC service
+// RegisterGRPC registers a gRPC service.
 func (srv *NotificationService) RegisterGRPC(s *grpc.Server) {
 	api.RegisterNotificationServiceServer(s, srv)
 }
 
-// RegisterREST registers a REST service
-func (srv *NotificationService) RegisterREST(mux *runtime.ServeMux, grpcEndpoint string) error {
-	return api.RegisterNotificationServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithInsecure()})
+// RegisterREST registers a REST service.
+func (srv *NotificationService) RegisterREST(ctx context.Context, mux *runtime.ServeMux, grpcEndpoint string) error {
+	return api.RegisterNotificationServiceHandlerFromEndpoint(ctx, mux, grpcEndpoint, []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())})
 }
 
-// Notify sends a notification to the user
+// Notify sends a notification to the user.
 func (srv *NotificationService) Notify(ctx context.Context, req *api.NotifyRequest) (*api.NotifyResponse, error) {
 	if len(srv.pendingNotifications) >= NotifierMaxPendingNotifications {
+		log.Warnf("Max number of pending notifications exceeded (%d)", NotifierMaxPendingNotifications)
 		return nil, status.Error(codes.ResourceExhausted, "Max number of pending notifications exceeded")
 	}
 
@@ -132,7 +135,7 @@ func (srv *NotificationService) notifySubscribers(req *api.NotifyRequest) *pendi
 			subscription.close()
 		}
 	}
-	var channel = make(chan *api.NotifyResponse, 1)
+	channel := make(chan *api.NotifyResponse, 1)
 	pending := &pendingNotification{
 		message:         message,
 		responseChannel: channel,
@@ -146,7 +149,7 @@ func (srv *NotificationService) notifySubscribers(req *api.NotifyRequest) *pendi
 	return pending
 }
 
-// Subscribe subscribes to notifications that are sent to the supervisor
+// Subscribe subscribes to notifications that are sent to the supervisor.
 func (srv *NotificationService) Subscribe(req *api.SubscribeRequest, resp api.NotificationService_SubscribeServer) error {
 	log.WithField("SubscribeRequest", req).Info("Subscribe entered")
 	defer log.WithField("SubscribeRequest", req).Info("Subscribe exited")
@@ -172,6 +175,11 @@ func (srv *NotificationService) Subscribe(req *api.SubscribeRequest, resp api.No
 func (srv *NotificationService) subscribeLocked(req *api.SubscribeRequest, resp api.NotificationService_SubscribeServer) *subscription {
 	srv.mutex.Lock()
 	defer srv.mutex.Unlock()
+
+	if len(srv.subscriptions) >= SubscriberMaxSubscriptions {
+		log.Warnf("potentially leaking subscription: max number exceeded (%d)", SubscriberMaxSubscriptions)
+	}
+
 	// account for some back pressure
 	capacity := len(srv.pendingNotifications)
 	if SubscriberMaxPendingNotifications > capacity {
@@ -209,7 +217,7 @@ func (srv *NotificationService) unsubscribeLocked(subscriptionID uint64) {
 	subscription.close()
 }
 
-// Respond reports user actions as response to a notification request
+// Respond reports user actions as response to a notification request.
 func (srv *NotificationService) Respond(ctx context.Context, req *api.RespondRequest) (*api.RespondResponse, error) {
 	srv.mutex.Lock()
 	defer srv.mutex.Unlock()

@@ -1,7 +1,7 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2023 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 // package: contentservice
@@ -95,5 +95,51 @@ export class DeleteWorkspaceResponse extends jspb.Message {
 
 export namespace DeleteWorkspaceResponse {
     export type AsObject = {
+    }
+}
+
+export class WorkspaceSnapshotExistsRequest extends jspb.Message {
+    getOwnerId(): string;
+    setOwnerId(value: string): WorkspaceSnapshotExistsRequest;
+    getWorkspaceId(): string;
+    setWorkspaceId(value: string): WorkspaceSnapshotExistsRequest;
+    getFilename(): string;
+    setFilename(value: string): WorkspaceSnapshotExistsRequest;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): WorkspaceSnapshotExistsRequest.AsObject;
+    static toObject(includeInstance: boolean, msg: WorkspaceSnapshotExistsRequest): WorkspaceSnapshotExistsRequest.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: WorkspaceSnapshotExistsRequest, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): WorkspaceSnapshotExistsRequest;
+    static deserializeBinaryFromReader(message: WorkspaceSnapshotExistsRequest, reader: jspb.BinaryReader): WorkspaceSnapshotExistsRequest;
+}
+
+export namespace WorkspaceSnapshotExistsRequest {
+    export type AsObject = {
+        ownerId: string,
+        workspaceId: string,
+        filename: string,
+    }
+}
+
+export class WorkspaceSnapshotExistsResponse extends jspb.Message {
+    getExists(): boolean;
+    setExists(value: boolean): WorkspaceSnapshotExistsResponse;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): WorkspaceSnapshotExistsResponse.AsObject;
+    static toObject(includeInstance: boolean, msg: WorkspaceSnapshotExistsResponse): WorkspaceSnapshotExistsResponse.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: WorkspaceSnapshotExistsResponse, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): WorkspaceSnapshotExistsResponse;
+    static deserializeBinaryFromReader(message: WorkspaceSnapshotExistsResponse, reader: jspb.BinaryReader): WorkspaceSnapshotExistsResponse;
+}
+
+export namespace WorkspaceSnapshotExistsResponse {
+    export type AsObject = {
+        exists: boolean,
     }
 }

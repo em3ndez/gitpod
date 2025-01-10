@@ -7,11 +7,16 @@ packages:
       - "go.sum"
     deps:
       - components/common-go:lib
+      - components/gitpod-db:latest-migration
+    prep:
+      - ["sh", "-c", "mkdir -p cmd/resources"]
+      - ["sh", "-c", "cat _deps/components-gitpod-db--latest-migration/latest-migration.txt > cmd/resources/latest-migration.txt"]
     env:
       - CGO_ENABLED=0
       - GOOS=linux
     config:
       packaging: app
+      buildCommand: ["go", "build", "-trimpath", "-ldflags", "-buildid= -w -s -X 'github.com/gitpod-io/gitpod/service-waiter/cmd.Version=commit-${__git_commit}'"]
   - name: docker
     type: docker
     deps:

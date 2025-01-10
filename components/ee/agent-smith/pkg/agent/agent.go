@@ -1,6 +1,6 @@
-// Copyright (c) 2021 Gitpod GmbH. All rights reserved.
-// Licensed under the Gitpod Enterprise Source Code License,
-// See License.enterprise.txt in the project root folder.
+// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License.AGPL.txt in the project root for license information.
 
 package agent
 
@@ -13,19 +13,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gitpod-io/gitpod/agent-smith/pkg/classifier"
-	"github.com/gitpod-io/gitpod/agent-smith/pkg/common"
-	"github.com/gitpod-io/gitpod/agent-smith/pkg/config"
-	"github.com/gitpod-io/gitpod/agent-smith/pkg/detector"
-	"github.com/gitpod-io/gitpod/common-go/log"
-	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/xerrors"
-
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/utils/lru"
+
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/classifier"
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/common"
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/config"
+	"github.com/gitpod-io/gitpod/agent-smith/pkg/detector"
+	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
+	"github.com/gitpod-io/gitpod/common-go/log"
+	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
+	wsmanapi "github.com/gitpod-io/gitpod/ws-manager/api"
 )
 
 const (
@@ -41,9 +46,10 @@ type Smith struct {
 	Kubernetes       kubernetes.Interface
 	metrics          *metrics
 
-	egressTrafficCheckHandler func(pid int) (int64, error)
-	timeElapsedHandler        func(t time.Time) time.Duration
-	notifiedInfringements     *lru.Cache
+	wsman wsmanapi.WorkspaceManagerClient
+
+	timeElapsedHandler    func(t time.Time) time.Duration
+	notifiedInfringements *lru.Cache
 
 	detector   detector.ProcessDetector
 	classifier classifier.ProcessClassifier
@@ -97,6 +103,28 @@ func NewAgentSmith(cfg config.Config) (*Smith, error) {
 		}
 	}
 
+	grpcOpts := common_grpc.DefaultClientOptions()
+	if cfg.WorkspaceManager.TLS.Authority != "" || cfg.WorkspaceManager.TLS.Certificate != "" && cfg.WorkspaceManager.TLS.PrivateKey != "" {
+		tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+			cfg.WorkspaceManager.TLS.Authority, cfg.WorkspaceManager.TLS.Certificate, cfg.WorkspaceManager.TLS.PrivateKey,
+			common_grpc.WithSetRootCAs(true),
+			common_grpc.WithServerName("ws-manager"),
+		)
+		if err != nil {
+			log.WithField("config", cfg.WorkspaceManager.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
+			return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+		}
+
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	} else {
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	conn, err := grpc.Dial(cfg.WorkspaceManager.Address, grpcOpts...)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot dial ws-manager-mk2: %w", err)
+	}
+	wsman := wsmanapi.NewWorkspaceManagerClient(conn)
+
 	detec, err := detector.NewProcfsDetector()
 	if err != nil {
 		return nil, err
@@ -111,23 +139,23 @@ func NewAgentSmith(cfg config.Config) (*Smith, error) {
 	res := &Smith{
 		EnforcementRules: map[string]config.EnforcementRules{
 			defaultRuleset: {
-				config.GradeKind(config.InfringementExec, common.SeverityBarely):          config.PenaltyLimitCPU,
-				config.GradeKind(config.InfringementExec, common.SeverityAudit):           config.PenaltyStopWorkspace,
-				config.GradeKind(config.InfringementExec, common.SeverityVery):            config.PenaltyStopWorkspaceAndBlockUser,
-				config.GradeKind(config.InfringementExcessiveEgress, common.SeverityVery): config.PenaltyStopWorkspace,
+				config.GradeKind(config.InfringementExec, common.SeverityBarely): config.PenaltyLimitCPU,
+				config.GradeKind(config.InfringementExec, common.SeverityAudit):  config.PenaltyStopWorkspace,
+				config.GradeKind(config.InfringementExec, common.SeverityVery):   config.PenaltyStopWorkspaceAndBlockUser,
 			},
 		},
 		Config:     cfg,
 		GitpodAPI:  api,
 		Kubernetes: clientset,
 
+		wsman: wsman,
+
 		detector:   detec,
 		classifier: class,
 
-		notifiedInfringements:     lru.New(notificationCacheSize),
-		metrics:                   m,
-		egressTrafficCheckHandler: getEgressTraffic,
-		timeElapsedHandler:        time.Since,
+		notifiedInfringements: lru.New(notificationCacheSize),
+		metrics:               m,
+		timeElapsedHandler:    time.Since,
 	}
 	if cfg.Enforcement.Default != nil {
 		if err := cfg.Enforcement.Default.Validate(); err != nil {
@@ -187,10 +215,17 @@ func (ws InfringingWorkspace) DescribeInfringements(charCount int) string {
 type Infringement struct {
 	Description string
 	Kind        config.GradedInfringementKind
+	CommandLine []string
 }
 
 // defaultRuleset is the name ("remote origin URL") of the default enforcement rules
 const defaultRuleset = ""
+
+type classifiedProcess struct {
+	P   detector.Process
+	C   *classifier.Classification
+	Err error
+}
 
 // Start gets a stream of Infringements from Run and executes a callback on them to apply a Penalty
 func (agent *Smith) Start(ctx context.Context, callback func(InfringingWorkspace, []config.PenaltyKind)) {
@@ -199,25 +234,35 @@ func (agent *Smith) Start(ctx context.Context, callback func(InfringingWorkspace
 		log.WithError(err).Fatal("cannot start process detector")
 	}
 
-	type classifiedProcess struct {
-		P   detector.Process
-		C   *classifier.Classification
-		Err error
-	}
 	var (
 		wg  sync.WaitGroup
-		cli chan detector.Process
-		clo chan classifiedProcess
+		cli = make(chan detector.Process, 500)
+		clo = make(chan classifiedProcess, 50)
 	)
+	agent.metrics.RegisterClassificationQueues(cli, clo)
+
+	workspaces := make(map[int]*common.Workspace)
+	wsMutex := &sync.Mutex{}
+
 	defer wg.Wait()
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 25; i++ {
 		wg.Add(1)
 		go func() {
-			agent.metrics.classificationBackpressureInCount.Set(float64(len(cli)))
-			agent.metrics.classificationBackpressureOutCount.Set(float64(len(clo)))
 			defer wg.Done()
 			for i := range cli {
+				// Update the workspaces map if this process belongs to a new workspace
+				wsMutex.Lock()
+				if _, ok := workspaces[i.Workspace.PID]; !ok {
+					log.Debugf("adding workspace with pid %d and workspaceId %s to workspaces", i.Workspace.PID, i.Workspace.WorkspaceID)
+					workspaces[i.Workspace.PID] = i.Workspace
+				}
+				wsMutex.Unlock()
+				// perform classification of the process
 				class, err := agent.classifier.Matches(i.Path, i.CommandLine)
+				// optimisation: early out to not block on the CLO chan
+				if err == nil && class.Level == classifier.LevelNoMatch {
+					continue
+				}
 				clo <- classifiedProcess{P: i, C: class, Err: err}
 			}
 		}()
@@ -225,15 +270,32 @@ func (agent *Smith) Start(ctx context.Context, callback func(InfringingWorkspace
 
 	defer log.Info("agent smith main loop ended")
 
+	// We want to fill the classifier in a Go routine seaparete from using the classification
+	// results, to ensure we're not deadlocking/block ourselves. If this were in the same loop,
+	// we could easily get into a situation where we'd need to scale the queues to match the proc index.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case proc, ok := <-ps:
+				if !ok {
+					return
+				}
+				select {
+				case cli <- proc:
+				default:
+					// we're overfilling the classifier worker
+					agent.metrics.classificationBackpressureInDrop.Inc()
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case proc, ok := <-ps:
-			if !ok {
-				return
-			}
-			cli <- proc
 		case class := <-clo:
 			proc, cl, err := class.P, class.C, class.Err
 			if err != nil {
@@ -244,13 +306,17 @@ func (agent *Smith) Start(ctx context.Context, callback func(InfringingWorkspace
 				continue
 			}
 
-			agent.Penalize(InfringingWorkspace{
+			_, _ = agent.Penalize(InfringingWorkspace{
 				SupervisorPID: proc.Workspace.PID,
 				Owner:         proc.Workspace.OwnerID,
 				InstanceID:    proc.Workspace.InstanceID,
 				GitRemoteURL:  []string{proc.Workspace.GitURL},
 				Infringements: []Infringement{
-					{Kind: config.GradeKind(config.InfringementExec, common.Severity(cl.Level)), Description: fmt.Sprintf("%s: %s", cl.Classifier, cl.Message)},
+					{
+						Kind:        config.GradeKind(config.InfringementExec, common.Severity(cl.Level)),
+						Description: fmt.Sprintf("%s: %s", cl.Classifier, cl.Message),
+						CommandLine: proc.CommandLine,
+					},
 				},
 			})
 		}
@@ -264,27 +330,35 @@ func (agent *Smith) Penalize(ws InfringingWorkspace) ([]config.PenaltyKind, erro
 		remoteURL = ws.GitRemoteURL[0]
 	}
 
+	owi := log.OWI(ws.Owner, ws.WorkspaceID, ws.InstanceID)
+
 	penalty := getPenalty(agent.EnforcementRules[defaultRuleset], agent.EnforcementRules[remoteURL], ws.Infringements)
 	for _, p := range penalty {
 		switch p {
 		case config.PenaltyStopWorkspace:
+			log.WithField("infringement", log.TrustedValueWrap{Value: ws.Infringements}).WithFields(owi).Info("stopping workspace")
 			agent.metrics.penaltyAttempts.WithLabelValues(string(p)).Inc()
-			err := agent.stopWorkspace(ws.SupervisorPID)
+			err := agent.stopWorkspace(ws.SupervisorPID, ws.InstanceID)
 			if err != nil {
+				log.WithError(err).WithFields(owi).Debug("failed to stop workspace")
 				agent.metrics.penaltyFailures.WithLabelValues(string(p), err.Error()).Inc()
 			}
 			return penalty, err
 		case config.PenaltyStopWorkspaceAndBlockUser:
+			log.WithField("infringement", log.TrustedValueWrap{Value: ws.Infringements}).WithFields(owi).Info("stopping workspace and blocking user")
 			agent.metrics.penaltyAttempts.WithLabelValues(string(p)).Inc()
-			err := agent.stopWorkspaceAndBlockUser(ws.SupervisorPID, ws.Owner)
+			err := agent.stopWorkspaceAndBlockUser(ws.SupervisorPID, ws.Owner, ws.WorkspaceID, ws.InstanceID)
 			if err != nil {
+				log.WithError(err).WithFields(owi).Debug("failed to stop workspace and block user")
 				agent.metrics.penaltyFailures.WithLabelValues(string(p), err.Error()).Inc()
 			}
 			return penalty, err
 		case config.PenaltyLimitCPU:
+			log.WithField("infringement", log.TrustedValueWrap{Value: ws.Infringements}).WithFields(owi).Info("limiting CPU")
 			agent.metrics.penaltyAttempts.WithLabelValues(string(p)).Inc()
 			err := agent.limitCPUUse(ws.Pod)
 			if err != nil {
+				log.WithError(err).WithFields(owi).Debug("failed to limit CPU")
 				agent.metrics.penaltyFailures.WithLabelValues(string(p), err.Error()).Inc()
 			}
 			return penalty, err
@@ -352,45 +426,4 @@ func (agent *Smith) Collect(m chan<- prometheus.Metric) {
 	agent.metrics.Collect(m)
 	agent.classifier.Collect(m)
 	agent.detector.Collect(m)
-}
-
-func (agent *Smith) checkEgressTrafficCallback(pid int, pidCreationTime time.Time) (*Infringement, error) {
-	if agent.Config.EgressTraffic == nil {
-		return nil, nil
-	}
-
-	podLifetime := agent.timeElapsedHandler(pidCreationTime)
-	resp, err := agent.egressTrafficCheckHandler(pid)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp <= 0 {
-		log.WithField("total egress bytes", resp).Warn("GetEgressTraffic returned <= 0 value")
-		return nil, nil
-	}
-
-	type level struct {
-		V config.GradedInfringementKind
-		T *config.PerLevelEgressTraffic
-	}
-	levels := make([]level, 0, 2)
-	if agent.Config.EgressTraffic.VeryExcessiveLevel != nil {
-		levels = append(levels, level{V: config.GradeKind(config.InfringementExcessiveEgress, common.SeverityVery), T: agent.Config.EgressTraffic.VeryExcessiveLevel})
-	}
-	if agent.Config.EgressTraffic.ExcessiveLevel != nil {
-		levels = append(levels, level{V: config.GradeKind(config.InfringementExcessiveEgress, common.SeverityAudit), T: agent.Config.EgressTraffic.ExcessiveLevel})
-	}
-
-	dt := int64(podLifetime / time.Duration(agent.Config.EgressTraffic.WindowDuration))
-	for _, lvl := range levels {
-		allowance := dt*lvl.T.Threshold.Value() + lvl.T.BaseBudget.Value()
-		excess := resp - allowance
-
-		if excess > 0 {
-			return &Infringement{Description: fmt.Sprintf("egress traffic is %.3f megabytes over limit", float64(excess)/(1024.0*1024.0)), Kind: lvl.V}, nil
-		}
-	}
-
-	return nil, nil
 }

@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package activation
 
@@ -10,33 +10,41 @@ import (
 	"os"
 	"sync"
 
-	"github.com/mailru/easygo/netpoll"
+	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/moredure/easygo/netpoll"
 	"golang.org/x/xerrors"
 )
 
 // Callback is called when a listener is written to. Receivers are expected to close socketFD.
 type Callback func(socketFD *os.File) error
 
-// Listen polls on the listener and calls callback when someone writes to it
+// Listen polls on the listener and calls callback when someone writes to it.
 func Listen(ctx context.Context, l net.Listener, activate Callback) error {
-	poller, err := netpoll.New(nil)
+	poller, err := netpoll.New(&netpoll.Config{
+		OnWaitError: func(err error) {
+			log.WithError(err).Error("netpoll: wait loop error")
+		},
+	})
 	if err != nil {
 		return err
 	}
+	defer poller.Close()
 
 	// Get netpoll descriptor with EventRead|EventEdgeTriggered.
 	desc, err := netpoll.HandleListener(l, netpoll.EventRead|netpoll.EventEdgeTriggered)
 	if err != nil {
 		return err
 	}
+	defer desc.Close()
 
 	var (
 		runc = make(chan bool, 1)
 		once sync.Once
 	)
-	poller.Start(desc, func(ev netpoll.Event) {
+
+	err = poller.Start(desc, func(ev netpoll.Event) {
 		defer once.Do(func() {
-			poller.Stop(desc)
+			_ = poller.Stop(desc)
 
 			close(runc)
 		})
@@ -47,6 +55,9 @@ func Listen(ctx context.Context, l net.Listener, activate Callback) error {
 
 		runc <- true
 	})
+	if err != nil {
+		return err
+	}
 
 	select {
 	case run := <-runc:

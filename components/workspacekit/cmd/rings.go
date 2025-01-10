@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +33,9 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -58,21 +64,28 @@ var ring0Cmd = &cobra.Command{
 	Short: "starts ring0 - enter here",
 	Run: func(_ *cobra.Command, args []string) {
 		log.Init(ServiceName, Version, true, false)
-		log := log.WithField("ring", 0)
+
+		wsid := os.Getenv("GITPOD_WORKSPACE_ID")
+		if wsid == "" {
+			log.Error("cannot find GITPOD_WORKSPACE_ID")
+			return
+		}
+
+		log := log.WithField("ring", 0).WithField("workspaceId", wsid)
 
 		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
 
-		defer log.Info("done")
+		defer log.Info("ring0 stopped")
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		client, err := connectToInWorkspaceDaemonService(ctx)
 		if err != nil {
-			log.WithError(err).Error("cannot connect to daemon")
+			log.WithError(err).Error("cannot connect to daemon from ring0")
 			return
 		}
 
@@ -89,7 +102,7 @@ var ring0Cmd = &cobra.Command{
 
 			client, err := connectToInWorkspaceDaemonService(ctx)
 			if err != nil {
-				log.WithError(err).Error("cannot connect to daemon")
+				log.WithError(err).Error("cannot connect to daemon from ring0 in defer")
 				return
 			}
 			defer client.Close()
@@ -103,14 +116,13 @@ var ring0Cmd = &cobra.Command{
 		cmd := exec.Command("/proc/self/exe", "ring1")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Pdeathsig:  syscall.SIGKILL,
-			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | unix.CLONE_NEWCGROUP,
 		}
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Env = append(os.Environ(),
 			"WORKSPACEKIT_FSSHIFT="+prep.FsShift.String(),
-			fmt.Sprintf("WORKSPACEKIT_FULL_WORKSPACE_BACKUP=%v", prep.FullWorkspaceBackup),
 		)
 
 		if err := cmd.Start(); err != nil {
@@ -139,7 +151,7 @@ var ring0Cmd = &cobra.Command{
 
 				_ = cmd.Process.Signal(unix.SIGTERM)
 				time.Sleep(ring1ShutdownTimeout)
-				if cmd.Process == nil {
+				if cmd.Process == nil || cmd.ProcessState.Exited() {
 					return
 				}
 
@@ -184,14 +196,20 @@ var ring1Cmd = &cobra.Command{
 	Short: "starts ring1",
 	Run: func(_cmd *cobra.Command, args []string) {
 		log.Init(ServiceName, Version, true, false)
-		log := log.WithField("ring", 1)
+
+		wsid := os.Getenv("GITPOD_WORKSPACE_ID")
+		if wsid == "" {
+			log.Error("cannot find GITPOD_WORKSPACE_ID")
+			return
+		}
+		log := log.WithField("ring", 1).WithField("workspaceId", wsid)
 
 		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
 
-		defer log.Info("done")
+		defer log.Info("ring1 stopped")
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -203,7 +221,7 @@ var ring1Cmd = &cobra.Command{
 		if !ring1Opts.MappingEstablished {
 			client, err := connectToInWorkspaceDaemonService(ctx)
 			if err != nil {
-				log.WithError(err).Error("cannot connect to daemon")
+				log.WithError(err).Error("cannot connect to daemon from ring1 when mappings not established")
 				return
 			}
 			defer client.Close()
@@ -256,12 +274,7 @@ var ring1Cmd = &cobra.Command{
 		}
 
 		var mnts []mnte
-
 		switch fsshift {
-		case api.FSShiftMethod_FUSE:
-			mnts = append(mnts,
-				mnte{Target: "/", Source: "/.workspace/mark", Flags: unix.MS_BIND | unix.MS_REC},
-			)
 		case api.FSShiftMethod_SHIFTFS:
 			mnts = append(mnts,
 				mnte{Target: "/", Source: "/.workspace/mark", FSType: "shiftfs"},
@@ -284,6 +297,12 @@ var ring1Cmd = &cobra.Command{
 		}
 		mnts = append(mnts, mnte{Target: "/tmp", Source: "tmpfs", FSType: "tmpfs"})
 
+		// If this is a cgroupv2 machine, we'll want to mount the cgroup2 FS ourselves
+		if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+			mnts = append(mnts, mnte{Target: "/sys/fs/cgroup", Source: "tmpfs", FSType: "tmpfs"})
+			mnts = append(mnts, mnte{Target: "/sys/fs/cgroup", Source: "cgroup", FSType: "cgroup2"})
+		}
+
 		if adds := os.Getenv("GITPOD_WORKSPACEKIT_BIND_MOUNTS"); adds != "" {
 			var additionalMounts []string
 			err = json.Unmarshal([]byte(adds), &additionalMounts)
@@ -295,13 +314,9 @@ var ring1Cmd = &cobra.Command{
 			}
 		}
 
-		// FWB workspaces do not require mounting /workspace
-		// if that is done, the backup will not contain any change in the directory
-		if os.Getenv("WORKSPACEKIT_FULL_WORKSPACE_BACKUP") != "true" {
-			mnts = append(mnts,
-				mnte{Target: "/workspace", Flags: unix.MS_BIND | unix.MS_REC},
-			)
-		}
+		mnts = append(mnts,
+			mnte{Target: "/workspace", Flags: unix.MS_BIND | unix.MS_REC},
+		)
 
 		for _, m := range mnts {
 			dst := filepath.Join(ring2Root, m.Target)
@@ -322,9 +337,24 @@ var ring1Cmd = &cobra.Command{
 			}).Debug("mounting new rootfs")
 			err = unix.Mount(m.Source, dst, m.FSType, m.Flags, "")
 			if err != nil {
-				log.WithError(err).WithField("dest", dst).Error("cannot establish mount")
+				log.WithError(err).WithField("dest", dst).WithField("fsType", m.FSType).Error("cannot establish mount")
 				return
 			}
+		}
+
+		// We deliberately do not bind mount `/etc/resolv.conf` and `/etc/hosts`, but instead place a copy
+		// so that users in the workspace can modify the file.
+		copyPaths := []string{"/etc/resolv.conf", "/etc/hosts"}
+		for _, fn := range copyPaths {
+			err = copyRing2Root(ring2Root, fn)
+			if err != nil {
+				log.WithError(err).Warn("cannot copy " + fn)
+			}
+		}
+
+		err = makeHostnameLocal(ring2Root)
+		if err != nil {
+			log.WithError(err).Warn("cannot make /etc/hosts hostname local")
 		}
 
 		env := make([]string, 0, len(os.Environ()))
@@ -335,6 +365,8 @@ var ring1Cmd = &cobra.Command{
 			env = append(env, e)
 		}
 
+		env = append(env, "WORKSPACEKIT_WRAP_NETNS=true")
+
 		socketFN := filepath.Join(os.TempDir(), fmt.Sprintf("workspacekit-ring1-%d.unix", time.Now().UnixNano()))
 		skt, err := net.Listen("unix", socketFN)
 		if err != nil {
@@ -343,10 +375,14 @@ var ring1Cmd = &cobra.Command{
 		}
 		defer skt.Close()
 
+		var (
+			cloneFlags uintptr = syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET
+		)
+
 		cmd := exec.Command("/proc/self/exe", "ring2", socketFN)
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Pdeathsig:  syscall.SIGKILL,
-			Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID,
+			Cloneflags: cloneFlags,
 		}
 		cmd.Dir = ring2Root
 		cmd.Stdin = os.Stdin
@@ -363,25 +399,32 @@ var ring1Cmd = &cobra.Command{
 		procLoc := filepath.Join(ring2Root, "proc")
 		err = os.MkdirAll(procLoc, 0755)
 		if err != nil {
-			log.WithError(err).Error("cannot mount proc")
+			log.WithError(err).Error("cannot create directory for mounting proc")
 			return
 		}
 
 		client, err := connectToInWorkspaceDaemonService(ctx)
 		if err != nil {
-			log.WithError(err).Error("cannot connect to daemon")
+			log.WithError(err).Error("cannot connect to daemon from ring1")
 			return
 		}
 		_, err = client.MountProc(ctx, &daemonapi.MountProcRequest{
 			Target: procLoc,
 			Pid:    int64(cmd.Process.Pid),
 		})
-		client.Close()
-
 		if err != nil {
+			client.Close()
 			log.WithError(err).Error("cannot mount proc")
 			return
 		}
+
+		_, err = client.EvacuateCGroup(ctx, &daemonapi.EvacuateCGroupRequest{})
+		if err != nil {
+			client.Close()
+			log.WithError(err).Error("cannot evacuate cgroup")
+			return
+		}
+		client.Close()
 
 		// We have to wait for ring2 to come back to us and connect to the socket we've passed along.
 		// There's a chance that ring2 crashes or misbehaves, so we don't want to wait forever, hence
@@ -429,6 +472,18 @@ var ring1Cmd = &cobra.Command{
 			return
 		}
 
+		client, err = connectToInWorkspaceDaemonService(ctx)
+		if err != nil {
+			log.WithError(err).Error("cannot connect to daemon from ring1 after ring2")
+			return
+		}
+		_, err = client.SetupPairVeths(ctx, &daemonapi.SetupPairVethsRequest{Pid: int64(cmd.Process.Pid)})
+		if err != nil {
+			log.WithError(err).Error("cannot setup pair of veths")
+			return
+		}
+		client.Close()
+
 		log.Info("signaling to child process")
 		_, err = msgutil.MarshalToWriter(ring2Conn, ringSyncMsg{
 			Stage:   1,
@@ -458,12 +513,13 @@ var ring1Cmd = &cobra.Command{
 				Ring2PID:    cmd.Process.Pid,
 				Ring2Rootfs: ring2Root,
 				BindEvents:  make(chan seccomp.BindEvent),
+				WorkspaceId: wsid,
 			}
 
-			stp, errchan := seccomp.Handle(scmpfd, handler)
+			stp, errchan := seccomp.Handle(scmpfd, handler, wsid)
 			defer close(stp)
 			go func() {
-				t := time.NewTicker(10 * time.Millisecond)
+				t := time.NewTicker(100 * time.Microsecond)
 				defer t.Stop()
 				for {
 					// We use the ticker to rate-limit the errors from the syscall handler.
@@ -479,12 +535,38 @@ var ring1Cmd = &cobra.Command{
 			}()
 		}
 
+		if enclave := os.Getenv("WORKSPACEKIT_RING2_ENCLAVE"); enclave != "" {
+			ecmd := exec.Command("/proc/self/exe", append([]string{"nsenter", "--target", strconv.Itoa(cmd.Process.Pid), "--mount", "--net"}, strings.Fields(enclave)...)...)
+			ecmd.Stdout = os.Stdout
+			ecmd.Stderr = os.Stderr
+
+			err := ecmd.Start()
+			if err != nil {
+				log.WithError(err).WithField("cmd", enclave).Error("cannot run enclave")
+				return
+			}
+		}
+
 		go func() {
 			err := lift.ServeLift(ctx, lift.DefaultSocketPath)
 			if err != nil {
 				log.WithError(err).Error("failed to serve ring1 command lift")
 			}
 		}()
+
+		socketPath := filepath.Join(ring2Root, ".supervisor")
+		if _, err = os.Stat(socketPath); errors.Is(err, fs.ErrNotExist) {
+			if err := os.MkdirAll(socketPath, 0644); err != nil {
+				log.Errorf("failed to create dir %v", err)
+			}
+		}
+
+		stopHook, err := startInfoService(socketPath)
+		if err != nil {
+			// workspace info is not critical, so we will not fail workspace start
+			log.Error("failed to start workspace info service")
+		}
+		defer stopHook()
 
 		err = cmd.Wait()
 		if err != nil {
@@ -503,9 +585,12 @@ var (
 		"/workspace",
 		"/sys",
 		"/dev",
-		"/etc/hosts",
 		"/etc/hostname",
-		"/etc/resolv.conf",
+		"/etc/ssl/certs/gitpod-ca.crt",
+	}
+	rejectMountPaths = map[string]struct{}{
+		"/etc/resolv.conf": {},
+		"/etc/hosts":       {},
 	}
 )
 
@@ -515,7 +600,8 @@ var (
 // That's how configMaps and secrets behave in Kubernetes.
 //
 // Note/Caveat: configMap or secret volumes with a subPath do not behave as described above and will not be recognised by this function.
-//              in those cases you'll want to use GITPOD_WORKSPACEKIT_BIND_MOUNTS to explicitely list those paths.
+//
+//	in those cases you'll want to use GITPOD_WORKSPACEKIT_BIND_MOUNTS to explicitely list those paths.
 func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (dest string, err error)) (mounts []string, err error) {
 	scanner := bufio.NewScanner(procMounts)
 	for scanner.Scan() {
@@ -546,10 +632,15 @@ func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (d
 			reject bool
 		)
 		switch fs {
-		case "cgroup", "devpts", "mqueue", "shm", "proc", "sysfs":
+		case "cgroup", "devpts", "mqueue", "shm", "proc", "sysfs", "cgroup2":
 			reject = true
 		}
 		if reject {
+			continue
+		}
+
+		// reject known paths
+		if _, ok := rejectMountPaths[path]; ok {
 			continue
 		}
 
@@ -567,29 +658,95 @@ func findBindMountCandidates(procMounts io.Reader, readlink func(path string) (d
 	return mounts, scanner.Err()
 }
 
+// copyRing2Root copies <fn> to <ring2root>/<fn>
+func copyRing2Root(ring2root string, fn string) error {
+	stat, err := os.Stat(fn)
+	if err != nil {
+		return err
+	}
+
+	org, err := os.Open(fn)
+	if err != nil {
+		return err
+	}
+	defer org.Close()
+
+	dst, err := os.OpenFile(filepath.Join(ring2root, fn), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, stat.Mode())
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, org)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func makeHostnameLocal(ring2root string) error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(ring2root, "/etc/hosts")
+	stat, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	bStr := string(b)
+	lines := strings.Split(bStr, "\n")
+	newLines := []string{}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
+			newLines = append(newLines, line)
+			continue
+		}
+		if strings.HasPrefix(fields[0], "#") {
+			newLines = append(newLines, line)
+		}
+		ip := net.ParseIP(fields[0]).To4()
+		if len(ip) != net.IPv4len {
+			continue
+		}
+		if fields[1] == hostname {
+			newLines = append(newLines, "127.0.0.1 "+hostname)
+		} else {
+			newLines = append(newLines, line)
+		}
+	}
+	return os.WriteFile(path, []byte(strings.Join(newLines, "\n")), stat.Mode())
+}
+
 func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 	buf := make([]byte, unix.CmsgSpace(4))
 
 	err := conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot setdeadline: %v", err)
 	}
 
 	f, err := conn.File()
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot open socket: %v", err)
 	}
 	defer f.Close()
 	connfd := int(f.Fd())
 
 	_, _, _, _, err = unix.Recvmsg(connfd, nil, buf, 0)
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot recvmsg from fd '%d': %v", connfd, err)
 	}
 
 	msgs, err := unix.ParseSocketControlMessage(buf)
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot parse socket control message: %v", err)
 	}
 	if len(msgs) != 1 {
 		return 0, xerrors.Errorf("expected a single socket control message")
@@ -597,7 +754,7 @@ func receiveSeccmpFd(conn *net.UnixConn) (libseccomp.ScmpFd, error) {
 
 	fds, err := unix.ParseUnixRights(&msgs[0])
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("cannot parse unix rights: %v", err)
 	}
 	if len(fds) == 0 {
 		return 0, xerrors.Errorf("expected a single socket FD")
@@ -615,14 +772,20 @@ var ring2Cmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(_cmd *cobra.Command, args []string) {
 		log.Init(ServiceName, Version, true, false)
-		log := log.WithField("ring", 2)
+
+		wsid := os.Getenv("GITPOD_WORKSPACE_ID")
+		if wsid == "" {
+			log.Error("cannot find GITPOD_WORKSPACE_ID")
+			return
+		}
+		log := log.WithField("ring", 2).WithField("workspaceId", wsid)
 
 		common_grpc.SetupLogging()
 
 		exitCode := 1
 		defer handleExit(&exitCode)
 
-		defer log.Info("done")
+		defer log.Info("ring2 stopped")
 
 		// we talk to ring1 using a Unix socket, so that we can send the seccomp fd across.
 		rconn, err := net.Dial("unix", args[0])
@@ -653,6 +816,30 @@ var ring2Cmd = &cobra.Command{
 			return
 		}
 
+		type fakeRlimit struct {
+			Cur uint64 `json:"softLimit"`
+			Max uint64 `json:"hardLimit"`
+		}
+
+		var rLimitCore fakeRlimit
+
+		rLimitValue := os.Getenv("GITPOD_RLIMIT_CORE")
+		if len(rLimitValue) != 0 {
+			err = json.Unmarshal([]byte(rLimitValue), &rLimitCore)
+			if err != nil {
+				log.WithError(err).WithField("data", rLimitValue).Error("cannot deserialize GITPOD_RLIMIT_CORE")
+			}
+		}
+
+		// we either set a limit or explicitly disable core dumps by setting 0 as values
+		err = unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{
+			Cur: rLimitCore.Cur,
+			Max: rLimitCore.Max,
+		})
+		if err != nil {
+			log.WithError(err).WithField("rlimit", rLimitCore).Error("cannot configure core dumps")
+		}
+
 		// Now that we're in our new root filesystem, including proc and all, we can load
 		// our seccomp filter, and tell our parent about it.
 		scmpFd, err := seccomp.LoadFilter()
@@ -674,7 +861,7 @@ var ring2Cmd = &cobra.Command{
 			return
 		}
 
-		err = unix.Exec(ring2Opts.SupervisorPath, []string{"supervisor", "run"}, os.Environ())
+		err = unix.Exec(ring2Opts.SupervisorPath, []string{"supervisor", "init"}, os.Environ())
 		if err != nil {
 			if eerr, ok := err.(*exec.ExitError); ok {
 				exitCode = eerr.ExitCode()
@@ -696,20 +883,6 @@ func pivotRoot(rootfs string, fsshift api.FSShiftMethod) error {
 	// /proc/self/cwd being the old root. Since we can play around with the cwd
 	// with pivot_root this allows us to pivot without creating directories in
 	// the rootfs. Shout-outs to the LXC developers for giving us this idea.
-
-	if fsshift == api.FSShiftMethod_FUSE {
-		err := unix.Chroot(rootfs)
-		if err != nil {
-			return xerrors.Errorf("cannot chroot: %v", err)
-		}
-
-		err = unix.Chdir("/")
-		if err != nil {
-			return xerrors.Errorf("cannot chdir to new root :%v", err)
-		}
-
-		return nil
-	}
 
 	oldroot, err := unix.Open("/", unix.O_DIRECTORY|unix.O_RDONLY, 0)
 	if err != nil {
@@ -809,21 +982,24 @@ func connectToInWorkspaceDaemonService(ctx context.Context) (*inWorkspaceService
 	const socketFN = "/.workspace/daemon.sock"
 
 	t := time.NewTicker(500 * time.Millisecond)
+	errs := errors.New("errors of connect to ws-daemon")
 	defer t.Stop()
 	for {
 		if _, err := os.Stat(socketFN); err == nil {
 			break
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			errs = fmt.Errorf("%v: %w", errs, err)
 		}
 
 		select {
 		case <-t.C:
 			continue
 		case <-ctx.Done():
-			return nil, xerrors.Errorf("socket did not appear before context was canceled")
+			return nil, fmt.Errorf("socket did not appear before context was canceled: %v", errs)
 		}
 	}
 
-	conn, err := grpc.DialContext(ctx, "unix://"+socketFN, grpc.WithInsecure())
+	conn, err := grpc.DialContext(ctx, "unix://"+socketFN, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
@@ -832,6 +1008,79 @@ func connectToInWorkspaceDaemonService(ctx context.Context) (*inWorkspaceService
 		InWorkspaceServiceClient: daemonapi.NewInWorkspaceServiceClient(conn),
 		conn:                     conn,
 	}, nil
+}
+
+type workspaceInfoService struct {
+	socket net.Listener
+	server *grpc.Server
+	api.UnimplementedWorkspaceInfoServiceServer
+}
+
+func startInfoService(socketDir string) (func(), error) {
+	socketFN := filepath.Join(socketDir, "info.sock")
+	if _, err := os.Stat(socketFN); err == nil {
+		_ = os.Remove(socketFN)
+	}
+
+	sckt, err := net.Listen("unix", socketFN)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create info socket: %w", err)
+	}
+
+	err = os.Chmod(socketFN, 0777)
+	if err != nil {
+		return nil, xerrors.Errorf("cannot chmod info socket: %w", err)
+	}
+
+	infoSvc := workspaceInfoService{
+		socket: sckt,
+	}
+
+	limiter := common_grpc.NewRatelimitingInterceptor(
+		map[string]common_grpc.RateLimit{
+			"iws.WorkspaceInfoService/WorkspaceInfo": {
+				RefillInterval: 1500,
+				BucketSize:     4,
+			},
+		})
+
+	infoSvc.server = grpc.NewServer(grpc.ChainUnaryInterceptor(limiter.UnaryInterceptor()))
+	api.RegisterWorkspaceInfoServiceServer(infoSvc.server, &infoSvc)
+	go func() {
+		err := infoSvc.server.Serve(sckt)
+		if err != nil {
+			log.WithError(err).Error("workspace info server failed")
+		}
+	}()
+
+	return func() {
+		infoSvc.server.Stop()
+		os.Remove(socketFN)
+	}, nil
+}
+
+var lastWorkspaceInfo *api.WorkspaceInfoResponse
+
+func (svc *workspaceInfoService) WorkspaceInfo(ctx context.Context, req *api.WorkspaceInfoRequest) (*api.WorkspaceInfoResponse, error) {
+	client, err := connectToInWorkspaceDaemonService(ctx)
+	if err != nil {
+		log.WithError(err).Error("could not connect to workspace daemon")
+		return nil, status.Error(codes.Internal, "could not resolve workspace info")
+	}
+	defer client.Close()
+
+	resp, err := client.WorkspaceInfo(ctx, &api.WorkspaceInfoRequest{})
+	if err != nil {
+		e, ok := status.FromError(err)
+		if ok && e.Code() == codes.ResourceExhausted {
+			return lastWorkspaceInfo, nil
+		}
+		log.WithError(err).Error("could not resolve workspace info")
+		return nil, status.Error(codes.Internal, "could not resolve workspace info")
+	} else {
+		lastWorkspaceInfo = resp
+	}
+	return resp, nil
 }
 
 func init() {

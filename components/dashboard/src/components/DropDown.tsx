@@ -1,26 +1,24 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
-import { useEffect, useState } from 'react';
-import ContextMenu from './ContextMenu';
+import { useEffect, useState } from "react";
+import Arrow from "./Arrow";
+import ContextMenu from "./ContextMenu";
 
 export interface DropDownProps {
     prefix?: string;
-    contextMenuWidth?: string;
-    activeEntry?: string,
+    customClasses?: string;
+    renderAsLink?: boolean;
+    activeEntry?: string;
     entries: DropDownEntry[];
 }
 
 export interface DropDownEntry {
-    title: string,
-    onClick: ()=>void
-}
-
-function Arrow(props: {up: boolean}) {
-    return <span className="mx-2 border-gray-400 dark:border-gray-600 group-hover:border-gray-600 dark:group-hover:border-gray-400" style={{ margin: 2, padding: 3, border: 'solid black', borderWidth: '0 2px 2px 0', display: 'inline-block', transform: `rotate(${props.up ? '-135deg' : '45deg'})`}}></span>
+    title: string;
+    onClick: () => void;
 }
 
 function DropDown(props: DropDownProps) {
@@ -28,20 +26,31 @@ function DropDown(props: DropDownProps) {
     useEffect(() => {
         setCurrent(props.activeEntry || props.entries[0].title);
     }, [props.activeEntry, props.entries]);
-    const enhancedEntries = props.entries.map(e => {
+    const enhancedEntries = props.entries.map((e) => {
         return {
             ...e,
             active: e.title === current,
             onClick: () => {
                 e.onClick();
                 setCurrent(e.title);
-            }
-        }
-    })
-    const font = "text-gray-400 dark:text-gray-500 text-sm leading-1 group hover:text-gray-600 dark:hover:text-gray-400 transition ease-in-out"
+            },
+        };
+    });
+    const defaultFont = "text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 ";
+    const asLinkFont = "text-blue-500 dark:text-blue-400 hover:text-blue-600 dark:hover:text-blue-500";
+    const asLinkArrowBorder =
+        "border-blue-500 dark:border-blue-400 group-hover:border-blue-600 dark:group-hover:border-blue-500";
     return (
-        <ContextMenu menuEntries={enhancedEntries} classes={`${props.contextMenuWidth} right-0`}>
-            <span className={`py-2 cursor-pointer ${font}`}>{props.prefix}{current}<Arrow up={false}/></span>
+        <ContextMenu menuEntries={enhancedEntries} customClasses={`${props.customClasses} right-0`}>
+            <span
+                className={`py-2 cursor-pointer text-sm leading-1 group ${
+                    props.renderAsLink ? asLinkFont : defaultFont
+                } transition ease-in-out`}
+            >
+                {props.prefix}
+                {current}
+                <Arrow direction={"down"} customBorderClasses={props.renderAsLink ? asLinkArrowBorder : undefined} />
+            </span>
         </ContextMenu>
     );
 }

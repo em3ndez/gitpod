@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package terminal
 
@@ -18,19 +18,14 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/supervisor/api"
 )
 
-const (
-	// closeTerminaldefaultGracePeriod is the time terminal
-	// processes get between SIGTERM and SIGKILL.
-	closeTerminaldefaultGracePeriod = 10 * time.Second
-)
-
-// NewMuxTerminalService creates a new terminal service
+// NewMuxTerminalService creates a new terminal service.
 func NewMuxTerminalService(m *Mux) *MuxTerminalService {
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -44,7 +39,7 @@ func NewMuxTerminalService(m *Mux) *MuxTerminalService {
 	}
 }
 
-// MuxTerminalService implements the terminal service API using a terminal Mux
+// MuxTerminalService implements the terminal service API using a terminal Mux.
 type MuxTerminalService struct {
 	Mux *Mux
 
@@ -53,24 +48,25 @@ type MuxTerminalService struct {
 	// if returns empty string then DefaultWorkdir is used
 	DefaultWorkdirProvider func() string
 
-	DefaultShell string
-	Env          []string
-	DefaultCreds *syscall.Credential
+	DefaultShell       string
+	Env                []string
+	DefaultCreds       *syscall.Credential
+	DefaultAmbientCaps []uintptr
 
 	api.UnimplementedTerminalServiceServer
 }
 
-// RegisterGRPC registers a gRPC service
+// RegisterGRPC registers a gRPC service.
 func (srv *MuxTerminalService) RegisterGRPC(s *grpc.Server) {
 	api.RegisterTerminalServiceServer(s, srv)
 }
 
-// RegisterREST registers a REST service
+// RegisterREST registers a REST service.
 func (srv *MuxTerminalService) RegisterREST(mux *runtime.ServeMux, grpcEndpoint string) error {
-	return api.RegisterTerminalServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithInsecure()})
+	return api.RegisterTerminalServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())})
 }
 
-// Open opens a new terminal running the shell
+// Open opens a new terminal running the shell.
 func (srv *MuxTerminalService) Open(ctx context.Context, req *api.OpenTerminalRequest) (*api.OpenTerminalResponse, error) {
 	return srv.OpenWithOptions(ctx, req, TermOptions{
 		ReadTimeout: 5 * time.Second,
@@ -99,7 +95,7 @@ func (srv *MuxTerminalService) OpenWithOptions(ctx context.Context, req *api.Ope
 	if cmd.Dir == "" {
 		cmd.Dir = srv.DefaultWorkdir
 	}
-	cmd.Env = append(srv.Env, "TERM=xterm-color")
+	cmd.Env = append(srv.Env, "TERM=xterm-256color")
 	for key, value := range req.Env {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%v=%v", key, value))
 	}
@@ -114,6 +110,14 @@ func (srv *MuxTerminalService) OpenWithOptions(ctx context.Context, req *api.Ope
 			Y:    uint16(req.Size.HeightPx),
 		}
 	}
+
+	if srv.DefaultAmbientCaps != nil {
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.AmbientCaps = srv.DefaultAmbientCaps
+	}
+
 	alias, err := srv.Mux.Start(cmd, options)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -136,9 +140,9 @@ func (srv *MuxTerminalService) OpenWithOptions(ctx context.Context, req *api.Ope
 	}, nil
 }
 
-// Close closes a terminal for the given alias
+// Close closes a terminal for the given alias.
 func (srv *MuxTerminalService) Shutdown(ctx context.Context, req *api.ShutdownTerminalRequest) (*api.ShutdownTerminalResponse, error) {
-	err := srv.Mux.CloseTerminal(req.Alias, closeTerminaldefaultGracePeriod)
+	err := srv.Mux.CloseTerminal(ctx, req.Alias, req.ForceSuccess)
 	if err == ErrNotFound {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
@@ -148,7 +152,7 @@ func (srv *MuxTerminalService) Shutdown(ctx context.Context, req *api.ShutdownTe
 	return &api.ShutdownTerminalResponse{}, nil
 }
 
-// List lists all open terminals
+// List lists all open terminals.
 func (srv *MuxTerminalService) List(ctx context.Context, req *api.ListTerminalsRequest) (*api.ListTerminalsResponse, error) {
 	srv.Mux.mu.RLock()
 	defer srv.Mux.mu.RUnlock()
@@ -167,7 +171,7 @@ func (srv *MuxTerminalService) List(ctx context.Context, req *api.ListTerminalsR
 	}, nil
 }
 
-// Get returns an open terminal info
+// Get returns an open terminal info.
 func (srv *MuxTerminalService) Get(ctx context.Context, req *api.GetTerminalRequest) (*api.Terminal, error) {
 	srv.Mux.mu.RLock()
 	defer srv.Mux.mu.RUnlock()
@@ -215,7 +219,7 @@ func (srv *MuxTerminalService) get(alias string) (*api.Terminal, bool) {
 	}, true
 }
 
-// Listen listens to a terminal
+// Listen listens to a terminal.
 func (srv *MuxTerminalService) Listen(req *api.ListenTerminalRequest, resp api.TerminalService_ListenServer) error {
 	srv.Mux.mu.RLock()
 	term, ok := srv.Mux.terms[req.Alias]
@@ -294,7 +298,7 @@ func (srv *MuxTerminalService) Listen(req *api.ListenTerminalRequest, resp api.T
 	}
 }
 
-// Write writes to a terminal
+// Write writes to a terminal.
 func (srv *MuxTerminalService) Write(ctx context.Context, req *api.WriteTerminalRequest) (*api.WriteTerminalResponse, error) {
 	srv.Mux.mu.RLock()
 	term, ok := srv.Mux.terms[req.Alias]
@@ -310,7 +314,7 @@ func (srv *MuxTerminalService) Write(ctx context.Context, req *api.WriteTerminal
 	return &api.WriteTerminalResponse{BytesWritten: uint32(n)}, nil
 }
 
-// SetSize sets the terminal's size
+// SetSize sets the terminal's size.
 func (srv *MuxTerminalService) SetSize(ctx context.Context, req *api.SetTerminalSizeRequest) (*api.SetTerminalSizeResponse, error) {
 	srv.Mux.mu.RLock()
 	term, ok := srv.Mux.terms[req.Alias]
@@ -338,7 +342,7 @@ func (srv *MuxTerminalService) SetSize(ctx context.Context, req *api.SetTerminal
 	return &api.SetTerminalSizeResponse{}, nil
 }
 
-// SetTitle sets the terminal's title
+// SetTitle sets the terminal's title.
 func (srv *MuxTerminalService) SetTitle(ctx context.Context, req *api.SetTerminalTitleRequest) (*api.SetTerminalTitleResponse, error) {
 	srv.Mux.mu.RLock()
 	term, ok := srv.Mux.terms[req.Alias]
@@ -350,7 +354,7 @@ func (srv *MuxTerminalService) SetTitle(ctx context.Context, req *api.SetTermina
 	return &api.SetTerminalTitleResponse{}, nil
 }
 
-// UpdateAnnotations sets the terminal's title
+// UpdateAnnotations sets the terminal's title.
 func (srv *MuxTerminalService) UpdateAnnotations(ctx context.Context, req *api.UpdateTerminalAnnotationsRequest) (*api.UpdateTerminalAnnotationsResponse, error) {
 	srv.Mux.mu.RLock()
 	term, ok := srv.Mux.terms[req.Alias]

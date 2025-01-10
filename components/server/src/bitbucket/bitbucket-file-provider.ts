@@ -1,36 +1,61 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { Commit, Repository, User } from "@gitpod/gitpod-protocol";
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { inject, injectable } from 'inversify';
-import { FileProvider, MaybeContent } from "../repohost/file-provider";
-import { BitbucketApiFactory } from './bitbucket-api-factory';
-
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
+import { inject, injectable } from "inversify";
+import { FileProvider, MaybeContent, RevisionNotFoundError } from "../repohost/file-provider";
+import { BitbucketApiFactory } from "./bitbucket-api-factory";
+import { handleBitbucketError } from "../bitbucket-server/utils";
 
 @injectable()
 export class BitbucketFileProvider implements FileProvider {
-
     @inject(BitbucketApiFactory) protected readonly apiFactory: BitbucketApiFactory;
 
     public async getGitpodFileContent(commit: Commit, user: User): Promise<MaybeContent> {
         const yamlVersion1 = await Promise.all([
-            this.getFileContent(commit, user, '.gitpod.yml'),
-            this.getFileContent(commit, user, '.gitpod')
+            this.getFileContent(commit, user, ".gitpod.yml"),
+            this.getFileContent(commit, user, ".gitpod"),
         ]);
-        return yamlVersion1.filter(f => !!f)[0];
+        return yamlVersion1.filter((f) => !!f)[0];
     }
 
-    public async getLastChangeRevision(repository: Repository, revisionOrBranch: string, user: User, path: string): Promise<string> {
+    public async getLastChangeRevision(
+        repository: Repository,
+        revisionOrBranch: string,
+        user: User,
+        path: string,
+    ): Promise<string> {
         try {
             const api = await this.apiFactory.create(user);
-            const fileMetaData = (await api.repositories.readSrc({ workspace: repository.owner, repo_slug: repository.name, node: revisionOrBranch, path, format: "meta" })).data;
-            return (fileMetaData as any).commit.hash;
+            const fileMetaData = (
+                await api.repositories.listFileHistory({
+                    workspace: repository.owner,
+                    repo_slug: repository.name,
+                    commit: revisionOrBranch,
+                    pagelen: 1,
+                    renames: "false",
+                    path,
+                })
+            ).data;
+            const lastCommit = fileMetaData.values?.[0].commit?.hash;
+            if (!lastCommit) {
+                throw new Error(`No commits found for ${path} in repository ${repository.owner}/${repository.name}`);
+            }
+
+            return lastCommit;
         } catch (err) {
-            log.error({ userId: user.id }, err);
+            const error = err instanceof Error ? handleBitbucketError(err) : err;
+            if (error.status && error.status === 404) {
+                throw new RevisionNotFoundError(
+                    `File ${path} does not exist in repository ${repository.owner}/${repository.name}`,
+                );
+            }
+
+            log.error({ userId: user.id }, error);
             throw new Error(`Could not fetch ${path} of repository ${repository.owner}/${repository.name}: ${err}`);
         }
     }
@@ -40,12 +65,21 @@ export class BitbucketFileProvider implements FileProvider {
             return undefined;
         }
 
+        const { repository, revision } = commit;
         try {
             const api = await this.apiFactory.create(user);
-            const contents = (await api.repositories.readSrc({ workspace: commit.repository.owner, repo_slug: commit.repository.name, node: commit.revision, path })).data;
+            const contents = (
+                await api.repositories.readSrc({
+                    workspace: repository.owner,
+                    repo_slug: repository.name,
+                    commit: revision,
+                    path,
+                })
+            ).data;
             return contents as string;
         } catch (err) {
-            log.error({ userId: user.id }, err);
+            const error = err instanceof Error ? handleBitbucketError(err) : err;
+            log.debug({ userId: user.id }, error);
         }
     }
 }

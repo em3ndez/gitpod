@@ -1,28 +1,46 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package resolve
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/containerd/containerd/remotes"
 	dockerremote "github.com/containerd/containerd/remotes/docker"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/opencontainers/go-digest"
 	"github.com/opentracing/opentracing-go"
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
 	"github.com/gitpod-io/gitpod/image-builder/pkg/auth"
+	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// ErrNotFound is returned when the reference was not found
-var ErrNotFound = xerrors.Errorf("not found")
+var (
+	// ErrNotFound is returned when the reference was not found
+	ErrNotFound = xerrors.Errorf("not found")
+
+	// ErrNotFound is returned when we're not authorized to return the reference
+	ErrUnauthorized = xerrors.Errorf("not authorized")
+
+	// TooManyRequestsMatcher returns true if an error is a code 429 "Too Many Requests" error
+	TooManyRequestsMatcher = func(err error) bool {
+		if err == nil {
+			return false
+		}
+		return strings.Contains(err.Error(), "429 Too Many Requests")
+	}
+)
 
 // StandaloneRefResolver can resolve image references without a Docker daemon
 type StandaloneRefResolver struct {
@@ -59,34 +77,78 @@ func (sr *StandaloneRefResolver) Resolve(ctx context.Context, ref string, opts .
 
 	// The ref may be what Docker calls a "familiar" name, e.g. ubuntu:latest instead of docker.io/library/ubuntu:latest.
 	// To make this a valid digested form we first need to normalize that familiar name.
-	pref, err := reference.ParseNormalizedNamed(ref)
+	pref, err := reference.ParseDockerRef(ref)
 	if err != nil {
 		return "", xerrors.Errorf("cannt resolve image ref: %w", err)
 	}
 
-	// The reference is already in digest form we don't have to do anything
-	if _, ok := pref.(reference.Canonical); ok {
-		span.LogKV("result", ref)
-		return ref, nil
-	}
-
-	// Some users don't specify a tag, and Docker assumes "latest" - we follow the same convention
-	if _, ok := pref.(reference.Tagged); !ok {
-		pref, err = reference.WithTag(pref, "latest")
-		if err != nil {
-			return "", err
-		}
-	}
-
 	nref := pref.String()
+	pref = reference.TrimNamed(pref)
 	span.LogKV("normalized-ref", nref)
 
-	res, _, err = r.Resolve(ctx, nref)
-	if err != nil && strings.Contains(err.Error(), "not found") {
-		err = ErrNotFound
+	res, desc, err := r.Resolve(ctx, nref)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			err = ErrNotFound
+		} else if strings.Contains(err.Error(), "Unauthorized") {
+			err = ErrUnauthorized
+		}
+		return
+	}
+	fetcher, err := r.Fetcher(ctx, res)
+	if err != nil {
+		return
 	}
 
-	return
+	in, err := fetcher.Fetch(ctx, desc)
+	if err != nil {
+		return
+	}
+	defer in.Close()
+	buf, err := io.ReadAll(in)
+	if err != nil {
+		return
+	}
+
+	var mf ociv1.Manifest
+	err = json.Unmarshal(buf, &mf)
+	if err != nil {
+		return "", fmt.Errorf("cannot unmarshal manifest: %w", err)
+	}
+
+	if mf.Config.Size != 0 {
+		pref, err = reference.WithDigest(pref, desc.Digest)
+		if err != nil {
+			return
+		}
+		return pref.String(), nil
+	}
+
+	var mfl ociv1.Index
+	err = json.Unmarshal(buf, &mfl)
+	if err != nil {
+		return
+	}
+
+	var dgst digest.Digest
+	for _, mf := range mfl.Manifests {
+		if mf.Platform == nil {
+			continue
+		}
+		if fmt.Sprintf("%s-%s", mf.Platform.OS, mf.Platform.Architecture) == "linux-amd64" {
+			dgst = mf.Digest
+			break
+		}
+	}
+	if dgst == "" {
+		return "", fmt.Errorf("no manifest for platform linux-amd64 found")
+	}
+
+	pref, err = reference.WithDigest(pref, dgst)
+	if err != nil {
+		return
+	}
+	return pref.String(), nil
 }
 
 type opts struct {
@@ -98,6 +160,10 @@ type DockerRefResolverOption func(o *opts)
 
 // WithAuthentication sets a base64 encoded authentication for accessing a Docker registry
 func WithAuthentication(auth *auth.Authentication) DockerRefResolverOption {
+	if auth == nil {
+		log.Debug("WithAuthentication - auth was nil")
+	}
+
 	return func(o *opts) {
 		o.Auth = auth
 	}
@@ -122,6 +188,7 @@ type DockerRefResolver interface {
 type PrecachingRefResolver struct {
 	Resolver   DockerRefResolver
 	Candidates []string
+	Auth       auth.RegistryAuthenticator
 
 	mu    sync.RWMutex
 	cache map[string]string
@@ -142,7 +209,24 @@ func (pr *PrecachingRefResolver) StartCaching(ctx context.Context, interval time
 	pr.cache = make(map[string]string)
 	for {
 		for _, c := range pr.Candidates {
-			res, err := pr.Resolver.Resolve(ctx, c)
+			var opts []DockerRefResolverOption
+			if pr.Auth != ((auth.RegistryAuthenticator)(nil)) {
+				ref, err := reference.ParseNormalizedNamed(c)
+				if err != nil {
+					log.WithError(err).WithField("ref", c).Warn("unable to precache reference: cannot parse")
+					continue
+				}
+
+				auth, err := pr.Auth.Authenticate(ctx, reference.Domain(ref))
+				if err != nil {
+					log.WithError(err).WithField("ref", c).Warn("unable to precache reference: cannot authenticate")
+					continue
+				}
+
+				opts = append(opts, WithAuthentication(auth))
+			}
+
+			res, err := pr.Resolver.Resolve(ctx, c, opts...)
 			if err != nil {
 				log.WithError(err).WithField("ref", c).Warn("unable to precache reference")
 				continue
