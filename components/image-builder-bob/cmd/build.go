@@ -1,17 +1,19 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
 import (
+	"errors"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/gitpod-io/gitpod/image-builder/bob/pkg/builder"
+	"github.com/spf13/cobra"
 
 	log "github.com/gitpod-io/gitpod/common-go/log"
-	"github.com/spf13/cobra"
+	"github.com/gitpod-io/gitpod/image-builder/bob/pkg/builder"
 )
 
 // buildCmd represents the build command
@@ -19,6 +21,9 @@ var buildCmd = &cobra.Command{
 	Use:   "build",
 	Short: "Runs the image build and is configured using environment variables (see pkg/builder/config.go for details)",
 	Run: func(cmd *cobra.Command, args []string) {
+		log.Init("bob", "", true, true)
+		log := log.WithField("command", "build")
+
 		t0 := time.Now()
 		if os.Geteuid() != 0 {
 			log.Fatal("must run as root")
@@ -29,6 +34,14 @@ var buildCmd = &cobra.Command{
 
 		cfg, err := builder.GetConfigFromEnv()
 		if err != nil {
+			if errors.Is(err, builder.DockerfilePathNotExists) {
+				dockerfilePath := strings.TrimPrefix(os.Getenv("BOB_DOCKERFILE_PATH"), "/workspace/")
+				err = os.WriteFile("/workspace/.gitpod/bob.log", []byte("could not find Dockerfile at \""+dockerfilePath+"\". Please double-check the value specified in image.file in .gitpod.yml"), 0644)
+				if err != nil {
+					log.WithError(err).Error("cannot write init message to /workspace/.gitpod/bob.log")
+				}
+			}
+
 			log.WithError(err).Fatal("cannot get config")
 			return
 		}
@@ -40,12 +53,17 @@ var buildCmd = &cobra.Command{
 		if err != nil {
 			log.WithError(err).Error("build failed")
 
-			// make sure we're running long enough to have our logs read
-			if dt := time.Since(t0); dt < 5*time.Second {
-				time.Sleep(dt)
+			err := os.WriteFile("/workspace/.gitpod/bob.log", []byte(err.Error()), 0644)
+			if err != nil {
+				log.WithError(err).Error("cannot write error to /workspace/.gitpod/bob.log")
 			}
 
-			return
+			// make sure we're running long enough to have our logs read
+			if dt := time.Since(t0); dt < 5*time.Second {
+				time.Sleep(10 * time.Second)
+			}
+
+			os.Exit(1)
 		}
 	},
 }

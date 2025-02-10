@@ -5,11 +5,12 @@
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
  */
 
-import { MessageConnection, ResponseError } from "vscode-jsonrpc";
+import { MessageConnection } from "vscode-jsonrpc";
 import { Event, Emitter } from "../util/event";
 import { Disposable } from "../util/disposable";
-import { ConnectionHandler } from './handler';
-import { log } from '../util/logging';
+import { ConnectionHandler } from "./handler";
+import { log } from "../util/logging";
+import { ApplicationError } from "./error";
 
 export type JsonRpcServer<Client> = Disposable & {
     /**
@@ -27,10 +28,7 @@ export interface JsonRpcConnectionEventEmitter {
 export type JsonRpcProxy<T> = T & JsonRpcConnectionEventEmitter;
 
 export class JsonRpcConnectionHandler<T extends object> implements ConnectionHandler {
-    constructor(
-        readonly path: string,
-        readonly targetFactory: (proxy: JsonRpcProxy<T>, request?: object) => any
-    ) { }
+    constructor(readonly path: string, readonly targetFactory: (proxy: JsonRpcProxy<T>, request?: object) => any) {}
 
     onConnection(connection: MessageConnection, request?: object): void {
         const factory = new JsonRpcProxyFactory<T>();
@@ -83,7 +81,6 @@ export class JsonRpcConnectionHandler<T extends object> implements ConnectionHan
  * @param <T> - The type of the object to expose to JSON-RPC.
  */
 export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
-
     protected readonly onDidOpenConnectionEmitter = new Emitter<void>();
     protected readonly onDidCloseConnectionEmitter = new Emitter<void>();
 
@@ -101,17 +98,19 @@ export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
     }
 
     protected waitForConnection(): void {
-        this.connectionPromise = new Promise(resolve =>
-            this.connectionPromiseResolve = resolve
-        );
-        this.connectionPromise.then(connection => {
-            connection.onClose(() => this.fireConnectionClosed());
-            this.fireConnectionOpened();
-        });
+        this.connectionPromise = new Promise((resolve) => (this.connectionPromiseResolve = resolve));
+        this.connectionPromise
+            .then((connection) => {
+                connection.onClose(() => this.fireConnectionClosed());
+                this.fireConnectionOpened();
+            })
+            .catch((err) => {
+                log.error("Error while waiting for connection", err);
+            });
     }
 
     fireConnectionClosed() {
-        this.onDidCloseConnectionEmitter.fire(undefined)
+        this.onDidCloseConnectionEmitter.fire(undefined);
     }
 
     fireConnectionOpened() {
@@ -125,7 +124,9 @@ export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
      * response.
      */
     listen(connection: MessageConnection) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         connection.onRequest((method: string, ...params: any[]) => this.onRequest(method, ...params));
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         connection.onNotification((method: string, ...params: any[]) => this.onNotification(method, ...params));
         connection.onDispose(() => this.waitForConnection());
         connection.listen();
@@ -148,7 +149,7 @@ export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
         try {
             return await this.target[method](...args);
         } catch (e) {
-            if (e instanceof ResponseError) {
+            if (ApplicationError.hasErrorCode(e)) {
                 log.info(`Request ${method} unsuccessful: ${e.code}/"${e.message}"`, { method, args });
             } else {
                 log.error(`Request ${method} failed with internal server error`, e, { method, args });
@@ -177,7 +178,7 @@ export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
      * If `T` implements `JsonRpcServer` then a client is used as a target object for a remote target object.
      */
     createProxy(): JsonRpcProxy<T> {
-        const result = new Proxy<T>(this as any, this);
+        const result = new Proxy<T>(this as unknown as T, this);
         return result as any;
     }
 
@@ -204,35 +205,36 @@ export class JsonRpcProxyFactory<T extends object> implements ProxyHandler<T> {
      * @returns A callable that executes the JSON-RPC call.
      */
     get(target: T, p: PropertyKey, receiver: any): any {
-        if (p === 'setClient') {
+        if (p === "setClient") {
             return (client: any) => {
                 this.target = client;
             };
         }
-        if (p === 'onDidOpenConnection') {
+        if (p === "onDidOpenConnection") {
             return this.onDidOpenConnectionEmitter.event;
         }
-        if (p === 'onDidCloseConnection') {
+        if (p === "onDidCloseConnection") {
             return this.onDidCloseConnectionEmitter.event;
         }
         const isNotify = this.isNotification(p);
         return (...args: any[]) =>
-            this.connectionPromise.then(connection =>
-                new Promise((resolve, reject) => {
-                    try {
-                        if (isNotify) {
-                            connection.sendNotification(p.toString(), ...args);
-                            resolve(undefined);
-                        } else {
-                            const resultPromise = connection.sendRequest(p.toString(), ...args) as Promise<any>;
-                            resultPromise
-                                .catch((err: any) => reject(err))
-                                .then((result: any) => resolve(result));
+            this.connectionPromise.then(
+                (connection) =>
+                    new Promise((resolve, reject) => {
+                        try {
+                            if (isNotify) {
+                                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+                                connection.sendNotification(p.toString(), ...args);
+                                resolve(undefined);
+                            } else {
+                                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+                                const resultPromise = connection.sendRequest(p.toString(), ...args) as Promise<any>;
+                                resultPromise.then(resolve, reject);
+                            }
+                        } catch (err) {
+                            reject(err);
                         }
-                    } catch (err) {
-                        reject(err);
-                    }
-                })
+                    }),
             );
     }
 

@@ -1,7 +1,7 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2023 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 // source: initializer.proto
@@ -19,7 +19,7 @@
 
 var jspb = require('google-protobuf');
 var goog = jspb;
-var global = Function('return this')();
+var global = (function() { return this || window || global || self || Function('return this')(); }).call(null);
 
 goog.exportSymbol('proto.contentservice.CloneTargetMode', null, global);
 goog.exportSymbol('proto.contentservice.CompositeInitializer', null, global);
@@ -214,7 +214,7 @@ if (goog.DEBUG && !COMPILED) {
  * @constructor
  */
 proto.contentservice.PrebuildInitializer = function(opt_data) {
-  jspb.Message.initialize(this, opt_data, 0, -1, null, null);
+  jspb.Message.initialize(this, opt_data, 0, -1, proto.contentservice.PrebuildInitializer.repeatedFields_, null);
 };
 goog.inherits(proto.contentservice.PrebuildInitializer, jspb.Message);
 if (goog.DEBUG && !COMPILED) {
@@ -1432,7 +1432,8 @@ proto.contentservice.GitInitializer.toObject = function(includeInstance, msg) {
     targetMode: jspb.Message.getFieldWithDefault(msg, 3, 0),
     cloneTaget: jspb.Message.getFieldWithDefault(msg, 4, ""),
     checkoutLocation: jspb.Message.getFieldWithDefault(msg, 5, ""),
-    config: (f = msg.getConfig()) && proto.contentservice.GitConfig.toObject(includeInstance, f)
+    config: (f = msg.getConfig()) && proto.contentservice.GitConfig.toObject(includeInstance, f),
+    fullClone: jspb.Message.getBooleanFieldWithDefault(msg, 7, false)
   };
 
   if (includeInstance) {
@@ -1493,6 +1494,10 @@ proto.contentservice.GitInitializer.deserializeBinaryFromReader = function(msg, 
       var value = new proto.contentservice.GitConfig;
       reader.readMessage(value,proto.contentservice.GitConfig.deserializeBinaryFromReader);
       msg.setConfig(value);
+      break;
+    case 7:
+      var value = /** @type {boolean} */ (reader.readBool());
+      msg.setFullClone(value);
       break;
     default:
       reader.skipField();
@@ -1564,6 +1569,13 @@ proto.contentservice.GitInitializer.serializeBinaryToWriter = function(message, 
       6,
       f,
       proto.contentservice.GitConfig.serializeBinaryToWriter
+    );
+  }
+  f = message.getFullClone();
+  if (f) {
+    writer.writeBool(
+      7,
+      f
     );
   }
 };
@@ -1693,6 +1705,24 @@ proto.contentservice.GitInitializer.prototype.clearConfig = function() {
  */
 proto.contentservice.GitInitializer.prototype.hasConfig = function() {
   return jspb.Message.getField(this, 6) != null;
+};
+
+
+/**
+ * optional bool full_clone = 7;
+ * @return {boolean}
+ */
+proto.contentservice.GitInitializer.prototype.getFullClone = function() {
+  return /** @type {boolean} */ (jspb.Message.getBooleanFieldWithDefault(this, 7, false));
+};
+
+
+/**
+ * @param {boolean} value
+ * @return {!proto.contentservice.GitInitializer} returns this
+ */
+proto.contentservice.GitInitializer.prototype.setFullClone = function(value) {
+  return jspb.Message.setProto3BooleanField(this, 7, value);
 };
 
 
@@ -1981,7 +2011,8 @@ proto.contentservice.SnapshotInitializer.prototype.toObject = function(opt_inclu
  */
 proto.contentservice.SnapshotInitializer.toObject = function(includeInstance, msg) {
   var f, obj = {
-    snapshot: jspb.Message.getFieldWithDefault(msg, 1, "")
+    snapshot: jspb.Message.getFieldWithDefault(msg, 1, ""),
+    fromVolumeSnapshot: jspb.Message.getBooleanFieldWithDefault(msg, 2, false)
   };
 
   if (includeInstance) {
@@ -2022,6 +2053,10 @@ proto.contentservice.SnapshotInitializer.deserializeBinaryFromReader = function(
       var value = /** @type {string} */ (reader.readString());
       msg.setSnapshot(value);
       break;
+    case 2:
+      var value = /** @type {boolean} */ (reader.readBool());
+      msg.setFromVolumeSnapshot(value);
+      break;
     default:
       reader.skipField();
       break;
@@ -2058,6 +2093,13 @@ proto.contentservice.SnapshotInitializer.serializeBinaryToWriter = function(mess
       f
     );
   }
+  f = message.getFromVolumeSnapshot();
+  if (f) {
+    writer.writeBool(
+      2,
+      f
+    );
+  }
 };
 
 
@@ -2079,6 +2121,31 @@ proto.contentservice.SnapshotInitializer.prototype.setSnapshot = function(value)
 };
 
 
+/**
+ * optional bool from_volume_snapshot = 2;
+ * @return {boolean}
+ */
+proto.contentservice.SnapshotInitializer.prototype.getFromVolumeSnapshot = function() {
+  return /** @type {boolean} */ (jspb.Message.getBooleanFieldWithDefault(this, 2, false));
+};
+
+
+/**
+ * @param {boolean} value
+ * @return {!proto.contentservice.SnapshotInitializer} returns this
+ */
+proto.contentservice.SnapshotInitializer.prototype.setFromVolumeSnapshot = function(value) {
+  return jspb.Message.setProto3BooleanField(this, 2, value);
+};
+
+
+
+/**
+ * List of repeated fields within this message type.
+ * @private {!Array<number>}
+ * @const
+ */
+proto.contentservice.PrebuildInitializer.repeatedFields_ = [2];
 
 
 
@@ -2112,7 +2179,8 @@ proto.contentservice.PrebuildInitializer.prototype.toObject = function(opt_inclu
 proto.contentservice.PrebuildInitializer.toObject = function(includeInstance, msg) {
   var f, obj = {
     prebuild: (f = msg.getPrebuild()) && proto.contentservice.SnapshotInitializer.toObject(includeInstance, f),
-    git: (f = msg.getGit()) && proto.contentservice.GitInitializer.toObject(includeInstance, f)
+    gitList: jspb.Message.toObjectList(msg.getGitList(),
+    proto.contentservice.GitInitializer.toObject, includeInstance)
   };
 
   if (includeInstance) {
@@ -2157,7 +2225,7 @@ proto.contentservice.PrebuildInitializer.deserializeBinaryFromReader = function(
     case 2:
       var value = new proto.contentservice.GitInitializer;
       reader.readMessage(value,proto.contentservice.GitInitializer.deserializeBinaryFromReader);
-      msg.setGit(value);
+      msg.addGit(value);
       break;
     default:
       reader.skipField();
@@ -2196,9 +2264,9 @@ proto.contentservice.PrebuildInitializer.serializeBinaryToWriter = function(mess
       proto.contentservice.SnapshotInitializer.serializeBinaryToWriter
     );
   }
-  f = message.getGit();
-  if (f != null) {
-    writer.writeMessage(
+  f = message.getGitList();
+  if (f.length > 0) {
+    writer.writeRepeatedMessage(
       2,
       f,
       proto.contentservice.GitInitializer.serializeBinaryToWriter
@@ -2245,39 +2313,40 @@ proto.contentservice.PrebuildInitializer.prototype.hasPrebuild = function() {
 
 
 /**
- * optional GitInitializer git = 2;
- * @return {?proto.contentservice.GitInitializer}
+ * repeated GitInitializer git = 2;
+ * @return {!Array<!proto.contentservice.GitInitializer>}
  */
-proto.contentservice.PrebuildInitializer.prototype.getGit = function() {
-  return /** @type{?proto.contentservice.GitInitializer} */ (
-    jspb.Message.getWrapperField(this, proto.contentservice.GitInitializer, 2));
+proto.contentservice.PrebuildInitializer.prototype.getGitList = function() {
+  return /** @type{!Array<!proto.contentservice.GitInitializer>} */ (
+    jspb.Message.getRepeatedWrapperField(this, proto.contentservice.GitInitializer, 2));
 };
 
 
 /**
- * @param {?proto.contentservice.GitInitializer|undefined} value
+ * @param {!Array<!proto.contentservice.GitInitializer>} value
  * @return {!proto.contentservice.PrebuildInitializer} returns this
 */
-proto.contentservice.PrebuildInitializer.prototype.setGit = function(value) {
-  return jspb.Message.setWrapperField(this, 2, value);
+proto.contentservice.PrebuildInitializer.prototype.setGitList = function(value) {
+  return jspb.Message.setRepeatedWrapperField(this, 2, value);
 };
 
 
 /**
- * Clears the message field making it undefined.
+ * @param {!proto.contentservice.GitInitializer=} opt_value
+ * @param {number=} opt_index
+ * @return {!proto.contentservice.GitInitializer}
+ */
+proto.contentservice.PrebuildInitializer.prototype.addGit = function(opt_value, opt_index) {
+  return jspb.Message.addToRepeatedWrapperField(this, 2, opt_value, proto.contentservice.GitInitializer, opt_index);
+};
+
+
+/**
+ * Clears the list making it empty but non-null.
  * @return {!proto.contentservice.PrebuildInitializer} returns this
  */
-proto.contentservice.PrebuildInitializer.prototype.clearGit = function() {
-  return this.setGit(undefined);
-};
-
-
-/**
- * Returns whether this field is set.
- * @return {boolean}
- */
-proto.contentservice.PrebuildInitializer.prototype.hasGit = function() {
-  return jspb.Message.getField(this, 2) != null;
+proto.contentservice.PrebuildInitializer.prototype.clearGitList = function() {
+  return this.setGitList([]);
 };
 
 
@@ -2313,7 +2382,8 @@ proto.contentservice.FromBackupInitializer.prototype.toObject = function(opt_inc
  */
 proto.contentservice.FromBackupInitializer.toObject = function(includeInstance, msg) {
   var f, obj = {
-
+    checkoutLocation: jspb.Message.getFieldWithDefault(msg, 1, ""),
+    fromVolumeSnapshot: jspb.Message.getBooleanFieldWithDefault(msg, 2, false)
   };
 
   if (includeInstance) {
@@ -2350,6 +2420,14 @@ proto.contentservice.FromBackupInitializer.deserializeBinaryFromReader = functio
     }
     var field = reader.getFieldNumber();
     switch (field) {
+    case 1:
+      var value = /** @type {string} */ (reader.readString());
+      msg.setCheckoutLocation(value);
+      break;
+    case 2:
+      var value = /** @type {boolean} */ (reader.readBool());
+      msg.setFromVolumeSnapshot(value);
+      break;
     default:
       reader.skipField();
       break;
@@ -2379,6 +2457,56 @@ proto.contentservice.FromBackupInitializer.prototype.serializeBinary = function(
  */
 proto.contentservice.FromBackupInitializer.serializeBinaryToWriter = function(message, writer) {
   var f = undefined;
+  f = message.getCheckoutLocation();
+  if (f.length > 0) {
+    writer.writeString(
+      1,
+      f
+    );
+  }
+  f = message.getFromVolumeSnapshot();
+  if (f) {
+    writer.writeBool(
+      2,
+      f
+    );
+  }
+};
+
+
+/**
+ * optional string checkout_location = 1;
+ * @return {string}
+ */
+proto.contentservice.FromBackupInitializer.prototype.getCheckoutLocation = function() {
+  return /** @type {string} */ (jspb.Message.getFieldWithDefault(this, 1, ""));
+};
+
+
+/**
+ * @param {string} value
+ * @return {!proto.contentservice.FromBackupInitializer} returns this
+ */
+proto.contentservice.FromBackupInitializer.prototype.setCheckoutLocation = function(value) {
+  return jspb.Message.setProto3StringField(this, 1, value);
+};
+
+
+/**
+ * optional bool from_volume_snapshot = 2;
+ * @return {boolean}
+ */
+proto.contentservice.FromBackupInitializer.prototype.getFromVolumeSnapshot = function() {
+  return /** @type {boolean} */ (jspb.Message.getBooleanFieldWithDefault(this, 2, false));
+};
+
+
+/**
+ * @param {boolean} value
+ * @return {!proto.contentservice.FromBackupInitializer} returns this
+ */
+proto.contentservice.FromBackupInitializer.prototype.setFromVolumeSnapshot = function(value) {
+  return jspb.Message.setProto3BooleanField(this, 2, value);
 };
 
 

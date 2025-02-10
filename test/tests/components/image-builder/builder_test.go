@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package imagebuilder
 
@@ -13,6 +13,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
@@ -24,11 +26,13 @@ import (
 func TestBaseImageBuild(t *testing.T) {
 	f := features.New("database").
 		WithLabel("component", "image-builder").
-		Assess("it should build a base image", func(_ context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		Assess("it should build a base image", func(testCtx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(testCtx, 5*time.Minute)
 			defer cancel()
 
-			api := integration.NewComponentAPI(ctx, cfg.Namespace(), cfg.Client())
+			api := integration.NewComponentAPI(ctx, cfg.Namespace(), kubeconfig, cfg.Client())
 			t.Cleanup(func() {
 				api.Done(t)
 			})
@@ -40,16 +44,17 @@ func TestBaseImageBuild(t *testing.T) {
 
 			bld, err := client.Build(ctx, &imgapi.BuildRequest{
 				ForceRebuild: true,
+				TriggeredBy:  "integration-test",
 				Source: &imgapi.BuildSource{
 					From: &imgapi.BuildSource_File{
 						File: &imgapi.BuildSourceDockerfile{
 							DockerfileVersion: "some-version",
-							DockerfilePath:    ".gitpod.Dockerfile",
+							DockerfilePath:    "test/tests/components/image-builder/test.Dockerfile",
 							ContextPath:       ".",
 							Source: &csapi.WorkspaceInitializer{
 								Spec: &csapi.WorkspaceInitializer_Git{
 									Git: &csapi.GitInitializer{
-										RemoteUri:  "https://github.com/gitpod-io/dazzle.git",
+										RemoteUri:  "https://github.com/gitpod-io/gitpod.git",
 										TargetMode: csapi.CloneTargetMode_REMOTE_BRANCH,
 										CloneTaget: "main",
 										Config: &csapi.GitConfig{
@@ -74,6 +79,9 @@ func TestBaseImageBuild(t *testing.T) {
 				}
 
 				if err != nil {
+					if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+						continue
+					}
 					t.Fatal(err)
 				}
 
@@ -83,14 +91,14 @@ func TestBaseImageBuild(t *testing.T) {
 				} else if msg.Status == imgapi.BuildStatus_done_failure {
 					t.Fatalf("image build failed: %s", msg.Message)
 				} else {
-					t.Logf("build output: %s", msg.Message)
+					t.Logf("build output: %s, %s", msg.Message, msg.Info)
 				}
 			}
 			if ref == "" {
 				t.Fatal("ref was empty")
 			}
 
-			return ctx
+			return testCtx
 		}).
 		Feature()
 
@@ -100,11 +108,13 @@ func TestBaseImageBuild(t *testing.T) {
 func TestParallelBaseImageBuild(t *testing.T) {
 	f := features.New("image-builder").
 		WithLabel("component", "image-builder").
-		Assess("it should allow parallel build of images", func(_ context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		Assess("it should allow parallel build of images", func(testCtx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(testCtx, 5*time.Minute)
 			defer cancel()
 
-			api := integration.NewComponentAPI(ctx, cfg.Namespace(), cfg.Client())
+			api := integration.NewComponentAPI(ctx, cfg.Namespace(), kubeconfig, cfg.Client())
 			t.Cleanup(func() {
 				api.Done(t)
 			})
@@ -116,16 +126,17 @@ func TestParallelBaseImageBuild(t *testing.T) {
 
 			req := &imgapi.BuildRequest{
 				ForceRebuild: true,
+				TriggeredBy:  "integration-test",
 				Source: &imgapi.BuildSource{
 					From: &imgapi.BuildSource_File{
 						File: &imgapi.BuildSourceDockerfile{
 							DockerfileVersion: "some-version",
-							DockerfilePath:    ".gitpod.Dockerfile",
+							DockerfilePath:    "test/tests/components/image-builder/test.Dockerfile",
 							ContextPath:       ".",
 							Source: &csapi.WorkspaceInitializer{
 								Spec: &csapi.WorkspaceInitializer_Git{
 									Git: &csapi.GitInitializer{
-										RemoteUri:  "https://github.com/gitpod-io/dazzle.git",
+										RemoteUri:  "https://github.com/gitpod-io/gitpod.git",
 										TargetMode: csapi.CloneTargetMode_REMOTE_BRANCH,
 										CloneTaget: "main",
 										Config: &csapi.GitConfig{
@@ -194,7 +205,7 @@ func TestParallelBaseImageBuild(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			return ctx
+			return testCtx
 		}).
 		Feature()
 

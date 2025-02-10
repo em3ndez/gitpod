@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package proxy
 
@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/gitpod-io/gitpod/ws-proxy/pkg/common"
 	"github.com/google/go-cmp/cmp"
 	"github.com/gorilla/mux"
 )
@@ -23,6 +24,7 @@ func TestWorkspaceRouter(t *testing.T) {
 		Status             int
 		URL                string
 		AdditionalHitCount int
+		DebugWorkspace     string
 	}
 	tests := []struct {
 		Name         string
@@ -30,7 +32,7 @@ func TestWorkspaceRouter(t *testing.T) {
 		Headers      map[string]string
 		WSHostSuffix string
 		Router       WorkspaceRouter
-		Infos        []WorkspaceInfo
+		Infos        []common.WorkspaceInfo
 		Expected     Expectation
 	}{
 		{
@@ -45,6 +47,21 @@ func TestWorkspaceRouter(t *testing.T) {
 				WorkspaceID: "amaranth-smelt-9ba20cc1",
 				Status:      http.StatusOK,
 				URL:         "http://amaranth-smelt-9ba20cc1.ws.gitpod.dev/",
+			},
+		},
+		{
+			Name: "host-based debug workspace access",
+			URL:  "http://debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev/",
+			Headers: map[string]string{
+				forwardedHostnameHeader: "debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev",
+			},
+			Router:       HostBasedRouter(forwardedHostnameHeader, wsHostSuffix, wsHostRegex),
+			WSHostSuffix: wsHostSuffix,
+			Expected: Expectation{
+				DebugWorkspace: "true",
+				WorkspaceID:    "amaranth-smelt-9ba20cc1",
+				Status:         http.StatusOK,
+				URL:            "http://debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev/",
 			},
 		},
 		{
@@ -63,16 +80,19 @@ func TestWorkspaceRouter(t *testing.T) {
 			},
 		},
 		{
-			Name: "host-based blobserve access",
-			URL:  "http://blobserve.ws.gitpod.dev/image:version:/foo/main.js",
+			Name: "host-based debug port access",
+			URL:  "http://1234-debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev/",
 			Headers: map[string]string{
-				forwardedHostnameHeader: "blobserve.ws.gitpod.dev",
+				forwardedHostnameHeader: "1234-debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev",
 			},
 			Router:       HostBasedRouter(forwardedHostnameHeader, wsHostSuffix, wsHostRegex),
 			WSHostSuffix: wsHostSuffix,
 			Expected: Expectation{
-				Status: http.StatusOK,
-				URL:    "http://blobserve.ws.gitpod.dev/image:version:/foo/main.js",
+				DebugWorkspace: "true",
+				WorkspaceID:    "amaranth-smelt-9ba20cc1",
+				WorkspacePort:  "1234",
+				Status:         http.StatusOK,
+				URL:            "http://1234-debug-amaranth-smelt-9ba20cc1.ws.gitpod.dev/",
 			},
 		},
 	}
@@ -83,15 +103,16 @@ func TestWorkspaceRouter(t *testing.T) {
 			ideRouter, portRouter, blobserveRouter := test.Router(r, &fakeWsInfoProvider{infos: test.Infos})
 			var act Expectation
 			actRecorder := func(w http.ResponseWriter, req *http.Request) {
-				defer w.WriteHeader(200)
+				defer w.WriteHeader(http.StatusOK)
 
 				vars := mux.Vars(req)
 				if vars == nil {
 					return
 				}
 
-				act.WorkspaceID = vars[workspaceIDIdentifier]
-				act.WorkspacePort = vars[workspacePortIdentifier]
+				act.WorkspaceID = vars[common.WorkspaceIDIdentifier]
+				act.WorkspacePort = vars[common.WorkspacePortIdentifier]
+				act.DebugWorkspace = vars[common.DebugWorkspaceIdentifier]
 				act.URL = req.URL.String()
 				act.AdditionalHitCount++
 			}
@@ -157,60 +178,22 @@ func TestMatchWorkspaceHostHeader(t *testing.T) {
 			HostHeader: "",
 		},
 		{
+			Name:       "no match 2",
+			HostHeader: "0d9rkrj560blqb5s07q431ru9mhg19k1k4bqgd1dbprtgmt7vuhk" + wsHostSuffix,
+			Path:       "eu.gcr.io/gitpod-core-dev/build/ide/code:nightly@sha256:41aeea688aa0943bd746cb70c4ed378910f7c7ecf56f5f53ccb2b76c6b68e1a7/__files__/index.html",
+		},
+		{
+			Name:       "no match 3",
+			HostHeader: "v--0d9rkrj560blqb5s07q431ru9mhg19k1k4bqgd1dbprtgmt7vuhk" + wsHostSuffix,
+			Path:       "eu.gcr.io/gitpod-core-dev/build/ide/code:nightly@sha256:41aeea688aa0943bd746cb70c4ed378910f7c7ecf56f5f53ccb2b76c6b68e1a7/__files__/index.html",
+		},
+		{
 			Name:       "workspace match",
 			HostHeader: "amaranth-smelt-9ba20cc1" + wsHostSuffix,
 			Expected: matchResult{
 				MatchesWorkspace: true,
 				WorkspaceVars: map[string]string{
-					workspaceIDIdentifier: "amaranth-smelt-9ba20cc1",
-				},
-			},
-		},
-		{
-			Name:       "webview workspace match",
-			HostHeader: "webview-amaranth-smelt-9ba20cc1" + wsHostSuffix,
-			Expected: matchResult{
-				MatchesWorkspace: true,
-				WorkspaceVars: map[string]string{
-					foreignOriginIdentifier: "webview-",
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-				},
-			},
-		},
-		{
-			Name:       "unique webview workspace match",
-			HostHeader: "ad859a83-b5a8-43ef-8e82-cfbf36cafacb-webview-foreign" + wsHostSuffix,
-			Path:       "/amaranth-smelt-9ba20cc1/index.html",
-			Expected: matchResult{
-				MatchesWorkspace: true,
-				WorkspaceVars: map[string]string{
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					foreignOriginIdentifier: "ad859a83-b5a8-43ef-8e82-cfbf36cafacb-webview-",
-					foreignPathIdentifier:   "/index.html",
-				},
-			},
-		},
-		{
-			Name:       "extension host workspace match",
-			HostHeader: "extensions-foreign" + wsHostSuffix,
-			Path:       "/amaranth-smelt-9ba20cc1/index.html",
-			Expected: matchResult{
-				MatchesWorkspace: true,
-				WorkspaceVars: map[string]string{
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					foreignOriginIdentifier: "extensions-",
-					foreignPathIdentifier:   "/index.html",
-				},
-			},
-		},
-		{
-			Name:       "mini browser workspace match",
-			HostHeader: "browser-amaranth-smelt-9ba20cc1" + wsHostSuffix,
-			Expected: matchResult{
-				MatchesWorkspace: true,
-				WorkspaceVars: map[string]string{
-					foreignOriginIdentifier: "browser-",
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
+					common.WorkspaceIDIdentifier: "amaranth-smelt-9ba20cc1",
 				},
 			},
 		},
@@ -220,60 +203,8 @@ func TestMatchWorkspaceHostHeader(t *testing.T) {
 			Expected: matchResult{
 				MatchesPort: true,
 				PortVars: map[string]string{
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					workspacePortIdentifier: "8080",
-				},
-			},
-		},
-		{
-			Name:       "webview port match",
-			HostHeader: "webview-8080-amaranth-smelt-9ba20cc1" + wsHostSuffix,
-			Expected: matchResult{
-				MatchesPort: true,
-				PortVars: map[string]string{
-					foreignOriginIdentifier: "webview-",
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					workspacePortIdentifier: "8080",
-				},
-			},
-		},
-		{
-			Name:       "unique webview port match",
-			HostHeader: "ad859a83-b5a8-43ef-8e82-cfbf36cafacb-webview-foreign" + wsHostSuffix,
-			Path:       "/8080-amaranth-smelt-9ba20cc1/index.html",
-			Expected: matchResult{
-				MatchesPort: true,
-				PortVars: map[string]string{
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					workspacePortIdentifier: "8080",
-					foreignOriginIdentifier: "ad859a83-b5a8-43ef-8e82-cfbf36cafacb-webview-",
-					foreignPathIdentifier:   "/index.html",
-				},
-			},
-		},
-		{
-			Name:       "extension host port match",
-			HostHeader: "extensions-foreign" + wsHostSuffix,
-			Path:       "/8080-amaranth-smelt-9ba20cc1/index.html",
-			Expected: matchResult{
-				MatchesPort: true,
-				PortVars: map[string]string{
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					workspacePortIdentifier: "8080",
-					foreignOriginIdentifier: "extensions-",
-					foreignPathIdentifier:   "/index.html",
-				},
-			},
-		},
-		{
-			Name:       "mini browser port match",
-			HostHeader: "browser-8080-amaranth-smelt-9ba20cc1" + wsHostSuffix,
-			Expected: matchResult{
-				MatchesPort: true,
-				PortVars: map[string]string{
-					foreignOriginIdentifier: "browser-",
-					workspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
-					workspacePortIdentifier: "8080",
+					common.WorkspaceIDIdentifier:   "amaranth-smelt-9ba20cc1",
+					common.WorkspacePortIdentifier: "8080",
 				},
 			},
 		},
@@ -312,6 +243,73 @@ func TestMatchWorkspaceHostHeader(t *testing.T) {
 
 			if diff := cmp.Diff(test.Expected, res); diff != "" {
 				t.Errorf("unexpected response (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAcmeHandler(t *testing.T) {
+	type Expectation struct {
+		ContentType string
+		Code        int
+	}
+	tests := []struct {
+		Name        string
+		Method      string
+		URL         string
+		Body        []byte
+		Expectation Expectation
+	}{
+		{
+			Name:   "Valid acme request",
+			Method: http.MethodGet,
+			URL:    "http://domain.example.com/.well-known/acme-challenge/token1",
+			Expectation: Expectation{
+				Code:        403,
+				ContentType: "text/plain; charset=utf-8",
+			},
+		},
+		{
+			Name:   "Not an acme request",
+			Method: http.MethodGet,
+			URL:    "http://domain.example.com/",
+			Expectation: Expectation{
+				Code:        404,
+				ContentType: "text/plain; charset=utf-8",
+			},
+		},
+		{
+			Name:   "Valid acme request",
+			Method: http.MethodGet,
+			URL:    "http://1.1.1.1/.well-known/acme-challenge/token1",
+			Expectation: Expectation{
+				Code:        403,
+				ContentType: "text/plain; charset=utf-8",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			req, err := http.NewRequest(test.Method, test.URL, nil)
+			if err != nil {
+				t.Errorf("unexpected error:%v", err)
+			}
+
+			w := httptest.NewRecorder()
+
+			r := mux.NewRouter()
+			setupAcmeRouter(r)
+
+			r.ServeHTTP(w, req)
+
+			act := Expectation{
+				ContentType: w.Header().Get("Content-Type"),
+				Code:        w.Code,
+			}
+
+			if diff := cmp.Diff(test.Expectation, act); diff != "" {
+				t.Errorf("unexpected result (-want +got):\n%s", diff)
 			}
 		})
 	}

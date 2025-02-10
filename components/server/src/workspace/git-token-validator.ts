@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { inject, injectable } from "inversify";
@@ -16,21 +16,22 @@ export interface CheckWriteAccessResult {
     error?: any;
 }
 
-export interface  IGitTokenValidatorParams {
-    token: string
-    host: string
-    repoFullName: string
+export interface IGitTokenValidatorParams {
+    token: string;
+    host: string;
+    owner: string;
+    repo: string;
+    repoKind?: string;
 }
 
 export interface IGitTokenValidator {
     checkWriteAccess(params: IGitTokenValidatorParams): Promise<CheckWriteAccessResult | undefined>;
 }
 
-export const IGitTokenValidator = Symbol("IGitTokenValidator")
+export const IGitTokenValidator = Symbol("IGitTokenValidator");
 
 @injectable()
 export class GitTokenValidator {
-
     @inject(HostContextProvider) hostContextProvider: HostContextProvider;
 
     async checkWriteAccess(params: IGitTokenValidatorParams): Promise<CheckWriteAccessResult | undefined> {

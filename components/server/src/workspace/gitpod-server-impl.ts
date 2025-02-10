@@ -1,169 +1,338 @@
 /**
-* Copyright (c) 2020 Gitpod GmbH. All rights reserved.
-* Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
+ * Licensed under the GNU Affero General Public License (AGPL).
+ * See License.AGPL.txt in the project root for license information.
  */
 
-import { BlobServiceClient } from "@gitpod/content-service/lib/blobs_grpc_pb";
-import { DownloadUrlRequest, DownloadUrlResponse, UploadUrlRequest, UploadUrlResponse } from '@gitpod/content-service/lib/blobs_pb';
-import { AppInstallationDB, UserDB, UserMessageViewsDB, WorkspaceDB, DBWithTracing, TracedWorkspaceDB, DBGitpodToken, DBUser, UserStorageResourcesDB, TeamDB } from '@gitpod/gitpod-db/lib';
-import { AuthProviderEntry, AuthProviderInfo, Branding, CommitContext, Configuration, CreateWorkspaceMode, DisposableCollection, GetWorkspaceTimeoutResult, GitpodClient, GitpodServer, GitpodToken, GitpodTokenType, InstallPluginsParams, PermissionName, PortVisibility, PrebuiltWorkspace, PrebuiltWorkspaceContext, PreparePluginUploadParams, ResolvedPlugins, ResolvePluginsParams, SetWorkspaceTimeoutResult, StartPrebuildContext, StartWorkspaceResult, Terms, Token, UninstallPluginParams, User, UserEnvVar, UserEnvVarValue, UserInfo, WhitelistedRepository, Workspace, WorkspaceContext, WorkspaceCreationResult, WorkspaceImageBuild, WorkspaceInfo, WorkspaceInstance, WorkspaceInstancePort, WorkspaceInstanceUser, WorkspaceTimeoutDuration, GuessGitTokenScopesParams, GuessedGitTokenScopes, Team, TeamMemberInfo, TeamMembershipInvite, CreateProjectParams, Project, ProviderRepository, TeamMemberRole, WithDefaultConfig, FindPrebuildsParams, PrebuildWithStatus, StartPrebuildResult, ClientHeaderFields } from '@gitpod/gitpod-protocol';
-import { AccountStatement } from "@gitpod/gitpod-protocol/lib/accounting-protocol";
-import { AdminBlockUserRequest, AdminGetListRequest, AdminGetListResult, AdminGetWorkspacesRequest, AdminModifyPermanentWorkspaceFeatureFlagRequest, AdminModifyRoleOrPermissionRequest, WorkspaceAndInstance } from '@gitpod/gitpod-protocol/lib/admin-protocol';
-import { GetLicenseInfoResult, LicenseFeature, LicenseValidationResult } from '@gitpod/gitpod-protocol/lib/license-protocol';
-import { GitpodFileParser } from '@gitpod/gitpod-protocol/lib/gitpod-file-parser';
-import { ErrorCodes } from '@gitpod/gitpod-protocol/lib/messaging/error';
-import { GithubUpgradeURL, PlanCoupon } from "@gitpod/gitpod-protocol/lib/payment-protocol";
-import { TeamSubscription, TeamSubscriptionSlot, TeamSubscriptionSlotResolved } from "@gitpod/gitpod-protocol/lib/team-subscription-protocol";
-import { Cancelable } from '@gitpod/gitpod-protocol/lib/util/cancelable';
-import { log, LogContext } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { TraceContext } from '@gitpod/gitpod-protocol/lib/util/tracing';
-import { PageMessage, RemotePageMessage, RemoteTrackMessage, TrackMessage } from '@gitpod/gitpod-protocol/lib/analytics';
-import { ImageBuilderClientProvider, LogsRequest } from '@gitpod/image-builder/lib';
-import { WorkspaceManagerClientProvider } from '@gitpod/ws-manager/lib/client-provider';
-import { ControlPortRequest, DescribeWorkspaceRequest, MarkActiveRequest, PortSpec, PortVisibility as ProtoPortVisibility, StopWorkspacePolicy, StopWorkspaceRequest } from '@gitpod/ws-manager/lib/core_pb';
-import * as crypto from 'crypto';
-import { inject, injectable } from 'inversify';
-import * as opentracing from 'opentracing';
-import { URL } from 'url';
-import * as uuidv4 from 'uuid/v4';
-import { Disposable, ResponseError } from 'vscode-jsonrpc';
-import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
-import { AuthProviderService } from '../auth/auth-provider-service';
-import { HostContextProvider } from '../auth/host-context-provider';
-import { GuardedResource, ResourceAccessGuard, ResourceAccessOp } from '../auth/resource-access';
-import { Config } from '../config';
-import { NotFoundError, UnauthorizedError } from '../errors';
-import { parseRepoUrl } from '../repohost/repo-url';
-import { TermsProvider } from '../terms/terms-provider';
-import { TheiaPluginService } from '../theia-plugin/theia-plugin-service';
-import { AuthorizationService } from '../user/authorization-service';
-import { TokenProvider } from '../user/token-provider';
-import { UserDeletionService } from '../user/user-deletion-service';
-import { UserService } from '../user/user-service';
-import { IClientDataPrometheusAdapter } from './client-data-prometheus-adapter';
-import { ContextParser } from './context-parser-service';
-import { GitTokenScopeGuesser } from "./git-token-scope-guesser";
-import { MessageBusIntegration } from './messagebus-integration';
-import { WorkspaceDeletionService } from './workspace-deletion-service';
-import { WorkspaceFactory } from './workspace-factory';
-import { WorkspaceStarter } from './workspace-starter';
+import { UserDB, WorkspaceDB, DBWithTracing, TracedWorkspaceDB, TeamDB, DBGitpodToken } from "@gitpod/gitpod-db/lib";
+import {
+    AuthProviderEntry,
+    AuthProviderInfo,
+    Configuration,
+    DisposableCollection,
+    GetWorkspaceTimeoutResult,
+    GitpodClient as GitpodApiClient,
+    GitpodServer,
+    GitpodToken,
+    GitpodTokenType,
+    PermissionName,
+    PrebuiltWorkspace,
+    SetWorkspaceTimeoutResult,
+    StartWorkspaceResult,
+    Token,
+    User,
+    UserEnvVarValue,
+    UserInfo,
+    Workspace,
+    WorkspaceContext,
+    WorkspaceCreationResult,
+    WorkspaceInfo,
+    WorkspaceInstance,
+    WorkspaceInstancePort,
+    WorkspaceInstanceUser,
+    WorkspaceTimeoutDuration,
+    GuessGitTokenScopesParams,
+    GuessedGitTokenScopes,
+    Team,
+    TeamMemberInfo,
+    TeamMembershipInvite,
+    CreateProjectParams,
+    Project,
+    ProviderRepository,
+    TeamMemberRole,
+    FindPrebuildsParams,
+    PrebuildWithStatus,
+    StartPrebuildResult,
+    Permission,
+    SSHPublicKeyValue,
+    UserSSHPublicKeyValue,
+    RoleOrPermission,
+    WorkspaceInstanceRepoStatus,
+    GetProviderRepositoriesParams,
+    SuggestedRepository,
+    GetDefaultWorkspaceImageParams,
+    GetDefaultWorkspaceImageResult,
+    SearchRepositoriesParams,
+} from "@gitpod/gitpod-protocol";
+import { BlockedRepository } from "@gitpod/gitpod-protocol/lib/blocked-repositories-protocol";
+import {
+    AdminBlockUserRequest,
+    AdminGetListRequest,
+    AdminGetListResult,
+    AdminGetWorkspacesRequest,
+    AdminModifyPermanentWorkspaceFeatureFlagRequest,
+    AdminModifyRoleOrPermissionRequest,
+    WorkspaceAndInstance,
+} from "@gitpod/gitpod-protocol/lib/admin-protocol";
+import { ApplicationError, ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { log, LogContext } from "@gitpod/gitpod-protocol/lib/util/logging";
+import {
+    InterfaceWithTraceContext,
+    TraceContext,
+    TraceContextWithSpan,
+} from "@gitpod/gitpod-protocol/lib/util/tracing";
+import { RemoteIdentifyMessage, RemotePageMessage, RemoteTrackMessage } from "@gitpod/gitpod-protocol/lib/analytics";
+import { SupportedWorkspaceClass } from "@gitpod/gitpod-protocol/lib/workspace-class";
+import { StopWorkspacePolicy } from "@gitpod/ws-manager/lib/core_pb";
+import { inject, injectable } from "inversify";
+import { v4 as uuidv4, validate as uuidValidate } from "uuid";
+import { Disposable, CancellationToken } from "vscode-jsonrpc";
+import { AuthProviderService } from "../auth/auth-provider-service";
+import { GuardedResource, ResourceAccessGuard, ResourceAccessOp } from "../auth/resource-access";
+import { Config } from "../config";
+import { AuthorizationService } from "../user/authorization-service";
+import { UserAuthentication } from "../user/user-authentication";
+import { ContextParser } from "./context-parser-service";
+import { isClusterMaintenanceError } from "./workspace-starter";
 import { HeadlessLogUrls } from "@gitpod/gitpod-protocol/lib/headless-workspace-log";
-import { HeadlessLogService } from "./headless-log-service";
-import { InvalidGitpodYMLError } from "./config-provider";
 import { ProjectsService } from "../projects/projects-service";
+import { IDEOption, IDEOptions } from "@gitpod/gitpod-protocol/lib/ide-protocol";
+import {
+    PartialProject,
+    OrganizationSettings,
+    Organization,
+} from "@gitpod/gitpod-protocol/lib/teams-projects-protocol";
+import { ClientMetadata, traceClientMetadata } from "../websocket/websocket-connection-manager";
+import {
+    EmailDomainFilterEntry,
+    EnvVarWithValue,
+    LinkedInProfile,
+    ProjectEnvVar,
+    UserEnvVar,
+    UserFeatureSettings,
+    WorkspaceImageBuild,
+    WorkspaceTimeoutSetting,
+} from "@gitpod/gitpod-protocol/lib/protocol";
+import { ListUsageRequest, ListUsageResponse } from "@gitpod/gitpod-protocol/lib/usage";
+import { VerificationService } from "../auth/verification-service";
+import { InstallationService } from "../auth/installation-service";
+import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
+import { formatPhoneNumber } from "../user/phone-numbers";
+import { IDEService } from "../ide-service";
+import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
+import { CostCenterJSON } from "@gitpod/gitpod-protocol/lib/usage";
+import { getExperimentsClientForBackend } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
+import { LinkedInService } from "../linkedin-service";
+import { PrebuildManager } from "../prebuilds/prebuild-manager";
+import { StripeService } from "../billing/stripe-service";
+import {
+    BillingServiceClient,
+    BillingServiceDefinition,
+    StripeCustomer,
+} from "@gitpod/usage-api/lib/usage/v1/billing.pb";
+import { ClientError } from "nice-grpc-common";
+import { BillingModes } from "../billing/billing-mode";
+import { Authorizer, SYSTEM_USER, SYSTEM_USER_ID } from "../authorization/authorizer";
+import { OrganizationService } from "../orgs/organization-service";
+import { RedisSubscriber } from "../messaging/redis-subscriber";
+import { UsageService } from "../orgs/usage-service";
+import { UserService } from "../user/user-service";
+import { SSHKeyService } from "../user/sshkey-service";
+import { StartWorkspaceOptions, WorkspaceService } from "./workspace-service";
+import { GitpodTokenService } from "../user/gitpod-token-service";
+import { EnvVarService } from "../user/env-var-service";
+import { ScmService } from "../scm/scm-service";
+import { ContextService } from "./context-service";
+import { runWithRequestContext, runWithSubjectId } from "../util/request-context";
+import { SubjectId } from "../auth/subject-id";
+import { getPrimaryEmail } from "@gitpod/public-api-common/lib/user-utils";
+import { AnalyticsController } from "../analytics-controller";
+import { ClientHeaderFields } from "../express-util";
+import { filter } from "../util/objects";
+
+// shortcut
+export const traceWI = (ctx: TraceContext, wi: Omit<LogContext, "userId">) => TraceContext.setOWI(ctx, wi); // userId is already taken care of in WebsocketConnectionManager
+export const traceAPIParams = (ctx: TraceContext, params: { [key: string]: any }) =>
+    TraceContext.addJsonRPCParameters(ctx, params);
+export function censor<T>(obj: T, k: keyof T): T {
+    const r = { ...obj };
+    delete (r as any)[k];
+    return r;
+}
+
+export type GitpodServerWithTracing = InterfaceWithTraceContext<GitpodServer>;
 
 @injectable()
-export class GitpodServerImpl<Client extends GitpodClient, Server extends GitpodServer> implements GitpodServer, Disposable {
+export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
+    constructor(
+        @inject(Config) private readonly config: Config,
+        @inject(TracedWorkspaceDB) private readonly workspaceDb: DBWithTracing<WorkspaceDB>,
+        @inject(ContextParser) private contextParser: ContextParser,
 
-    @inject(Config) protected readonly config: Config;
-    @inject(TracedWorkspaceDB) protected readonly workspaceDb: DBWithTracing<WorkspaceDB>;
-    @inject(WorkspaceFactory) protected readonly workspaceFactory: WorkspaceFactory;
-    @inject(WorkspaceDeletionService) protected readonly workspaceDeletionService: WorkspaceDeletionService;
-    @inject(MessageBusIntegration) protected readonly messageBusIntegration: MessageBusIntegration;
-    @inject(ContextParser) protected contextParser: ContextParser;
-    @inject(HostContextProvider) protected readonly hostContextProvider: HostContextProvider;
-    @inject(GitpodFileParser) protected readonly gitpodParser: GitpodFileParser;
+        @inject(PrebuildManager) private readonly prebuildManager: PrebuildManager,
+        @inject(WorkspaceService) private readonly workspaceService: WorkspaceService,
 
-    @inject(WorkspaceStarter) protected readonly workspaceStarter: WorkspaceStarter;
-    @inject(WorkspaceManagerClientProvider) protected readonly workspaceManagerClientProvider: WorkspaceManagerClientProvider;
-    @inject(ImageBuilderClientProvider) protected imageBuilderClientProvider: ImageBuilderClientProvider;
+        @inject(UserDB) private readonly userDB: UserDB,
+        @inject(UserAuthentication) private readonly userAuthentication: UserAuthentication,
+        @inject(UserService) private readonly userService: UserService,
+        @inject(AuthorizationService) private readonly authorizationService: AuthorizationService,
+        @inject(SSHKeyService) private readonly sshKeyservice: SSHKeyService,
+        @inject(GitpodTokenService) private readonly gitpodTokenService: GitpodTokenService,
+        @inject(EnvVarService) private readonly envVarService: EnvVarService,
 
-    @inject(UserDB) protected readonly userDB: UserDB;
-    @inject(TokenProvider) protected readonly tokenProvider: TokenProvider;
-    @inject(UserService) protected readonly userService: UserService;
-    @inject(UserMessageViewsDB) protected readonly userMessageViewsDB: UserMessageViewsDB;
-    @inject(UserStorageResourcesDB) protected readonly userStorageResourcesDB: UserStorageResourcesDB;
-    @inject(UserDeletionService) protected readonly userDeletionService: UserDeletionService;
-    @inject(IAnalyticsWriter) protected readonly analytics: IAnalyticsWriter;
-    @inject(AuthorizationService) protected readonly authorizationService: AuthorizationService;
-    @inject(TeamDB) protected readonly teamDB: TeamDB;
+        @inject(TeamDB) private readonly teamDB: TeamDB,
+        @inject(OrganizationService) private readonly organizationService: OrganizationService,
 
-    @inject(AppInstallationDB) protected readonly appInstallationDB: AppInstallationDB;
+        @inject(LinkedInService) private readonly linkedInService: LinkedInService,
 
-    @inject(IClientDataPrometheusAdapter) protected readonly clientDataPrometheusAdapter: IClientDataPrometheusAdapter;
+        @inject(AuthProviderService) private readonly authProviderService: AuthProviderService,
 
-    @inject(TheiaPluginService) protected readonly pluginService: TheiaPluginService;
+        @inject(ProjectsService) private readonly projectsService: ProjectsService,
 
-    @inject(AuthProviderService) protected readonly authProviderService: AuthProviderService;
+        @inject(IDEService) private readonly ideService: IDEService,
 
-    @inject(TermsProvider) protected readonly termsProvider: TermsProvider;
+        @inject(VerificationService) private readonly verificationService: VerificationService,
 
-    @inject(BlobServiceClient) protected readonly blobServiceClient: BlobServiceClient;
+        @inject(InstallationService) private readonly installationService: InstallationService,
 
-    @inject(GitTokenScopeGuesser) protected readonly gitTokenScopeGuesser: GitTokenScopeGuesser;
+        @inject(Authorizer) private readonly auth: Authorizer,
 
-    @inject(HeadlessLogService) protected readonly headlessLogService: HeadlessLogService;
+        @inject(ScmService) private readonly scmService: ScmService,
 
-    @inject(ProjectsService) protected readonly projectsService: ProjectsService;
+        @inject(BillingModes) private readonly billingModes: BillingModes,
+        @inject(StripeService) private readonly stripeService: StripeService,
+        @inject(UsageService) private readonly usageService: UsageService,
+        @inject(BillingServiceDefinition.name) private readonly billingService: BillingServiceClient,
+
+        @inject(RedisSubscriber) private readonly subscriber: RedisSubscriber,
+
+        @inject(ContextService) private readonly contextService: ContextService,
+        @inject(AnalyticsController) private readonly analyticsController: AnalyticsController,
+    ) {}
 
     /** Id the uniquely identifies this server instance */
     public readonly uuid: string = uuidv4();
-    protected client: Client | undefined;
-    protected user?: User;
-    protected readonly disposables = new DisposableCollection();
-    protected headlessLogRegistry = new Map<string, boolean>();
-    protected resourceAccessGuard: ResourceAccessGuard;
-    protected clientHeaderFields: ClientHeaderFields | undefined;
+    public readonly clientMetadata: ClientMetadata;
+    private clientHeaderFields: ClientHeaderFields;
+    private resourceAccessGuard: ResourceAccessGuard;
+    private client: GitpodApiClient | undefined;
+
+    private userID: string | undefined;
+
+    private readonly disposables = new DisposableCollection();
 
     dispose(): void {
         this.disposables.dispose();
     }
 
-    initialize(client: Client | undefined, user: User, accessGuard: ResourceAccessGuard, clientHeaderFields: ClientHeaderFields | undefined): void {
+    initialize(
+        client: GitpodApiClient | undefined,
+        userID: string | undefined,
+        accessGuard: ResourceAccessGuard,
+        clientMetadata: ClientMetadata,
+        connectionCtx: TraceContext | undefined,
+        clientHeaderFields: ClientHeaderFields,
+    ): void {
         if (client) {
-            this.disposables.push(Disposable.create(() => this.client = undefined));
+            this.disposables.push(Disposable.create(() => (this.client = undefined)));
         }
         this.client = client;
-        this.user = user;
+        this.userID = userID;
         this.resourceAccessGuard = accessGuard;
+        this.clientHeaderFields = clientHeaderFields;
+        (this.clientMetadata as any) = clientMetadata;
 
-        log.debug({ userId: this.user?.id }, `clientRegion: ${clientHeaderFields?.clientRegion}`);
-        log.debug({ userId: this.user?.id }, 'initializeClient');
+        log.debug({ userId: this.userID }, `clientRegion: ${clientHeaderFields.clientRegion}`);
+        log.debug({ userId: this.userID }, "initializeClient");
 
         this.listenForWorkspaceInstanceUpdates();
-        this.clientHeaderFields = clientHeaderFields;
+        this.listenForPrebuildUpdates(connectionCtx).catch((err) =>
+            log.error("error registering for prebuild updates", err),
+        );
     }
 
-    protected listenForWorkspaceInstanceUpdates(): void {
-        if (!this.user || !this.client) {
+    private async listenForPrebuildUpdates(ctx?: TraceContext) {
+        const userId = this.userID;
+        if (!this.client || !userId) {
             return;
         }
 
-        const withTrace = (ctx: TraceContext, cb: () => void) => {
-            // if we don't have a parent span, don't create a trace here as those <trace-without-root-spans> are not useful.
-            if (!ctx || !ctx.span || !ctx.span.context()) {
-                cb();
-                return;
-            }
+        const handler = (ctx: TraceContext, update: PrebuildWithStatus) =>
+            TraceContext.withSpan(
+                "forwardPrebuildUpdateToClient",
+                (ctx) => {
+                    traceClientMetadata(ctx, this.clientMetadata);
+                    TraceContext.setJsonRPCMetadata(ctx, "onPrebuildUpdate");
 
-            const span = TraceContext.startSpan("forwardInstanceUpdateToClient", ctx);
-            try {
-                cb();
-            } catch (e) {
-                TraceContext.logError({ span }, e);
-                throw e;
-            } finally {
-                span.finish();
-            }
+                    this.client?.onPrebuildUpdate(update);
+                },
+                ctx,
+            );
+
+        if (!this.disposables.disposed) {
+            await runWithRequestContext(
+                {
+                    requestKind: "gitpod-server-impl-listener",
+                    requestMethod: "listenForPrebuildUpdates",
+                    signal: new AbortController().signal,
+                    subjectId: SubjectId.fromUserId(userId),
+                },
+                async () => {
+                    const organizations = await this.getTeams(ctx ?? {});
+                    for (const organization of organizations) {
+                        const hasPermission = await this.auth.hasPermissionOnOrganization(
+                            userId,
+                            "read_prebuild",
+                            organization.id,
+                        );
+                        if (hasPermission) {
+                            this.disposables.push(
+                                this.subscriber.listenForOrganizationPrebuildUpdates(organization.id, handler),
+                            );
+                        }
+                    }
+                },
+            );
+        }
+    }
+
+    private listenForWorkspaceInstanceUpdates(): void {
+        if (!this.userID || !this.client) {
+            return;
         }
 
         // TODO(cw): the instance update is not subject to resource access guards, hence provides instance info
         //           to clients who might not otherwise have access to that information.
-        this.disposables.push(this.messageBusIntegration.listenForWorkspaceInstanceUpdates(
-            this.user.id,
-            (ctx: TraceContext, instance: WorkspaceInstance) => withTrace(ctx, () => this.client?.onInstanceUpdate(this.censorInstance(instance)))
-        ));
-
+        this.disposables.pushAll([
+            this.subscriber.listenForWorkspaceInstanceUpdates(this.userID, (ctx, instance) =>
+                this.forwardInstanceUpdateToClient(ctx, instance),
+            ),
+        ]);
     }
 
-    setClient(client: Client | undefined): void {
-        throw new Error('Unsupported operation. Use initialize.')
+    private forwardInstanceUpdateToClient(ctx: TraceContext, instance: WorkspaceInstance) {
+        // gpl: We decided against tracing updates here, because it create far too much noise (cmp. history)
+        const userId = this.userID;
+        if (userId) {
+            runWithSubjectId(SubjectId.fromUserId(userId), () =>
+                this.workspaceService.getWorkspace(userId, instance.workspaceId),
+            )
+                .then((ws) => {
+                    this.client?.onInstanceUpdate(this.censorInstance(instance));
+                })
+                .catch((err) => {
+                    if (
+                        ApplicationError.hasErrorCode(err) &&
+                        (err.code === ErrorCodes.NOT_FOUND || err.code === ErrorCodes.PERMISSION_DENIED)
+                    ) {
+                        // ignore
+                    } else {
+                        log.error("error forwarding instance update to client", err);
+                    }
+                });
+        }
     }
 
-    protected async guardAccess(resource: GuardedResource, op: ResourceAccessOp) {
+    setClient(ctx: TraceContext, client: GitpodApiClient | undefined): void {
+        throw new Error("Unsupported operation. Use initialize.");
+    }
+
+    private async guardAccess(resource: GuardedResource, op: ResourceAccessOp) {
         if (!(await this.resourceAccessGuard.canAccess(resource, op))) {
-            throw new ResponseError(ErrorCodes.PERMISSION_DENIED, `operation not permitted: missing ${op} permission on ${resource.kind}`);
+            throw new ApplicationError(
+                ErrorCodes.PERMISSION_DENIED,
+                `operation not permitted: missing ${op} permission on ${resource.kind}`,
+            );
         }
     }
 
@@ -173,7 +342,7 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
      *
      * @param wsi the workspace instance shape we want to censor
      */
-    protected censorInstance<T extends WorkspaceInstance | undefined>(wsi: T): T {
+    private censorInstance<T extends WorkspaceInstance | undefined>(wsi: T): T {
         if (!wsi) {
             return wsi;
         }
@@ -181,32 +350,37 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         const res = { ...wsi! };
 
         // owner token will set as cookie in the future
-        delete (res.status.ownerToken);
+        delete res.status.ownerToken;
         // is an operational internal detail
-        delete (res.status.nodeName);
-        // configuration contains feature flags and theia version.
-        // we might want to share that in the future, but for the time being there's no need
-        delete (res.configuration);
+        delete res.status.nodeName;
         // internal operation detail
         // @ts-ignore
-        delete (res.workspaceImage);
+        delete res.workspaceImage;
 
         return res;
     }
 
-    protected checkUser(methodName?: string, logPayload?: {}, ctx?: LogContext): User {
-        if (this.showSetupCondition?.value) {
-            throw new ResponseError(ErrorCodes.SETUP_REQUIRED, 'Setup required.');
+    private async checkUser(methodName?: string, logPayload?: {}, ctx?: LogContext): Promise<User> {
+        const cellDisabled = await getExperimentsClientForBackend().getValueAsync("cell_disabled", false, {});
+        if (cellDisabled) {
+            throw new ApplicationError(ErrorCodes.CELL_EXPIRED, "Cell is disabled");
         }
-        if (!this.user) {
-            throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, 'User is not authenticated. Please login.');
+
+        // Generally, a user session is required.
+        const userId = this.userID;
+        if (!userId) {
+            throw new ApplicationError(ErrorCodes.NOT_AUTHENTICATED, "User is not authenticated. Please login.");
         }
-        if (this.user.markedDeleted === true) {
-            throw new ResponseError(ErrorCodes.USER_DELETED, 'User has been deleted.');
+
+        const user = await runWithSubjectId(SYSTEM_USER, async () =>
+            this.userService.findUserById(SYSTEM_USER_ID, userId),
+        );
+        if (user.markedDeleted === true) {
+            throw new ApplicationError(ErrorCodes.USER_DELETED, "User has been deleted.");
         }
         const userContext: LogContext = {
             ...ctx,
-            userId: this.user.id,
+            userId: user.id,
         };
         if (methodName) {
             let payload = { api: true };
@@ -215,11 +389,12 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
             }
             log.debug(userContext, methodName, payload);
         }
-        return this.user;
+
+        return user;
     }
 
-    protected checkAndBlockUser(methodName?: string, logPayload?: {}, ctx?: LogContext): User {
-        const user = this.checkUser(methodName, logPayload);
+    private async checkAndBlockUser(methodName?: string, logPayload?: {}, ctx?: LogContext): Promise<User> {
+        const user = await this.checkUser(methodName, logPayload);
         if (user.blocked) {
             const userContext: LogContext = {
                 ...ctx,
@@ -229,304 +404,250 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
             if (logPayload) {
                 payload = { ...logPayload, ...payload };
             }
-            log.debug(userContext, `${methodName || 'checkAndBlockUser'}: blocked`, payload);
-            throw new ResponseError(ErrorCodes.USER_BLOCKED, "You've been blocked.");
+            log.debug(userContext, `${methodName || "checkAndBlockUser"}: blocked`, payload);
+            throw new ApplicationError(ErrorCodes.USER_BLOCKED, "You've been blocked.");
         }
         return user;
     }
 
-
-    public async getLoggedInUser(): Promise<User> {
-        await this.doUpdateUser();
+    public async getLoggedInUser(ctx: TraceContext): Promise<User> {
         return this.checkUser("getLoggedInUser");
     }
 
-    protected showSetupCondition: { value: boolean } | undefined = undefined;
-    protected async doUpdateUser(): Promise<void> {
+    public async updateLoggedInUser(ctx: TraceContext, update: Partial<User>): Promise<User> {
+        traceAPIParams(ctx, {}); // partialUser contains PII
 
-        // execute the check for the setup to be shown until the setup is not required.
-        // cf. evaluation of the condition in `checkUser`
-        if (!this.showSetupCondition || this.showSetupCondition.value === true) {
-            const hasAnyStaticProviders = this.hostContextProvider.getAll().some(hc => hc.authProvider.params.builtin === true);
-            if (!hasAnyStaticProviders) {
-                const userCount = await this.userDB.getUserCount();
-                this.showSetupCondition = { value: userCount === 0 };
-            } else {
-                this.showSetupCondition = { value: false };
-            }
-        }
-
-        if (this.user) {
-            const updatedUser = await this.userDB.findUserById(this.user.id);
-            if (updatedUser) {
-                this.user = updatedUser;
-            }
-        }
-    }
-    protected termsAccepted: boolean | undefined;
-    protected async checkTermsAcceptance() {
-        if (!this.termsAccepted) {
-            if (this.user) {
-                this.termsAccepted = await this.userService.checkTermsAccepted(this.user);
-            }
-        }
-        if (!this.termsAccepted) {
-            throw new ResponseError(ErrorCodes.USER_TERMS_ACCEPTANCE_REQUIRED, "You need to accept the terms.");
-        }
-    }
-
-    public async updateLoggedInUser(partialUser: Partial<User>): Promise<User> {
-        const user = this.checkUser('updateLoggedInUser');
+        const user = await this.checkUser("updateLoggedInUser");
         await this.guardAccess({ kind: "user", subject: user }, "update");
 
-        const allowedFields: (keyof User)[] = ['avatarUrl', 'fullName', 'additionalData'];
-        for (const p of allowedFields) {
-            if (p in partialUser) {
-                (user[p] as any) = partialUser[p];
-            }
-        }
+        const updatedUser = await this.userService.updateUser(user.id, {
+            ...update,
+            id: user.id,
+        });
 
-        await this.userDB.updateUserPartial(user);
-        return user;
+        return updatedUser;
     }
 
-    public async getClientRegion(): Promise<string | undefined> {
-        this.checkUser("getClientRegion");
+    public async updateWorkspaceTimeoutSetting(
+        ctx: TraceContext,
+        setting: Partial<WorkspaceTimeoutSetting>,
+    ): Promise<void> {
+        traceAPIParams(ctx, { setting });
+        const user = await this.checkAndBlockUser("updateWorkspaceTimeoutSetting");
+        await this.guardAccess({ kind: "user", subject: user }, "update");
+
+        await this.userService.updateWorkspaceTimeoutSetting(user.id, user.id, setting);
+    }
+
+    public async sendPhoneNumberVerificationToken(
+        ctx: TraceContext,
+        rawPhoneNumber: string,
+    ): Promise<{ verificationId: string }> {
+        const user = await this.checkUser("sendPhoneNumberVerificationToken");
+
+        const channel = "call";
+        const verificationId = await this.verificationService.sendVerificationToken(
+            user.id,
+            formatPhoneNumber(rawPhoneNumber),
+            channel,
+        );
+
+        return {
+            verificationId,
+        };
+    }
+
+    public async verifyPhoneNumberVerificationToken(
+        ctx: TraceContext,
+        rawPhoneNumber: string,
+        token: string,
+        verificationId: string,
+    ): Promise<boolean> {
+        const phoneNumber = formatPhoneNumber(rawPhoneNumber);
+        const user = await this.checkUser("verifyPhoneNumberVerificationToken");
+
+        return await this.verificationService.verifyVerificationToken(user, phoneNumber, token, verificationId);
+    }
+
+    public async getClientRegion(ctx: TraceContext): Promise<string | undefined> {
+        await this.checkUser("getClientRegion");
         return this.clientHeaderFields?.clientRegion;
     }
 
     /**
      * Returns the descriptions of auth providers. This also controls the visibility of
-     * auth providers on the dashbard.
+     * auth providers on the dashboard.
      *
-     * If this call is unauthenticated (i.e. for anonumous users,) it returns only information
+     * If this call is unauthenticated (i.e. for anonymous users,) it returns only information
      * necessary for the Login page.
      *
      * If there are built-in auth providers configured, only these are returned.
      */
-    public async getAuthProviders(): Promise<AuthProviderInfo[]> {
-        const { builtinAuthProvidersConfigured } = this.config;
-
-        const hostContexts = this.hostContextProvider.getAll();
-        const authProviders = hostContexts.map(hc => hc.authProvider.info);
-
-        const isBuiltIn = (info: AuthProviderInfo) => !info.ownerId;
-        const isNotHidden = (info: AuthProviderInfo) => !info.hiddenOnDashboard;
-        const isVerified = (info: AuthProviderInfo) => info.verified;
-
-        // if no user session is available, compute public information only
-        if (!this.user) {
-            const toPublic = (info: AuthProviderInfo) => <AuthProviderInfo>{
-                authProviderId: info.authProviderId,
-                authProviderType: info.authProviderType,
-                disallowLogin: info.disallowLogin,
-                host: info.host,
-                icon: info.icon,
-                description: info.description
-            }
-            let result = authProviders.filter(isNotHidden).filter(isVerified);
-            if (builtinAuthProvidersConfigured) {
-                result = result.filter(isBuiltIn);
-            }
-            return result.map(toPublic);
+    public async getAuthProviders(ctx: TraceContext): Promise<AuthProviderInfo[]> {
+        // if no user session is available, return public information only
+        if (!this.userID) {
+            return await this.authProviderService.getAuthProviderDescriptionsUnauthenticated();
         }
 
         // otherwise show all the details
-        const result: AuthProviderInfo[] = [];
-        for (const info of authProviders) {
-            const identity = this.user.identities.find(i => i.authProviderId === info.authProviderId);
-            if (identity) {
-                result.push({ ...info, isReadonly: identity.readonly });
-                continue;
-            }
-            if (info.ownerId === this.user.id) {
-                result.push(info);
-                continue;
-            }
-            if (builtinAuthProvidersConfigured && !isBuiltIn(info)) {
-                continue;
-            }
-            if (isNotHidden(info) && isVerified(info)) {
-                result.push(info);
-            }
-        }
-        return result;
+        const user = await this.checkUser("getAuthProviders");
+        return await this.authProviderService.getAuthProviderDescriptions(user);
     }
 
-    public async getBranding(): Promise<Branding> {
-        return this.config.brandingConfig;
-    }
-
-    public async getConfiguration(): Promise<Configuration> {
+    public async getConfiguration(ctx: TraceContext): Promise<Configuration> {
         return {
-            garbageCollectionStartDate: this.config.workspaceGarbageCollection.startDate,
-            daysBeforeGarbageCollection: this.config.workspaceGarbageCollection.minAgeDays,
-        }
+            isDedicatedInstallation: this.config.isDedicatedInstallation,
+        };
     }
 
-    public async getToken(query: GitpodServer.GetTokenSearchOptions): Promise<Token | undefined> {
-        await this.doUpdateUser();
-        const user = this.checkUser("getToken");
-        const logCtx = { userId: user.id, host: query.host };
+    public async getToken(ctx: TraceContext, query: GitpodServer.GetTokenSearchOptions): Promise<Token | undefined> {
+        traceAPIParams(ctx, { query });
 
+        const user = await this.checkUser("getToken");
         const { host } = query;
         try {
-            const token = await this.tokenProvider.getTokenForHost(user, host);
-            await this.guardAccess({ kind: "token", subject: token, tokenOwnerID: user.id }, "get");
+            const token = await this.scmService.getToken(user.id, { host });
+            if (token) {
+                await this.guardAccess({ kind: "token", subject: token, tokenOwnerID: user.id }, "get");
+            }
 
             return token;
         } catch (error) {
-            log.error(logCtx, "failed to find token: ", error);
-            return undefined
+            return undefined;
         }
     }
 
-    public async getPortAuthenticationToken(workspaceId: string): Promise<Token> {
-        const user = this.checkAndBlockUser("getPortAuthenticationToken", { workspaceId });
-        const span = opentracing.globalTracer().startSpan("getPortAuthenticationToken");
-        span.setTag("workspaceId", workspaceId);
-
-        const workspace = await this.workspaceDb.trace({ span }).findById(workspaceId);
-        await this.guardAccess({ kind: "workspace", subject: workspace! }, "get");
-
-        try {
-            const token = await this.tokenProvider.getFreshPortAuthenticationToken(user, workspaceId);
-            await this.guardAccess({ kind: "token", subject: token, tokenOwnerID: user.id }, "create");
-
-            return token;
-        } finally {
-            span.finish();
-        }
-    }
-
-    public async deleteAccount(): Promise<void> {
-        const user = this.checkUser("deleteAccount");
+    public async deleteAccount(ctx: TraceContext): Promise<void> {
+        const user = await this.checkAndBlockUser("deleteAccount");
         await this.guardAccess({ kind: "user", subject: user! }, "delete");
 
-        await this.userDeletionService.deleteUser(user.id);
+        await this.userService.deleteUser(user.id, user.id);
     }
 
-    protected async getTeamMembersByProject(projectId: string | undefined): Promise<TeamMemberInfo[]> {
-        if (projectId) {
-            const project = await this.projectsService.getProject(projectId);
-            if (project && project.teamId) {
-                return await this.teamDB.findMembersByTeam(project.teamId);
-            }
-        }
-        return [];
+    public async getWorkspace(ctx: TraceContext, workspaceId: string): Promise<WorkspaceInfo> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkUser("getWorkspace");
+
+        const result = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        return {
+            ...result,
+            latestInstance: this.censorInstance(result.latestInstance),
+        };
     }
 
-    public async getWorkspace(id: string): Promise<WorkspaceInfo> {
-        const user = this.checkUser('getWorkspace');
-        const span = opentracing.globalTracer().startSpan("getWorkspace");
-        span.setTag("workspaceId", id);
-        span.setTag("userId", user.id);
+    public async getOwnerToken(ctx: TraceContext, workspaceId: string): Promise<string> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
 
-        try {
-            const workspace = await this.internalGetWorkspace(id, this.workspaceDb.trace({ span }));
-            const latestInstancePromise = this.workspaceDb.trace({}).findCurrentInstance(id);
-            const teamMembers = await this.getTeamMembersByProject(workspace.projectId);
-            await this.guardAccess({ kind: "workspace", subject: workspace, teamMembers }, "get");
-            const latestInstance = await latestInstancePromise;
-            if (!!latestInstance) {
-                await this.guardAccess({
-                    kind: "workspaceInstance",
-                    subject: latestInstance,
-                    workspace,
-                    teamMembers,
-                }, "get");
-            }
+        const user = await this.checkAndBlockUser("getOwnerToken");
 
+        //TODO this requests are only here to populate the resource guard check
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+
+        const latestInstance = await this.workspaceService.getCurrentInstance(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspaceInstance", subject: latestInstance, workspace }, "get");
+
+        return await this.workspaceService.getOwnerToken(user.id, workspaceId);
+    }
+
+    public async getIDECredentials(ctx: TraceContext, workspaceId: string): Promise<string> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("getIDECredentials");
+
+        //TODO this requests are only here to populate the resource guard check
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+
+        return await this.workspaceService.getIDECredentials(user.id, workspaceId);
+    }
+
+    public async startWorkspace(
+        ctx: TraceContext,
+        workspaceId: string,
+        options: GitpodServer.StartWorkspaceOptions,
+    ): Promise<StartWorkspaceResult> {
+        traceAPIParams(ctx, { workspaceId, options });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("startWorkspace", undefined, { workspaceId });
+
+        // (gpl) We keep this check here for backwards compatibility, it should be superfluous in the future
+        const { workspace, latestInstance: instance } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+
+        // (gpl) We keep this check here for backwards compatibility, it should be superfluous in the future
+        if (instance && instance.status.phase !== "stopped") {
+            traceWI(ctx, { instanceId: instance.id });
+
+            // We already have a running workspace.
+            // Note: ownership doesn't matter here as this is basically a noop. It's not StartWorkspace's concern
+            //       to guard workspace access - just to prevent non-owners from starting workspaces.
+
+            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get");
             return {
-                workspace,
-                latestInstance: this.censorInstance(latestInstance)
+                instanceID: instance.id,
+                workspaceURL: instance.ideUrl,
             };
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
         }
+
+        // (gpl) We keep this check here for backwards compatibility, it should be superfluous in the future
+        // no matter if the workspace is shared or not, you cannot create a new instance
+        await this.guardAccess({ kind: "workspaceInstance", subject: undefined, workspace }, "create");
+
+        const opts: StartWorkspaceOptions = {
+            ...options,
+            clientRegionCode: this.clientHeaderFields?.clientRegion,
+        };
+        const result = await this.workspaceService.startWorkspace(ctx, user, workspaceId, opts);
+        traceWI(ctx, { instanceId: result.instanceID });
+        return result;
     }
 
-    public async startWorkspace(workspaceId: string, options: GitpodServer.StartWorkspaceOptions): Promise<StartWorkspaceResult> {
-        const span = opentracing.globalTracer().startSpan("startWorkspace");
-        span.setTag("workspaceId", workspaceId);
+    public async stopWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
 
-        try {
-            const user = this.checkAndBlockUser("startWorkspace", undefined, { workspaceId });
-            await this.checkTermsAcceptance();
-
-            const mayStartPromise = this.mayStartWorkspace({ span }, user, this.workspaceDb.trace({ span }).findRegularRunningInstances(user.id));
-            const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({ span }));
-            await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
-
-            const runningInstance = await this.workspaceDb.trace({ span }).findRunningInstance(workspace.id);
-            if (runningInstance) {
-                // We already have a running workspace.
-                // Note: ownership doesn't matter here as this is basically a noop. It's not StartWorkspace's concern
-                //       to guard workspace access - just to prevent non-owners from starting workspaces.
-
-                await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace }, "get");
-                return {
-                    instanceID: runningInstance.id,
-                    workspaceURL: runningInstance.ideUrl,
-                };
-            }
-
-            if (!!workspace.softDeleted) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "Workspace not found!");
-            }
-
-            // no matter if the workspace is shared or not, you cannot create a new instance
-            await this.guardAccess({ kind: "workspaceInstance", subject: undefined, workspace }, "create");
-
-            if (workspace.type !== "regular") {
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Cannot (re-)start irregular workspace.");
-            }
-
-            if (workspace.deleted) {
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Cannot (re-)start a deleted workspace.");
-            }
-            const envVars = this.userDB.getEnvVars(user.id);
-
-            await mayStartPromise;
-
-            // at this point we're about to actually start a new workspace
-            return await this.workspaceStarter.startWorkspace({ span }, workspace, user, await envVars, {
-                forceDefaultImage: !!options.forceDefaultImage
-            });
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    public async stopWorkspace(workspaceId: string): Promise<void> {
-        const user = this.checkUser('stopWorkspace', undefined, { workspaceId });
+        const user = await this.checkUser("stopWorkspace", undefined, { workspaceId });
         const logCtx = { userId: user.id, workspaceId };
 
-        const span = opentracing.globalTracer().startSpan("stopWorkspace");
-        span.setTag("workspaceId", workspaceId);
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        if (workspace.type === "prebuild") {
+            // If this is a team prebuild, any team member can stop it.
+            const teamMembers = await this.organizationService.listMembers(user.id, workspace.organizationId);
+            await this.guardAccess({ kind: "workspace", subject: workspace, teamMembers }, "get");
+        } else {
+            // If this is not a prebuild, or it's a personal prebuild, only the workspace owner can stop it.
+            await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+        }
 
         try {
-            const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({ span }));
-            await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
-
-            this.internalStopWorkspace({ span }, workspace).catch(err => {
-                log.error(logCtx, "stopWorkspace error: ", err);
-            });
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+            await this.internalStopWorkspace(ctx, user.id, workspace, "stopped via API");
+        } catch (err) {
+            log.error(logCtx, "stopWorkspace error: ", err);
+            if (isClusterMaintenanceError(err)) {
+                throw new ApplicationError(
+                    ErrorCodes.PRECONDITION_FAILED,
+                    "Cannot stop the workspace because the workspace cluster is under maintenance. Please try again in a few minutes",
+                );
+            }
+            throw err;
         }
     }
 
-    protected async internalStopWorkspace(ctx: TraceContext, workspace: Workspace, policy?: StopWorkspacePolicy, admin: boolean = false): Promise<void> {
+    // TODO(gpl) Remove this method once we introduced FGA
+    private async internalStopWorkspace(
+        ctx: TraceContext,
+        userId: string,
+        workspace: Workspace,
+        reason: string,
+        policy?: StopWorkspacePolicy,
+        admin: boolean = false,
+    ): Promise<void> {
         const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspace.id);
         if (!instance) {
             // there's no instance running - we're done
@@ -538,1599 +659,2189 @@ export class GitpodServerImpl<Client extends GitpodClient, Server extends Gitpod
         // that is logged in).
         // The guard check happens in guardAdminAccess(...) for admin users.
         if (!admin) {
-            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update");
+            if (workspace.type === "prebuild") {
+                // If this is a team prebuild, any team member can stop it.
+                const teamMembers = await this.organizationService.listMembers(userId, workspace.organizationId);
+                await this.guardAccess(
+                    { kind: "workspaceInstance", subject: instance, workspace, teamMembers },
+                    "update",
+                );
+            } else {
+                // If this is not a prebuild, or it's a personal prebuild, only the workspace owner can stop it.
+                await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update");
+            }
         }
-        await this.internalStopWorkspaceInstance(ctx, instance.id, instance.region, policy);
+
+        await this.workspaceService.stopWorkspace(userId, workspace.id, reason, policy);
     }
 
-    protected async internalStopWorkspaceInstance(ctx: TraceContext, instanceId: string, instanceRegion: string, policy?: StopWorkspacePolicy): Promise<void> {
-        const req = new StopWorkspaceRequest();
-        req.setId(instanceId);
-        req.setPolicy(policy || StopWorkspacePolicy.NORMALLY);
-
-        const client = await this.workspaceManagerClientProvider.get(instanceRegion);
-        await client.stopWorkspace(ctx, req);
-    }
-
-    public async updateWorkspaceUserPin(id: string, action: "pin" | "unpin" | "toggle"): Promise<void> {
-        const user = this.checkAndBlockUser('updateWorkspacePin');
-        const span = opentracing.globalTracer().startSpan("updateWorkspacePin");
-        span.setTag("workspaceId", id);
-        span.setTag("userId", user.id);
-        span.setTag("action", action);
-
-        try {
-            await this.workspaceDb.trace({ span }).transaction(async db => {
-                const ws = await this.internalGetWorkspace(id, db);
-                await this.guardAccess({ kind: "workspace", subject: ws }, "update");
-
-                switch (action) {
-                    case "pin":
-                        ws.pinned = true;
-                        break
-                    case "unpin":
-                        ws.pinned = false;
-                        break
-                    case "toggle":
-                        ws.pinned = !ws.pinned;
-                        break
-                }
-
-                await db.store(ws);
-            });
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+    private async guardAdminAccess(method: string, params: any, requiredPermission: PermissionName): Promise<User> {
+        const user = await this.checkAndBlockUser(method);
+        if (!this.authorizationService.hasPermission(user, requiredPermission)) {
+            log.warn({ userId: user.id }, "unauthorised admin access", { authorised: false, method, params });
+            throw new ApplicationError(ErrorCodes.PERMISSION_DENIED, "not allowed");
         }
+        log.info({ userId: user.id }, "admin access", { authorised: true, method, params });
+        return user;
     }
 
-    public async deleteWorkspace(id: string): Promise<void> {
-        const user = this.checkAndBlockUser('deleteWorkspace');
-        const span = opentracing.globalTracer().startSpan("deleteWorkspace");
-        span.setTag("workspaceId", id);
-        span.setTag("userId", user.id);
+    public async updateWorkspaceUserPin(
+        ctx: TraceContext,
+        workspaceId: string,
+        action: "pin" | "unpin" | "toggle",
+    ): Promise<void> {
+        traceAPIParams(ctx, { workspaceId, action });
+        traceWI(ctx, { workspaceId });
 
-        try {
-            const ws = await this.internalGetWorkspace(id, this.workspaceDb.trace({}));
-            await this.guardAccess({ kind: "workspace", subject: ws }, "delete");
+        const user = await this.checkAndBlockUser("updateWorkspaceUserPin");
 
-            // for good measure, try and stop running instances
-            await this.internalStopWorkspace({ span }, ws);
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
 
-            // actually delete the workspace
-            await this.workspaceDeletionService.softDeleteWorkspace({ span }, ws, "user");
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
+        switch (action) {
+            case "pin":
+                workspace.pinned = true;
+                break;
+            case "unpin":
+                workspace.pinned = false;
+                break;
+            case "toggle":
+                workspace.pinned = !workspace.pinned;
+                break;
         }
+
+        await this.workspaceService.setPinned(user.id, workspace.id, workspace.pinned);
     }
 
-    public async controlAdmission(id: string, level: "owner" | "everyone"): Promise<void> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Workspace sharing support is implemented in Gitpod's Enterprise Edition`)
+    public async deleteWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("deleteWorkspace");
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "delete");
+
+        await this.workspaceService.deleteWorkspace(user.id, workspaceId, "user");
     }
 
-    public async setWorkspaceDescription(id: string, description: string): Promise<void> {
-        const user = this.checkAndBlockUser('setWorkspaceDescription');
-        const span = opentracing.globalTracer().startSpan("setWorkspaceDescription");
-        span.setTag("workspaceId", id);
-        span.setTag("userId", user.id);
+    public async setWorkspaceDescription(ctx: TraceContext, workspaceId: string, description: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId, description });
+        traceWI(ctx, { workspaceId });
 
-        try {
-            const workspace = await this.internalGetWorkspace(id, this.workspaceDb.trace({ span }));
+        const user = await this.checkAndBlockUser("setWorkspaceDescription");
 
-            await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
-            await this.workspaceDb.trace({ span }).updatePartial(id, { description });
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
+
+        await this.workspaceService.setDescription(user.id, workspaceId, description);
     }
 
-    public async getWorkspaces(options: GitpodServer.GetWorkspacesOptions): Promise<WorkspaceInfo[]> {
-        const user = this.checkUser("getWorkspaces");
+    public async getWorkspaces(
+        ctx: TraceContext,
+        options: GitpodServer.GetWorkspacesOptions,
+    ): Promise<WorkspaceInfo[]> {
+        traceAPIParams(ctx, { options });
 
-        const res = await this.workspaceDb.trace({}).find({
-            limit: 20,
-            ...options,
-            userId: user.id,
-            includeHeadless: false,
-        });
-        await Promise.all(res.map(ws => this.guardAccess({ kind: "workspace", subject: ws.workspace }, "get")));
-        await Promise.all(res.map(ws => this.guardAccess({ kind: "workspaceInstance", subject: ws.latestInstance, workspace: ws.workspace}, "get")));
-        return res;
+        const user = await this.checkUser("getWorkspaces");
+
+        const result = await this.workspaceService.getWorkspaces(user.id, options);
+        await Promise.all(result.map((ws) => this.guardAccess({ kind: "workspace", subject: ws.workspace }, "get")));
+        await Promise.all(
+            result.map((ws) =>
+                this.guardAccess(
+                    { kind: "workspaceInstance", subject: ws.latestInstance, workspace: ws.workspace },
+                    "get",
+                ),
+            ),
+        );
+        return result;
     }
 
-    public async isWorkspaceOwner(workspaceId: string): Promise<boolean> {
-        const user = this.checkUser("isWorkspaceOwner", undefined, { workspaceId });
+    public async isWorkspaceOwner(ctx: TraceContext, workspaceId: string): Promise<boolean> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
 
-        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({}));
+        const user = await this.checkUser("isWorkspaceOwner", undefined, { workspaceId });
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
         await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
         return user.id == workspace.ownerId;
     }
 
-    public async sendHeartBeat(options: GitpodServer.SendHeartBeatOptions): Promise<void> {
+    public async sendHeartBeat(ctx: TraceContext, options: GitpodServer.SendHeartBeatOptions): Promise<void> {
+        traceAPIParams(ctx, { options });
         const { instanceId } = options;
-        const user = this.checkAndBlockUser("sendHeartBeat", undefined, { instanceId });
+        traceWI(ctx, { instanceId });
 
-        const span = opentracing.globalTracer().startSpan("sendHeartBeat");
-        try {
-            span.setTag("workspaceId", instanceId);
-            span.setTag("userId", user.id);
+        const user = await this.checkAndBlockUser("sendHeartBeat", undefined, { instanceId });
 
-            const wsi = await this.workspaceDb.trace({ span }).findInstanceById(instanceId);
-            if (!wsi) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "workspace does not exist");
-            }
-
-            const ws = await this.workspaceDb.trace({ span }).findById(wsi.workspaceId);
-            if (!ws) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "workspace does not exist");
-            }
-            await this.guardAccess({ kind: "workspaceInstance", subject: wsi, workspace: ws }, "update");
-
-            const wasClosed = !!(options && options.wasClosed);
-            await this.workspaceDb.trace({ span }).updateLastHeartbeat(instanceId, user.id, new Date(), wasClosed);
-
-            const req = new MarkActiveRequest();
-            req.setId(instanceId);
-            req.setClosed(wasClosed);
-
-            const client = await this.workspaceManagerClientProvider.get(wsi.region);
-            await client.markActive({ span }, req);
-
-            if (options && options.roundTripTime && Number.isFinite(options.roundTripTime)) {
-                this.clientDataPrometheusAdapter.storeWorkspaceRoundTripTimeSample(user, instanceId, options.roundTripTime);
-            }
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            if (e.message && typeof (e.message) === 'string' && (e.message as String).endsWith("does not exist")) {
-                // This is an old tab with open workspace: drop silently
-                return;
-            } else {
-                throw e;
-            }
-        } finally {
-            span.finish();
-        }
+        await this.workspaceService.sendHeartBeat(user.id, options, (instance, workspace) =>
+            this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update"),
+        );
     }
 
-    async getWorkspaceOwner(workspaceId: string): Promise<UserInfo | undefined> {
-        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({}));
+    async getWorkspaceOwner(ctx: TraceContext, workspaceId: string): Promise<UserInfo | undefined> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkUser("getWorkspaceOwner");
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
         await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
 
-        const owner = await this.userDB.findUserById(workspace.ownerId);
-        if (!owner) {
-            return undefined;
+        try {
+            const owner = await this.userService.findUserById(user.id, workspace.ownerId);
+            await this.guardAccess({ kind: "user", subject: owner }, "get");
+            return { name: owner.name };
+        } catch (e) {
+            if (e.code === ErrorCodes.NOT_FOUND) {
+                return undefined;
+            }
+            throw e;
         }
-
-        await this.guardAccess({ kind: "user", subject: owner }, "get");
-        return { name: owner.name };
     }
 
-    public async getWorkspaceUsers(workspaceId: string): Promise<WorkspaceInstanceUser[]> {
-        this.checkUser("getWorkspaceUsers", undefined, { workspaceId });
+    public async getWorkspaceUsers(ctx: TraceContext, workspaceId: string): Promise<WorkspaceInstanceUser[]> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
 
-        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({}));
+        const user = await this.checkAndBlockUser("getWorkspaceUsers", undefined, { workspaceId });
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
         await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
 
         // Note: there's no need to try and guard the users below, they're not complete users but just enough to
         //       to support the workspace sharing. The access guard above is enough.
-        return await this.workspaceDb.trace({}).getWorkspaceUsers(workspaceId, this.config.workspaceHeartbeat.timeoutSeconds * 1000);
+        return await this.workspaceDb
+            .trace(ctx)
+            .getWorkspaceUsers(workspaceId, this.config.workspaceHeartbeat.timeoutSeconds * 1000);
     }
 
-    protected async internalGetWorkspace(id: string, db: WorkspaceDB): Promise<Workspace> {
-        const ws = await db.findById(id);
-        if (!ws) {
-            throw new Error(`No workspace with id '${id}' found.`);
+    public async isPrebuildDone(ctx: TraceContext, pwsId: string): Promise<boolean> {
+        traceAPIParams(ctx, { pwsId });
+
+        const user = await this.checkUser("isPrebuildDone");
+
+        const pws = await this.workspaceDb.trace(ctx).findPrebuildByID(pwsId);
+        if (!pws || !pws.projectId) {
+            // there is no prebuild - that's as good one being done
+            return true;
         }
-        return ws;
+
+        await this.auth.checkPermissionOnProject(user.id, "read_prebuild", pws.projectId);
+
+        return PrebuiltWorkspace.isDone(pws);
     }
 
-    private async findRunningInstancesForContext(ctx: TraceContext, contextPromise: Promise<WorkspaceContext>, contextUrl: string, runningInstancesPromise: Promise<WorkspaceInstance[]>): Promise<WorkspaceInfo[]> {
-        const span = TraceContext.startSpan("findRunningInstancesForContext", ctx);
-        try {
-            const runningInstances = (await runningInstancesPromise).filter(instance => instance.status.phase !== 'stopping');
-            const runningInfos = await Promise.all(runningInstances.map(async workspaceInstance => {
-                const workspace = await this.workspaceDb.trace({ span }).findById(workspaceInstance.workspaceId);
-                if (!workspace) {
-                    return;
-                }
+    public async createWorkspace(
+        ctx: TraceContext,
+        options: GitpodServer.CreateWorkspaceOptions,
+    ): Promise<WorkspaceCreationResult> {
+        traceAPIParams(ctx, { options });
 
-                const result: WorkspaceInfo = {
-                    workspace,
-                    latestInstance: workspaceInstance
-                };
-                return result;
-            }));
-
-            let context: WorkspaceContext;
-            try {
-                context = await contextPromise;
-            } catch {
-                return [];
-            }
-            const sameContext = (ws: WorkspaceInfo) => {
-                return ws.workspace.contextURL === contextUrl &&
-                    CommitContext.is(ws.workspace.context) &&
-                    CommitContext.is(context) &&
-                    ws.workspace.context.revision === context.revision
-            }
-            return runningInfos
-                .filter(info => info && info.workspace.type === "regular" && sameContext(info))
-                .map(info => info!);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    public async isPrebuildDone(pwsid: string): Promise<boolean> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, "Prebuilds are implemented in Gitpod's enterprise edition")
-    }
-
-    public async createWorkspace(options: GitpodServer.CreateWorkspaceOptions): Promise<WorkspaceCreationResult> {
         const contextUrl = options.contextUrl;
-        const mode = options.mode || CreateWorkspaceMode.Default;
         let normalizedContextUrl: string = "";
         let logContext: LogContext = {};
 
-        const span = opentracing.globalTracer().startSpan("createWorkspace");
-        span.setTag("contextUrl", contextUrl);
-        span.setTag("mode", mode);
-        const ctx: TraceContext = { span };
         try {
-            const user = this.checkAndBlockUser("createWorkspace", { mode });
-            await this.checkTermsAcceptance();
-            span.setTag("userId", user.id);
+            const user = await this.checkAndBlockUser("createWorkspace", { options });
 
-            const envVars = this.userDB.getEnvVars(user.id);
             logContext = { userId: user.id };
 
-            // Credit check runs in parallel with the other operations up until we start consuming resources.
-            // Make sure to await for the creditCheck promise in the right places.
-            const runningInstancesPromise = this.workspaceDb.trace({ span }).findRegularRunningInstances(user.id);
             normalizedContextUrl = this.contextParser.normalizeContextURL(contextUrl);
-            let runningForContextPromise: Promise<WorkspaceInfo[]> = Promise.resolve([]);
-            const contextPromise = this.contextParser.handle(ctx, user, normalizedContextUrl);
-            if (mode === CreateWorkspaceMode.SelectIfRunning) {
-                runningForContextPromise = this.findRunningInstancesForContext(ctx, contextPromise, normalizedContextUrl, runningInstancesPromise);
-            }
 
-            // make sure we've checked that the user has enough credit before consuming any resources.
-            // Be sure to check this before prebuilds and create workspace, too!
-            let context = await contextPromise;
-            await Promise.all([
-                this.mayStartWorkspace({ span }, user, runningInstancesPromise),
-                this.mayOpenContext(user, context)
-            ]);
+            const { context, project } = await this.contextService.parseContext(user, contextUrl, {
+                projectId: options.projectId,
+                organizationId: options.organizationId,
+            });
 
-            // if we're forced to use the default config, mark the context as such
-            if (!!options.forceDefaultConfig) {
-                context = WithDefaultConfig.mark(context);
-            }
-
-            // if this is an explicit prebuild, check if the user wants to install an app.
-            if (StartPrebuildContext.is(context) && CommitContext.is(context.actual) && context.actual.repository.cloneUrl) {
-                const cloneUrl = context.actual.repository.cloneUrl;
-                const host = new URL(cloneUrl).hostname;
-                const hostContext = this.hostContextProvider.get(host);
-                const services = hostContext && hostContext.services;
-                if (!hostContext || !services) {
-                    console.error('Unknown host: ' + host);
-                } else {
-                    if (await services.repositoryService.canInstallAutomatedPrebuilds(user, cloneUrl)) {
-                        console.log('Installing automated prebuilds for ' + cloneUrl);
-                        services.repositoryService.installAutomatedPrebuilds(user, cloneUrl);
-                    }
-                }
-            }
-
-            if (mode === CreateWorkspaceMode.SelectIfRunning && context.forceCreateNewWorkspace !== true) {
-                const runningForContext = await runningForContextPromise;
-                if (runningForContext.length > 0) {
-                    return { existingWorkspaces: runningForContext }
-                }
-            }
-
-            const prebuiltWorkspace = await this.findPrebuiltWorkspace({ span }, user, context, mode);
-            if (WorkspaceCreationResult.is(prebuiltWorkspace)) {
-                span.log({ prebuild: "running" });
-                return prebuiltWorkspace as WorkspaceCreationResult;
-            }
-            if (WorkspaceContext.is(prebuiltWorkspace)) {
-                span.log({ prebuild: "available" });
-                context = prebuiltWorkspace;
-            }
-
-            const workspace = await this.workspaceFactory.createForContext({ span }, user, context, normalizedContextUrl);
+            const workspace = await this.workspaceService.createWorkspace(
+                ctx,
+                user,
+                options.organizationId,
+                project,
+                context,
+                normalizedContextUrl,
+                options.workspaceClass,
+            );
             try {
                 await this.guardAccess({ kind: "workspace", subject: workspace }, "create");
             } catch (err) {
-                await this.workspaceDb.trace({ span }).hardDeleteWorkspace(workspace.id);
+                await this.workspaceService
+                    .hardDeleteWorkspace(user.id, workspace.id)
+                    .catch((err) => log.error("failed to hard-delete workspace", err));
                 throw err;
             }
 
             logContext.workspaceId = workspace.id;
-            span.setTag("workspaceId", workspace.id);
-            const startWorkspaceResult = await this.workspaceStarter.startWorkspace({ span }, workspace, user, await envVars);
-            span.log({ "event": "startWorkspaceComplete", ...startWorkspaceResult });
+            traceWI(ctx, { workspaceId: workspace.id });
+
+            const opts: StartWorkspaceOptions = {
+                ...options,
+                clientRegionCode: this.clientHeaderFields?.clientRegion,
+            };
+            const startWorkspaceResult = await this.workspaceService.startWorkspace(ctx, user, workspace.id, opts);
+            ctx.span?.log({ event: "startWorkspaceComplete", ...startWorkspaceResult });
 
             return {
                 workspaceURL: startWorkspaceResult.workspaceURL,
-                createdWorkspaceId: workspace.id
+                createdWorkspaceId: workspace.id,
             };
         } catch (error) {
-            if (NotFoundError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "Repository not found.", error.data);
-            }
-            if (UnauthorizedError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
-            }
-            if (InvalidGitpodYMLError.is(error)) {
-                throw new ResponseError(ErrorCodes.INVALID_GITPOD_YML, error.message);
-            }
-
-            TraceContext.logError({ span }, error);
-            const errorCode = this.parseErrorCode(error);
-            if (errorCode) {
-                // specific errors will be handled in create-workspace.tsx
-                throw error;
-            }
-            log.debug(logContext, error);
-            throw new ResponseError(ErrorCodes.CONTEXT_PARSE_ERROR, (error && error.message) ? error.message
-                : `Cannot create workspace for URL: ${normalizedContextUrl}`);
-        } finally {
-            span.finish();
+            this.handleError(error, logContext, normalizedContextUrl);
+            throw error;
         }
     }
 
-    /**
-     * This is an explicit extension point for allowing downstream versions of Gitpod to selectively restrict access.
-     * @returns true if the user is allowed to access the repository
-     */
-    protected async mayStartWorkspaceOnRepo(): Promise<boolean> {
-        return true;
+    public async resolveContext(ctx: TraceContextWithSpan, contextUrl: string): Promise<WorkspaceContext> {
+        const user = await this.checkAndBlockUser("resolveContext");
+        return this.contextService.parseContextUrl(user, contextUrl);
     }
 
-
-    protected parseErrorCode(error: any) {
-        const errorCode = error && error.code;
-        if (errorCode) {
-            try {
-                const code = parseInt(errorCode);
-                if (!isNaN(code)) {
-                    return code;
-                }
-            } catch { }
+    private handleError(error: any, logContext: LogContext, normalizedContextUrl: string) {
+        if (ApplicationError.hasErrorCode(error)) {
+            // specific errors will be handled in create-workspace.tsx
+            throw error;
         }
-        return undefined;
-    }
-
-    protected async findPrebuiltWorkspace(ctx: TraceContext, user: User, context: WorkspaceContext, mode: CreateWorkspaceMode): Promise<WorkspaceCreationResult | PrebuiltWorkspaceContext | undefined> {
-        // prebuilds are an EE feature
-        return undefined;
-    }
-
-    protected async pollDatabaseUntilPrebuildIsAvailable(prebuildID: string, timeoutMS: number): Promise<PrebuiltWorkspace | undefined> {
-        const pollPrebuildAvailable = new Cancelable(async cancel => {
-            const prebuild = await this.workspaceDb.trace({}).findPrebuildByID(prebuildID);
-            if (prebuild && PrebuiltWorkspace.isAvailable(prebuild)) {
-                return prebuild;
-            }
-            return;
-        });
-
-        const result = await Promise.race([
-            pollPrebuildAvailable.run(),
-            new Promise<undefined>((resolve, reject) => setTimeout(() => resolve(undefined), timeoutMS))
-        ]);
-        pollPrebuildAvailable.cancel();
-
-        return result;
+        // TODO(ak) not sure about it we shovel all errors in context parsing error
+        // we should rather do internal errors, and categorize at sources
+        log.debug(logContext, error);
+        throw new ApplicationError(
+            ErrorCodes.CONTEXT_PARSE_ERROR,
+            error ? String(error) : `Cannot create workspace for URL: ${normalizedContextUrl}`,
+        );
     }
 
     /**
-     * Extension point for implementing eligibility checks. Throws a ResponseError if not eligible.
-     * @param ctx
-     * @param user
-     * @param runningInstances
+     *
+     * @deprecated
      */
-    protected async mayStartWorkspace(ctx: TraceContext, user: User, runningInstances: Promise<WorkspaceInstance[]>): Promise<void> {
+    async getProviderRepositoriesForUser(
+        ctx: TraceContext,
+        params: GetProviderRepositoriesParams,
+        cancellationToken?: CancellationToken,
+    ): Promise<ProviderRepository[]> {
+        traceAPIParams(ctx, { params });
+
+        await this.checkAndBlockUser("getProviderRepositoriesForUser");
+        return [];
     }
 
-    /**
-     * Extension point for implementing eligibility checks. Throws a ResponseError if not eligible.
-     * @param user
-     * @param context
-     */
-    protected async mayOpenContext(user: User, context: WorkspaceContext): Promise<void> {
+    async triggerPrebuild(
+        ctx: TraceContext,
+        projectId: string,
+        branchName: string | null,
+    ): Promise<StartPrebuildResult> {
+        traceAPIParams(ctx, { projectId, branchName });
+
+        const user = await this.checkAndBlockUser("triggerPrebuild");
+
+        await this.guardProjectOperation(user, projectId, "update");
+        const prebuild = await this.prebuildManager.triggerPrebuild(ctx, user, projectId, branchName);
+        return prebuild;
     }
 
-    public async mayAccessPrivateRepo(): Promise<boolean> {
-        return true;
+    public async getSuggestedRepositories(ctx: TraceContext, organizationId: string): Promise<SuggestedRepository[]> {
+        traceAPIParams(ctx, { organizationId });
+
+        const user = await this.checkAndBlockUser("getSuggestedRepositories");
+
+        if (!uuidValidate(organizationId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId must be a valid UUID");
+        }
+
+        const projectsPromise = this.projectsService.getProjects(user.id, organizationId);
+        const workspacesPromise = this.workspaceService.getWorkspaces(user.id, { organizationId });
+        const repos = await this.scmService.listSuggestedRepositories(user.id, { projectsPromise, workspacesPromise });
+        return repos;
     }
 
-    public async getFeaturedRepositories(): Promise<WhitelistedRepository[]> {
-        const user = this.checkUser("getFeaturedRepositories");
-        const repositories = await this.workspaceDb.trace({}).getFeaturedRepositories();
-        if (repositories.length === 0) return [];
+    public async searchRepositories(
+        ctx: TraceContext,
+        params: SearchRepositoriesParams,
+    ): Promise<SuggestedRepository[]> {
+        traceAPIParams(ctx, { params });
+        const user = await this.checkAndBlockUser("searchRepositories");
 
-        return (await Promise.all(repositories
-            .filter(repo => repo.url != undefined)
-            .map(async whitelistedRepo => {
-                const repoUrl = parseRepoUrl(whitelistedRepo.url!);
-                if (!repoUrl) return undefined;
-
-                const { host, owner, repo } = repoUrl;
-                const hostContext = this.hostContextProvider.get(host);
-                if (!hostContext || !hostContext.services) {
-                    return undefined;
-                }
-                const repoProvider = hostContext.services.repositoryProvider;
-                try {
-                    const repository = await repoProvider.getRepo(user, owner, repo);
-                    return {
-                        url: repository.webUrl,
-                        name: repository.name,
-                        description: whitelistedRepo.description || repository.description,
-                        avatar: repository.avatarUrl,
-                    }
-                } catch {
-                    // this happens quite often if only GitLab is enabled
-                }
-            }
-            ))).filter(e => e !== undefined) as WhitelistedRepository[];
+        return await this.scmService.searchRepositories(user.id, params);
     }
 
-    public async setWorkspaceTimeout(workspaceId: string, duration: WorkspaceTimeoutDuration): Promise<SetWorkspaceTimeoutResult> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Custom workspace timeout is implemented in Gitpod's Enterprise Edition`);
+    public async setWorkspaceTimeout(
+        ctx: TraceContext,
+        workspaceId: string,
+        duration: WorkspaceTimeoutDuration,
+    ): Promise<SetWorkspaceTimeoutResult> {
+        traceAPIParams(ctx, { workspaceId, duration });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkUser("setWorkspaceTimeout");
+
+        return this.workspaceService.setWorkspaceTimeout(user.id, workspaceId, duration, (instance, workspace) =>
+            this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace: workspace }, "update"),
+        );
     }
 
-    public async getWorkspaceTimeout(workspaceId: string): Promise<GetWorkspaceTimeoutResult> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Custom workspace timeout is implemented in Gitpod's Enterprise Edition`);
+    public async getWorkspaceTimeout(ctx: TraceContext, workspaceId: string): Promise<GetWorkspaceTimeoutResult> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkUser("getWorkspaceTimeout");
+
+        return this.workspaceService.getWorkspaceTimeout(user.id, workspaceId, (instance, workspace) =>
+            this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get"),
+        );
     }
 
-    public async getOpenPorts(workspaceId: string): Promise<WorkspaceInstancePort[]> {
-        const user = this.checkUser("getOpenPorts");
-        const span = opentracing.globalTracer().startSpan("getOpenPorts");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
+    public async getOpenPorts(ctx: TraceContext, workspaceId: string): Promise<WorkspaceInstancePort[]> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
 
-        try {
-            const instance = await this.workspaceDb.trace({ span }).findRunningInstance(workspaceId);
-            const workspace = await this.workspaceDb.trace({ span }).findById(workspaceId);
-            if (!instance || !workspace) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
-            }
+        const user = await this.checkAndBlockUser("getOpenPorts");
 
-            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get");
+        const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!instance || !workspace) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
+        }
 
-            const req = new DescribeWorkspaceRequest();
-            req.setId(instance.id);
-            const client = await this.workspaceManagerClientProvider.get(instance.region);
-            const desc = await client.describeWorkspace({ span }, req);
+        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get");
 
-            if (!desc.hasStatus()) {
-                throw new Error("describeWorkspace returned no status");
-            }
+        return await this.workspaceService.getOpenPorts(user.id, workspaceId);
+    }
 
-            const status = desc.getStatus()!;
-            const ports = status.getSpec()!.getExposedPortsList().map(p => <WorkspaceInstancePort>{
-                port: p.getPort(),
-                targetPort: p.getTarget(),
-                url: p.getUrl(),
-                visibility: this.portVisibilityFromProto(p.getVisibility())
+    public async updateGitStatus(
+        ctx: TraceContext,
+        workspaceId: string,
+        gitStatus: Required<WorkspaceInstanceRepoStatus> | undefined,
+    ): Promise<void> {
+        traceAPIParams(ctx, { workspaceId, repo: gitStatus });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("updateGitStatus");
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        const instance = await this.workspaceService.getCurrentInstance(user.id, workspaceId);
+        traceWI(ctx, { instanceId: instance.id });
+        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update");
+
+        await this.workspaceService.updateGitStatus(user.id, workspaceId, gitStatus);
+    }
+
+    public async openPort(
+        ctx: TraceContext,
+        workspaceId: string,
+        port: WorkspaceInstancePort,
+    ): Promise<WorkspaceInstancePort | undefined> {
+        traceAPIParams(ctx, { workspaceId, port });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("openPort");
+
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        const runningInstance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        if (!runningInstance) {
+            log.debug({ userId: user.id, workspaceId }, "Cannot open port for workspace with no running instance", {
+                port,
             });
-
-            return ports;
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    public async openPort(workspaceId: string, port: WorkspaceInstancePort): Promise<WorkspaceInstancePort | undefined> {
-        const user = this.checkAndBlockUser("openPort");
-        const span = opentracing.globalTracer().startSpan("openPort");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
-        span.setTag("port", port);
-
-        try {
-            const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({ span }));
-            const runningInstance = await this.workspaceDb.trace({ span }).findRunningInstance(workspaceId);
-            if (!runningInstance) {
-                log.debug({ userId: user.id, workspaceId }, 'Cannot open port for workspace with no running instance', { port });
-                return;
-            }
-            await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace }, "update");
-
-            const req = new ControlPortRequest();
-            req.setId(runningInstance.id);
-            const spec = new PortSpec();
-            spec.setPort(port.port);
-            if (!!port.targetPort) {
-                spec.setTarget(port.targetPort);
-            } else {
-                spec.setTarget(port.port);
-            }
-            spec.setVisibility(this.portVisibilityToProto(port.visibility))
-            req.setSpec(spec);
-            req.setExpose(true);
-
-            const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
-            await client.controlPort({ span }, req);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    protected portVisibilityFromProto(visibility: ProtoPortVisibility): PortVisibility {
-        switch (visibility) {
-            default:    // the default in the protobuf def is: private
-            case ProtoPortVisibility.PORT_VISIBILITY_PRIVATE:
-                return 'private';
-            case ProtoPortVisibility.PORT_VISIBILITY_PUBLIC:
-                return 'public';
-        }
-    }
-
-    protected portVisibilityToProto(visibility: PortVisibility | undefined): ProtoPortVisibility {
-        switch (visibility) {
-            default:    // the default for requests is: private
-            case 'private':
-                return ProtoPortVisibility.PORT_VISIBILITY_PRIVATE;
-            case 'public':
-                return ProtoPortVisibility.PORT_VISIBILITY_PUBLIC;
-        }
-    }
-
-    public async closePort(workspaceId: string, port: number) {
-        const user = this.checkAndBlockUser("closePort");
-        const span = opentracing.globalTracer().startSpan("closePort");
-        span.setTag("workspaceId", workspaceId);
-        span.setTag("userId", user.id);
-        span.setTag("port", port);
-
-        try {
-            const { workspace, instance } = await this.internGetCurrentWorkspaceInstance(user.id, workspaceId);
-            if (!instance || instance.status.phase !== 'running') {
-                log.debug({ userId: user.id, workspaceId }, 'Cannot close a port for a workspace which has no running instance', { port });
-                return;
-            }
-            await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update");
-
-            const req = new ControlPortRequest();
-            req.setId(instance.id);
-            const spec = new PortSpec();
-            spec.setPort(port);
-            req.setSpec(spec);
-            req.setExpose(false);
-
-            const client = await this.workspaceManagerClientProvider.get(instance.region);
-            await client.controlPort({ span }, req);
-        } catch (e) {
-            TraceContext.logError({ span }, e);
-            throw e;
-        } finally {
-            span.finish();
-        }
-    }
-
-    async watchWorkspaceImageBuildLogs(workspaceId: string): Promise<void> {
-        const user = this.checkAndBlockUser("watchWorkspaceImageBuildLogs", undefined, { workspaceId });
-        const span = opentracing.globalTracer().startSpan("watchWorkspaceImageBuildLogs");
-        const logCtx: LogContext = { userId: user.id, workspaceId };
-
-        const { instance, workspace } = await this.internGetCurrentWorkspaceInstance(user.id, workspaceId);
-        if (!this.client) {
             return;
         }
+        traceWI(ctx, { instanceId: runningInstance.id });
+        await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace }, "update");
+        return await this.workspaceService.openPort(user.id, workspaceId, port);
+    }
+
+    public async closePort(ctx: TraceContext, workspaceId: string, port: number) {
+        traceAPIParams(ctx, { workspaceId, port });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("closePort");
+
+        const { workspace, instance } = await this.internGetCurrentWorkspaceInstance(ctx, user, workspaceId);
+        if (!instance || instance.status.phase !== "running") {
+            log.debug(
+                { userId: user.id, workspaceId },
+                "Cannot close a port for a workspace which has no running instance",
+                { port },
+            );
+            return;
+        }
+        traceWI(ctx, { instanceId: instance.id });
+        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "update");
+
+        await this.workspaceService.closePort(user.id, workspaceId, port);
+    }
+
+    async watchWorkspaceImageBuildLogs(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("watchWorkspaceImageBuildLogs", undefined, { workspaceId });
+        const client = this.client;
+        if (!client) {
+            return;
+        }
+
+        // TODO(gpl) Remove entirely after FGA rollout
+        const logCtx: LogContext = { userId: user.id, workspaceId };
+        const { instance, workspace } = await this.internGetCurrentWorkspaceInstance(ctx, user, workspaceId);
         if (!instance) {
             log.debug(logCtx, `No running instance for workspaceId.`);
             return;
         }
-        if (!workspace.imageNameResolved) {
-            log.debug(logCtx, `No imageNameResolved set for workspaceId, cannot watch logs.`);
-            return;
-        }
-        const teamMembers = await this.getTeamMembersByProject(workspace.projectId);
-        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace, teamMembers }, "get");
-        if (!this.client) {
-            return;
-        }
+        traceWI(ctx, { instanceId: instance.id });
+        const teamMembers = await this.organizationService.listMembers(user.id, workspace.organizationId);
+        await this.guardAccess({ kind: "workspaceLog", subject: workspace, teamMembers }, "get");
 
-        try {
-            const imgbuilder = this.imageBuilderClientProvider.getDefault();
-            const req = new LogsRequest();
-            req.setCensored(true);
-            req.setBuildRef(workspace.imageNameResolved);
-
-            let lineCount = 0;
-            imgbuilder.logs({ span }, req, data => {
-                if (!this.client) {
-                    return 'stop';
-                }
-                data = data.replace("\n", WorkspaceImageBuild.LogLine.DELIMITER);
-                lineCount += data.split(WorkspaceImageBuild.LogLine.DELIMITER_REGEX).length;
-
-                this.client.onWorkspaceImageBuildLogs(undefined as any, {
-                    text: data,
-                    isDiff: true,
-                    upToLine: lineCount
-                })
-                return 'continue';
+        const receiver = async (chunk: Uint8Array) => {
+            client.onWorkspaceImageBuildLogs(undefined as any as WorkspaceImageBuild.StateInfo, {
+                data: Array.from(chunk), // json-rpc can't handle objects, so we convert back-and-forth here
             });
-        } catch (err) {
-            log.error(logCtx, `cannot watch logs for workspaceId`, err)
-        }
+        };
+        await this.workspaceService.watchWorkspaceImageBuildLogs(user.id, workspaceId, receiver);
     }
 
-    async getHeadlessLog(instanceId: string): Promise<HeadlessLogUrls> {
-        const user = this.checkAndBlockUser('getHeadlessLog', { instanceId });
-        const span = opentracing.globalTracer().startSpan("getHeadlessLog");
+    async getHeadlessLog(ctx: TraceContext, instanceId: string): Promise<HeadlessLogUrls> {
+        traceAPIParams(ctx, { instanceId });
 
-        const ws = await this.workspaceDb.trace({ span }).findByInstanceId(instanceId);
-        if (!ws) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${instanceId} not found`);
-        }
+        const user = await this.checkAndBlockUser("getHeadlessLog", { instanceId });
 
-        const wsiPromise = this.workspaceDb.trace({span}).findInstanceById(instanceId);
-        const teamMembers = await this.getTeamMembersByProject(ws.projectId);
-
-        await this.guardAccess({ kind: 'workspace', subject: ws, teamMembers }, 'get');
-
-        const wsi = await wsiPromise;
-        if (!wsi) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace instance for ${instanceId} not found`);
-        }
-
-        const urls = await this.headlessLogService.getHeadlessLogURLs(user.id, wsi, ws.ownerId);
-        if (!urls || (typeof urls.streams === "object" && Object.keys(urls.streams).length === 0)) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `Headless logs for ${instanceId} not found`);
-        }
-        return urls;
-    }
-
-    protected async internGetCurrentWorkspaceInstance(userId: string, workspaceId: string): Promise<{ workspace: Workspace, instance: WorkspaceInstance | undefined }> {
-        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({}));
-
-        const instance = await this.workspaceDb.trace({}).findRunningInstance(workspaceId);
-        return { instance, workspace };
-    }
-
-    async getUserStorageResource(options: GitpodServer.GetUserStorageResourceOptions): Promise<string> {
-        const userId = this.checkUser("getUserStorageResource", { uri: options.uri }).id;
-        const uri = options.uri;
-
-        await this.guardAccess({ kind: "userStorage", uri, userID: userId }, "get");
-
-        return await this.userStorageResourcesDB.get(userId, uri);
-    }
-
-    async updateUserStorageResource(options: GitpodServer.UpdateUserStorageResourceOptions): Promise<void> {
-        const userId = this.checkAndBlockUser("updateUserStorageResource", { uri: options.uri }).id;
-        const uri = options.uri;
-        const content = options.content;
-
-        await this.guardAccess({ kind: "userStorage", uri, userID: userId }, "update");
-
-        await this.userStorageResourcesDB.update(userId, uri, content);
-    }
-
-
-    async sendFeedback(feedback: string): Promise<string | undefined> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, 'Sending feedback is not implemented');
-    }
-
-    async registerGithubApp(installationId: string): Promise<void> {
-        const user = this.checkAndBlockUser();
-
-        if (!this.config.githubApp?.enabled) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, 'No GitHub app enabled for this installation. Please talk to your administrator.');
-        }
-
-        await this.appInstallationDB.recordNewInstallation('github', 'user', installationId, user.id);
-    }
-
-    async takeSnapshot(options: GitpodServer.TakeSnapshotOptions): Promise<string> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Snapshot support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async getSnapshots(workspaceId: string): Promise<string[]> {
-        // this is an EE feature. Throwing an exception here would break the dashboard though.
-        return [];
-    }
-
-    /**
-     * stores/updates layout information for the given workspace
-     */
-    async storeLayout(workspaceId: string, layoutData: string): Promise<void> {
-        const user = this.checkAndBlockUser("storeLayout");
-        const workspace = await this.workspaceDb.trace({}).findById(workspaceId);
-        if (!workspace || workspace.ownerId !== user.id) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
-        }
-
-        await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
-
-        await this.workspaceDb.trace({}).storeLayoutData({
-            workspaceId,
-            lastUpdatedTime: new Date().toISOString(),
-            layoutData
+        return this.workspaceService.getHeadlessLog(user.id, instanceId, async (workspace) => {
+            const teamMembers = await this.organizationService.listMembers(user.id, workspace.organizationId);
+            await this.guardAccess({ kind: "workspaceLog", subject: workspace, teamMembers }, "get");
         });
     }
 
+    // TODO(gpl): Remove after FGA rollout
+    private async internGetCurrentWorkspaceInstance(
+        ctx: TraceContext,
+        user: User,
+        workspaceId: string,
+    ): Promise<{ workspace: Workspace; instance: WorkspaceInstance | undefined }> {
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+
+        const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        return { instance, workspace };
+    }
+
+    async isGitHubAppEnabled(ctx: TraceContext): Promise<boolean> {
+        return false;
+    }
+
+    async registerGithubApp(ctx: TraceContext, installationId: string): Promise<void> {}
+
+    async takeSnapshot(ctx: TraceContext, options: GitpodServer.TakeSnapshotOptions): Promise<string> {
+        traceAPIParams(ctx, { options });
+        const { workspaceId } = options;
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("takeSnapshot");
+
+        // TODO: Remove after FGA rollout
+        const workspace = await this.guardSnaphotAccess(ctx, user.id, workspaceId);
+        const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
+        if (!instance) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} has no running instance`);
+        }
+        await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get");
+        // end of todo
+
+        const snapshot = await this.workspaceService.takeSnapshot(user.id, options);
+        return snapshot.id;
+    }
+
     /**
-     * retrieves layout information for the given workspace
+     * @param snapshotId
+     * @throws ApplicationError with either NOT_FOUND or SNAPSHOT_ERROR in case the snapshot is not done yet.
      */
-    async getLayout(workspaceId: string): Promise<string | undefined> {
-        this.checkUser("storeLayout");
+    async waitForSnapshot(ctx: TraceContext, snapshotId: string): Promise<void> {
+        traceAPIParams(ctx, { snapshotId });
 
-        const workspace = await this.workspaceDb.trace({}).findById(workspaceId);
-        if (!workspace) {
-            return;
+        const user = await this.checkAndBlockUser("waitForSnapshot");
+
+        // TODO: Remove after FGA rollout
+        const snapshot = await this.workspaceDb.trace(ctx).findSnapshotById(snapshotId);
+        if (!snapshot) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `No snapshot with id '${snapshotId}' found.`);
         }
+        await this.guardSnaphotAccess(ctx, user.id, snapshot.originalWorkspaceId);
+        // end of todo
+
+        await this.workspaceService.waitForSnapshot(user.id, snapshotId);
+    }
+
+    async getSnapshots(ctx: TraceContext, workspaceId: string): Promise<string[]> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("getSnapshots");
+
+        // TODO: Remove after FGA rollout
+        // we use the workspacService which checks if the requesting user has access to the workspace. If that is the case they have access to snapshots as well.
+        // below is the old permission check which would also check if the user has access to the snapshot itself. This is not the case anymore.
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
+        if (workspace.ownerId !== user.id) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
+        }
+        // end of todo
+
+        const snapshots = await this.workspaceService.listSnapshots(user.id, workspaceId);
+
+        // TODO: Remove after FGA rollout
+        await Promise.all(snapshots.map((s) => this.guardAccess({ kind: "snapshot", subject: s, workspace }, "get")));
+        // end of todo
+
+        return snapshots.map((s) => s.id);
+    }
+
+    async getWorkspaceEnvVars(ctx: TraceContext, workspaceId: string): Promise<EnvVarWithValue[]> {
+        const user = await this.checkUser("getWorkspaceEnvVars");
+        const { workspace } = await this.workspaceService.getWorkspace(user.id, workspaceId);
         await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+        const envVars = await this.envVarService.resolveEnvVariables(
+            workspace.ownerId,
+            workspace.organizationId,
+            workspace.projectId,
+            workspace.type,
+            workspace.context,
+            workspace.config,
+        );
 
-        const layoutData = await this.workspaceDb.trace({}).findLayoutDataByWorkspaceId(workspaceId);
-        if (!layoutData) {
-            return;
-        }
-        return layoutData.layoutData;
-    }
-
-    // Get environment variables (filter by repository pattern precedence)
-    async getEnvVars(): Promise<UserEnvVarValue[]> {
-        const user = this.checkUser("getEnvVars");
-        const result = new Map<string, { value: UserEnvVar, score: number }>();
-        for (const value of await this.userDB.getEnvVars(user.id)) {
-            if (!await this.resourceAccessGuard.canAccess({ kind: 'envVar', subject: value }, 'get')) {
+        const result: EnvVarWithValue[] = [];
+        for (const value of envVars.workspace) {
+            if (
+                UserEnvVar.is(value) &&
+                !(await this.resourceAccessGuard.canAccess({ kind: "envVar", subject: value }, "get"))
+            ) {
                 continue;
             }
-            const score = UserEnvVar.score(value);
-            const current = result.get(value.name);
-            if (!current || score < current.score) {
-                result.set(value.name, { value, score });
-            }
-        }
-        return [...result.values()]
-            .map(({ value: { id, name, value, repositoryPattern } }) => ({ id, name, value, repositoryPattern }));
-    }
-
-    // Get all environment variables (unfiltered)
-    async getAllEnvVars(): Promise<UserEnvVarValue[]> {
-        const user = this.checkUser("getAllEnvVars");
-        const result: UserEnvVarValue[] = [];
-        for (const value of await this.userDB.getEnvVars(user.id)) {
-            if (!await this.resourceAccessGuard.canAccess({ kind: 'envVar', subject: value }, 'get')) {
-                continue;
-            }
-            result.push({
-                id: value.id,
-                name: value.name,
-                value: value.value,
-                repositoryPattern: value.repositoryPattern,
-            });
+            result.push(value);
         }
         return result;
     }
 
-    async setEnvVar(variable: UserEnvVarValue): Promise<void> {
+    // Get all environment variables (unfiltered)
+    async getAllEnvVars(ctx: TraceContext): Promise<UserEnvVarValue[]> {
+        const user = await this.checkUser("getAllEnvVars");
+        return this.envVarService.listUserEnvVars(user.id, user.id, (envvar: UserEnvVar) => {
+            return this.resourceAccessGuard.canAccess({ kind: "envVar", subject: envvar }, "get");
+        });
+    }
+
+    async setEnvVar(ctx: TraceContext, variable: UserEnvVarValue): Promise<void> {
+        traceAPIParams(ctx, { variable: censor(variable, "value") }); // filter content because of PII
+
         // Note: this operation is per-user only, hence needs no resource guard
-        const user = this.checkAndBlockUser("setEnvVar");
-        const userId = user.id;
+        const user = await this.checkAndBlockUser("setEnvVar");
+        const userEnvVars = await this.envVarService.listUserEnvVars(user.id, user.id);
+        const existingEnvVar = userEnvVars.find(
+            (v) =>
+                v.name == variable.name &&
+                UserEnvVar.normalizeRepoPattern(v.repositoryPattern) ===
+                    UserEnvVar.normalizeRepoPattern(variable.repositoryPattern),
+        );
+        if (existingEnvVar) {
+            await this.envVarService.updateUserEnvVar(
+                user.id,
+                user.id,
+                { ...variable, id: existingEnvVar.id },
+                (envvar: UserEnvVar) => {
+                    return this.guardAccess({ kind: "envVar", subject: envvar }, "update");
+                },
+            );
+        } else {
+            await this.envVarService.addUserEnvVar(user.id, user.id, variable, (envvar: UserEnvVar) => {
+                return this.guardAccess({ kind: "envVar", subject: envvar }, "create");
+            });
+        }
+    }
 
-        variable.repositoryPattern = UserEnvVar.normalizeRepoPattern(variable.repositoryPattern);
-        const existingVars = (await this.userDB.getEnvVars(user.id)).filter(v => !v.deleted);
+    async deleteEnvVar(ctx: TraceContext, variable: UserEnvVarValue): Promise<void> {
+        traceAPIParams(ctx, { variable: censor(variable, "value") });
 
-        const existingVar = existingVars.find(v => v.name == variable.name && v.repositoryPattern == variable.repositoryPattern);
-        if (!!existingVar) {
-            // overwrite existing variable rather than introduce a duplicate
-            variable.id = existingVar.id;
+        // Note: this operation is per-user only, hence needs no resource guard
+        const user = await this.checkAndBlockUser("deleteEnvVar");
+        return this.envVarService.deleteUserEnvVar(user.id, user.id, variable, (envvar: UserEnvVar) => {
+            return this.guardAccess({ kind: "envVar", subject: envvar }, "delete");
+        });
+    }
+
+    async hasSSHPublicKey(ctx: TraceContext): Promise<boolean> {
+        const user = await this.checkUser("hasSSHPublicKey");
+        return this.sshKeyservice.hasSSHPublicKey(user.id, user.id);
+    }
+
+    async getSSHPublicKeys(ctx: TraceContext): Promise<UserSSHPublicKeyValue[]> {
+        const user = await this.checkUser("getSSHPublicKeys");
+        return this.sshKeyservice.getSSHPublicKeys(user.id, user.id);
+    }
+
+    async addSSHPublicKey(ctx: TraceContext, value: SSHPublicKeyValue): Promise<UserSSHPublicKeyValue> {
+        const user = await this.checkUser("addSSHPublicKey");
+        return this.sshKeyservice.addSSHPublicKey(user.id, user.id, value);
+    }
+
+    async deleteSSHPublicKey(ctx: TraceContext, id: string): Promise<void> {
+        const user = await this.checkUser("deleteSSHPublicKey");
+        return this.sshKeyservice.deleteSSHPublicKey(user.id, user.id, id);
+    }
+
+    async setProjectEnvironmentVariable(
+        ctx: TraceContext,
+        projectId: string,
+        name: string,
+        value: string,
+        censored: boolean,
+        id?: string,
+    ): Promise<void> {
+        traceAPIParams(ctx, { projectId, name }); // value may contain secrets
+        const user = await this.checkAndBlockUser("setProjectEnvironmentVariable");
+        await this.guardProjectOperation(user, projectId, "update");
+        const envVars = await this.envVarService.listProjectEnvVars(user.id, projectId);
+        if (envVars.find((v) => v.name === name)) {
+            await this.envVarService.updateProjectEnvVar(user.id, projectId, { name, value, censored, id });
+        } else {
+            await this.envVarService.addProjectEnvVar(user.id, projectId, { name, value, censored });
+        }
+    }
+
+    async getProjectEnvironmentVariables(ctx: TraceContext, projectId: string): Promise<ProjectEnvVar[]> {
+        traceAPIParams(ctx, { projectId });
+        const user = await this.checkAndBlockUser("getProjectEnvironmentVariables");
+        await this.guardProjectOperation(user, projectId, "get");
+        return this.envVarService.listProjectEnvVars(user.id, projectId);
+    }
+
+    async deleteProjectEnvironmentVariable(ctx: TraceContext, variableId: string): Promise<void> {
+        traceAPIParams(ctx, { variableId });
+        const user = await this.checkAndBlockUser("deleteProjectEnvironmentVariable");
+        const envVar = await this.envVarService.getProjectEnvVarById(user.id, variableId);
+        if (!envVar) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "Project environment variable not found");
+        }
+        await this.guardProjectOperation(user, envVar.projectId, "update");
+        return this.envVarService.deleteProjectEnvVar(user.id, envVar.id);
+    }
+
+    private async guardSnaphotAccess(ctx: TraceContext, userId: string, workspaceId: string): Promise<Workspace> {
+        traceAPIParams(ctx, { userId, workspaceId });
+
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!workspace || workspace.ownerId !== userId) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `Workspace ${workspaceId} does not exist.`);
+        }
+        await this.guardAccess({ kind: "snapshot", subject: undefined, workspace }, "create");
+
+        return workspace;
+    }
+
+    // TODO(gpl) Remove after FGA rollout (only uuidValidate has to be extracted)
+    private async guardTeamOperation(teamId: string, op: ResourceAccessOp): Promise<void> {
+        if (!uuidValidate(teamId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organization ID must be a valid UUID");
         }
 
-        if (!variable.id) {
-            // this is a new variable - make sure the user does not have too many (don't DOS our database using gp env)
-            const varCount = existingVars.length;
-            if (varCount > this.config.maxEnvvarPerUserCount) {
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, `cannot have more than ${this.config.maxEnvvarPerUserCount} environment variables`)
+        const org = await this.teamDB.findTeamById(teamId);
+        if (!org) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `Organization ID: ${teamId} not found.`);
+        }
+
+        const members = await this.teamDB.findMembersByTeam(org.id);
+
+        if (!(await this.resourceAccessGuard.canAccess({ kind: "team", subject: org, members }, op))) {
+            // if user has read permission, throw 403, otherwise 404
+            if (await this.resourceAccessGuard.canAccess({ kind: "team", subject: org, members }, "get")) {
+                throw new ApplicationError(ErrorCodes.PERMISSION_DENIED, `No access to Organization ID: ${teamId}`);
+            } else {
+                throw new ApplicationError(ErrorCodes.NOT_FOUND, `Organization ID: ${teamId} not found.`);
             }
         }
+        return;
+    }
 
-        const envvar: UserEnvVar = {
-            ...variable,
-            id: variable.id || uuidv4(),
-            userId,
+    public async getTeams(ctx: TraceContext): Promise<Organization[]> {
+        const user = await this.checkUser("getOrganizations");
+        const orgs = await this.organizationService.listOrganizationsByMember(user.id, user.id);
+
+        const filterOrg = async (org: Organization): Promise<Organization | undefined> => {
+            const members = await this.organizationService.listMembers(user.id, org.id);
+            if (!(await this.resourceAccessGuard.canAccess({ kind: "team", subject: org, members }, "get"))) {
+                return undefined;
+            }
+            return org;
         };
-        await this.guardAccess({ kind: 'envVar', subject: envvar }, typeof variable.id === 'string' ? 'update' : 'create');
-        this.analytics.track({ event: "envvar-set", userId });
 
-        await this.userDB.setEnvVar(envvar);
+        const accessibleOrgs = [];
+        for (const check of orgs.map(filterOrg)) {
+            const org = await check;
+            if (org) {
+                accessibleOrgs.push(org);
+            }
+        }
+        return accessibleOrgs;
     }
 
-    async deleteEnvVar(variable: UserEnvVarValue): Promise<void> {
-        // Note: this operation is per-user only, hence needs no resource guard
-        const user = this.checkAndBlockUser("deleteEnvVar");
-        const userId = user.id;
+    public async getTeam(ctx: TraceContext, teamId: string): Promise<Team> {
+        traceAPIParams(ctx, { teamId });
 
-        if (!variable.id && variable.name && variable.repositoryPattern) {
-            variable.repositoryPattern = UserEnvVar.normalizeRepoPattern(variable.repositoryPattern);
-            const existingVars = (await this.userDB.getEnvVars(user.id)).filter(v => !v.deleted);
-            const existingVar = existingVars.find(v => v.name == variable.name && v.repositoryPattern == variable.repositoryPattern);
-            variable.id = existingVar?.id;
-        }
+        const user = await this.checkAndBlockUser("getTeam");
 
-        if (!variable.id) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `cannot delete '${variable.name}' in scope '${variable.repositoryPattern}'`)
-        }
-
-        const envvar: UserEnvVar = {
-            ...variable,
-            id: variable.id!,
-            userId,
-        };
-        await this.guardAccess({ kind: 'envVar', subject: envvar }, 'delete');
-        this.analytics.track({ event: "envvar-deleted", userId });
-
-        await this.userDB.deleteEnvVar(envvar);
+        await this.guardTeamOperation(teamId, "get");
+        return this.organizationService.getOrganization(user.id, teamId);
     }
 
-    protected async guardTeamOperation(teamId: string | undefined, op: ResourceAccessOp): Promise<void> {
-        const team = await this.teamDB.findTeamById(teamId || "");
-        if (!team) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "Team not found");
-        }
-        const members = await this.teamDB.findMembersByTeam(team.id);
-        await this.guardAccess({ kind: "team", subject: team, members }, op);
+    public async updateTeam(ctx: TraceContext, teamId: string, team: Pick<Team, "name">): Promise<Team> {
+        traceAPIParams(ctx, { teamId });
+        const user = await this.checkUser("updateTeam");
+
+        await this.guardTeamOperation(teamId, "update");
+        return this.organizationService.updateOrganization(user.id, teamId, team);
     }
 
-    public async getTeams(): Promise<Team[]> {
-        // Note: this operation is per-user only, hence needs no resource guard
-        const user = this.checkUser("getTeams");
-        return this.teamDB.findTeamsByUser(user.id);
-    }
+    public async getTeamMembers(ctx: TraceContext, teamId: string): Promise<TeamMemberInfo[]> {
+        traceAPIParams(ctx, { teamId });
 
-    public async getTeamMembers(teamId: string): Promise<TeamMemberInfo[]> {
-        this.checkUser("getTeamMembers");
-        const team = await this.teamDB.findTeamById(teamId);
-        if (!team) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "Team not found");
-        }
-        const members = await this.teamDB.findMembersByTeam(team.id);
-        await this.guardAccess({ kind: "team", subject: team, members }, "get");
+        const user = await this.checkUser("getTeamMembers");
+        await this.guardTeamOperation(teamId, "get");
+        const members = await this.organizationService.listMembers(user.id, teamId);
+
         return members;
     }
 
-    public async createTeam(name: string): Promise<Team> {
+    public async createTeam(ctx: TraceContext, name: string): Promise<Team> {
+        traceAPIParams(ctx, { name });
+
         // Note: this operation is per-user only, hence needs no resource guard
-        const user = this.checkAndBlockUser("createTeam");
-        const team = await this.teamDB.createTeam(user.id, name);
-        this.analytics.track({
-            userId: user.id,
-            event: "team_created",
-            properties: {
-                id: team.id,
-                name: team.name,
-                slug: team.slug,
-                created_at: team.creationTime
-            }
-        })
-        return team;
+        const user = await this.checkAndBlockUser("createTeam");
+        const org = await this.organizationService.createOrganization(user.id, name);
+        // create a cost center
+        await this.usageService.getCostCenter(user.id, org.id);
+
+        ctx.span?.setTag("teamId", org.id);
+        return org;
     }
 
-    public async joinTeam(inviteId: string): Promise<Team> {
-        const user = this.checkAndBlockUser("joinTeam");
-        // Invites can be used by anyone, as long as they know the invite ID, hence needs no resource guard
-        const invite = await this.teamDB.findTeamMembershipInviteById(inviteId);
-        if (!invite || invite.invalidationTime !== '') {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "The invite link is no longer valid.");
+    public async joinTeam(ctx: TraceContext, inviteId: string): Promise<Team> {
+        traceAPIParams(ctx, { inviteId });
+
+        const user = await this.checkAndBlockUser("joinTeam");
+
+        const orgId = await this.organizationService.joinOrganization(user.id, inviteId);
+        const org = await this.getTeam(ctx, orgId);
+        if (org !== undefined) {
+            try {
+                // verify the new member if this org is a paying customer
+                if (
+                    (await this.stripeService.findUncancelledSubscriptionByAttributionId(
+                        AttributionId.render({ kind: "team", teamId: org.id }),
+                    )) !== undefined
+                ) {
+                    await this.userService.markUserAsVerified(user, undefined);
+                }
+            } catch (e) {
+                log.warn("Failed to verify new org member", e);
+            }
         }
-        await this.teamDB.addMemberToTeam(user.id, invite.teamId);
-        const team = await this.teamDB.findTeamById(invite.teamId);
 
-        this.analytics.track({
-            userId: user.id,
-            event: "team_joined",
-            properties: {
-                team_id: invite.teamId,
-                invite_id: inviteId
-            }
-        })
-        return team!;
+        return org!;
     }
 
-    public async setTeamMemberRole(teamId: string, userId: string, role: TeamMemberRole): Promise<void> {
-        this.checkAndBlockUser("setTeamMemberRole");
+    public async setTeamMemberRole(
+        ctx: TraceContext,
+        teamId: string,
+        userId: string,
+        role: TeamMemberRole,
+    ): Promise<void> {
+        traceAPIParams(ctx, { teamId, userId, role });
+
+        const requestor = await this.checkAndBlockUser("setTeamMemberRole");
+
+        if (!uuidValidate(userId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "user ID must be a valid UUID");
+        }
+
+        if (!TeamMemberRole.isValid(role)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "invalid role name");
+        }
+
         await this.guardTeamOperation(teamId, "update");
-        await this.teamDB.setTeamMemberRole(userId, teamId, role);
+        await this.organizationService.addOrUpdateMember(requestor.id, teamId, userId, role);
     }
 
-    public async removeTeamMember(teamId: string, userId: string): Promise<void> {
-        const user = this.checkAndBlockUser("removeTeamMember");
-        // Users are free to leave any team themselves, but only owners can remove others from their teams.
-        await this.guardTeamOperation(teamId, user.id === userId ? "get" : "update");
-        await this.teamDB.removeMemberFromTeam(userId, teamId);
-        this.analytics.track({
-            userId: user.id,
-            event: "team_user_removed",
-            properties: {
-                team_id: teamId,
-                removed_user_id: userId
+    public async removeTeamMember(ctx: TraceContext, orgID: string, userId: string): Promise<void> {
+        traceAPIParams(ctx, { teamId: orgID, userId });
+
+        if (!uuidValidate(userId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "user ID must be a valid UUID");
+        }
+
+        const requestor = await this.checkAndBlockUser("removeTeamMember");
+
+        // The user is leaving a team, if they are removing themselves from the team.
+        const currentUserLeavingTeam = requestor.id === userId;
+        if (!currentUserLeavingTeam) {
+            await this.guardTeamOperation(orgID, "update");
+        } else {
+            await this.guardTeamOperation(orgID, "get");
+        }
+
+        await this.organizationService.removeOrganizationMember(requestor.id, orgID, userId);
+    }
+
+    public async getGenericInvite(ctx: TraceContext, teamId: string): Promise<TeamMembershipInvite> {
+        traceAPIParams(ctx, { teamId });
+
+        const user = await this.checkUser("getGenericInvite");
+        await this.guardTeamOperation(teamId, "update");
+
+        return this.organizationService.getOrCreateInvite(user.id, teamId);
+    }
+
+    public async resetGenericInvite(ctx: TraceContext, teamId: string): Promise<TeamMembershipInvite> {
+        traceAPIParams(ctx, { teamId });
+
+        const user = await this.checkAndBlockUser("resetGenericInvite");
+        await this.guardTeamOperation(teamId, "update");
+        return this.organizationService.resetInvite(user.id, teamId);
+    }
+
+    private async guardProjectOperation(user: User, projectId: string, op: ResourceAccessOp): Promise<void> {
+        const project = await this.projectsService.getProject(user.id, projectId);
+        // Anyone who can read a team's information (i.e. any team member) can manage team projects
+        await this.guardTeamOperation(project.teamId, "get");
+    }
+
+    public async deleteProject(ctx: TraceContext, projectId: string): Promise<void> {
+        traceAPIParams(ctx, { projectId });
+
+        const user = await this.checkUser("deleteProject");
+        await this.guardProjectOperation(user, projectId, "delete");
+        return this.projectsService.deleteProject(user.id, projectId);
+    }
+
+    public async deleteTeam(ctx: TraceContext, teamId: string): Promise<void> {
+        const user = await this.checkAndBlockUser("deleteTeam");
+        traceAPIParams(ctx, { teamId, userId: user.id });
+
+        await this.guardTeamOperation(teamId, "delete");
+        await this.organizationService.deleteOrganization(user.id, teamId);
+    }
+
+    async getOrgSettings(ctx: TraceContextWithSpan, orgId: string): Promise<OrganizationSettings> {
+        const user = await this.checkAndBlockUser("getOrgSettings");
+        traceAPIParams(ctx, { orgId, userId: user.id });
+        await this.guardTeamOperation(orgId, "get");
+        return this.organizationService.getSettings(user.id, orgId);
+    }
+
+    async updateOrgSettings(
+        ctx: TraceContextWithSpan,
+        orgId: string,
+        settings: Partial<OrganizationSettings>,
+    ): Promise<OrganizationSettings> {
+        const user = await this.checkAndBlockUser("updateOrgSettings");
+        traceAPIParams(ctx, { orgId, userId: user.id });
+        await this.guardTeamOperation(orgId, "update");
+        return this.organizationService.updateSettings(user.id, orgId, settings);
+    }
+
+    async getOrgWorkspaceClasses(ctx: TraceContextWithSpan, orgId: string): Promise<SupportedWorkspaceClass[]> {
+        const user = await this.checkAndBlockUser("getOrgWorkspaceClasses");
+        traceAPIParams(ctx, { orgId, userId: user.id });
+        await this.guardTeamOperation(orgId, "get");
+        return this.organizationService.listWorkspaceClasses(user.id, orgId);
+    }
+
+    async getDefaultWorkspaceImage(
+        ctx: TraceContextWithSpan,
+        params: GetDefaultWorkspaceImageParams,
+    ): Promise<GetDefaultWorkspaceImageResult> {
+        const user = await this.checkAndBlockUser("getDefaultWorkspaceImage");
+        traceAPIParams(ctx, { params, userId: user.id });
+        if (params.workspaceId) {
+            const workspace = await this.getWorkspace(ctx, params.workspaceId);
+            const orgSettings = await this.organizationService.getSettings(user.id, workspace.workspace.organizationId);
+            if (orgSettings.defaultWorkspaceImage) {
+                return {
+                    image: orgSettings.defaultWorkspaceImage,
+                    source: "organization",
+                };
             }
-        })
+        }
+        return {
+            image: this.config.workspaceDefaults.workspaceImage,
+            source: "installation",
+        };
     }
 
-    public async getGenericInvite(teamId: string): Promise<TeamMembershipInvite> {
-        this.checkUser("getGenericInvite");
+    public async getTeamProjects(ctx: TraceContext, teamId: string): Promise<Project[]> {
+        traceAPIParams(ctx, { teamId });
+
+        const user = await this.checkUser("getTeamProjects");
+
         await this.guardTeamOperation(teamId, "get");
-        const invite = await this.teamDB.findGenericInviteByTeamId(teamId);
-        if (invite) {
-            return invite;
-        }
-        return this.teamDB.resetGenericInvite(teamId);
+        return this.projectsService.getProjects(user.id, teamId);
     }
 
-    public async resetGenericInvite(teamId: string): Promise<TeamMembershipInvite> {
-        this.checkAndBlockUser("resetGenericInvite");
-        await this.guardTeamOperation(teamId, "update");
-        return this.teamDB.resetGenericInvite(teamId);
+    public async findPrebuilds(ctx: TraceContext, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
+        traceAPIParams(ctx, { params });
+
+        const user = await this.checkAndBlockUser("findPrebuilds");
+        await this.guardProjectOperation(user, params.projectId, "get");
+        return this.projectsService.findPrebuilds(user.id, params);
     }
 
-    protected async guardProjectOperation(user: User, projectId: string, op: ResourceAccessOp): Promise<void> {
-        const project = await this.projectsService.getProject(projectId);
-        if (!project) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
-        }
-        // TODO(janx): This if/else block should probably become a GuardedProject.
-        if (project.userId) {
-            if (user.id !== project.userId) {
-                // Projects owned by a single user can only be accessed by that user
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Not allowed to access this project");
-            }
-        } else {
-            // Anyone who can read a team's information (i.e. any team member) can manage team projects
-            await this.guardTeamOperation(project.teamId, "get");
-        }
+    public async getPrebuild(ctx: TraceContext, prebuildId: string): Promise<PrebuildWithStatus | undefined> {
+        traceAPIParams(ctx, { prebuildId });
+        const user = await this.checkAndBlockUser("getPrebuild");
+
+        return await this.prebuildManager.getPrebuild(ctx, user.id, prebuildId, async (pbws, workspace) => {
+            const teamMembers = await this.organizationService.listMembers(user.id, workspace.organizationId);
+            await this.guardAccess({ kind: "prebuild", subject: pbws, workspace, teamMembers }, "get");
+        });
     }
 
-    public async getProviderRepositoriesForUser(params: { provider: string }): Promise<ProviderRepository[]> {
-        this.checkAndBlockUser("getProviderRepositoriesForUser");
-        // Note: this operation is per-user only, hence needs no resource guard
+    public async findPrebuildByWorkspaceID(
+        ctx: TraceContext,
+        workspaceId: string,
+    ): Promise<PrebuiltWorkspace | undefined> {
+        traceAPIParams(ctx, { workspaceId });
+        const user = await this.checkAndBlockUser("findPrebuildByWorkspaceID");
 
-        // implemented in EE
-        return [];
+        return await this.prebuildManager.findPrebuildByWorkspaceID(
+            ctx,
+            user.id,
+            workspaceId,
+            async (pbws, workspace) => {
+                const teamMembers = await this.organizationService.listMembers(user.id, workspace.organizationId);
+                await this.guardAccess({ kind: "prebuild", subject: pbws, workspace, teamMembers }, "get");
+            },
+        );
     }
 
-    public async createProject(params: CreateProjectParams): Promise<Project> {
-        const user = this.checkUser("createProject");
-        if (params.userId) {
-            if (params.userId !== user.id) {
-                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, `Cannot create Projects for other users`);
-            }
-        } else {
-            // Anyone who can read a team's information (i.e. any team member) can create a new project.
-            await this.guardTeamOperation(params.teamId, "get");
+    public async getProjectOverview(ctx: TraceContext, projectId: string): Promise<Project.Overview | undefined> {
+        traceAPIParams(ctx, { projectId });
+
+        const user = await this.checkAndBlockUser("getProjectOverview");
+        await this.guardProjectOperation(user, projectId, "get");
+        const result = await this.projectsService.getProjectOverview(user, projectId);
+        if (result) {
+            result.isConsideredInactive = await this.projectsService.isProjectConsideredInactive(user.id, projectId);
         }
-        const project = this.projectsService.createProject(params);
-        this.analytics.track({
-            userId: user.id,
-            event: "project_created",
-            properties: {
-                name: params.name,
-                clone_url: params.cloneUrl,
-                account: params.account,
-                provider: params.provider,
-                owner_type: !!params.teamId ? "team" : "user",
-                owner_id: !!params.teamId ? params.teamId : params.userId,
-                app_installation_id: params.appInstallationId
-            }
-        })
+        return result;
+    }
+
+    async adminFindPrebuilds(ctx: TraceContext, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
+        traceAPIParams(ctx, { params });
+        const user = await this.guardAdminAccess("adminFindPrebuilds", { params }, Permission.ADMIN_PROJECTS);
+
+        return this.projectsService.findPrebuilds(user.id, params);
+    }
+
+    async cancelPrebuild(ctx: TraceContext, projectId: string, prebuildId: string): Promise<void> {
+        traceAPIParams(ctx, { projectId, prebuildId });
+
+        const user = await this.checkAndBlockUser("cancelPrebuild");
+
+        await this.projectsService.getProject(user.id, projectId);
+        await this.guardProjectOperation(user, projectId, "update");
+        await this.auth.checkPermissionOnProject(user.id, "write_prebuild", projectId);
+
+        const prebuild = await this.workspaceDb.trace(ctx).findPrebuildByID(prebuildId);
+        if (!prebuild) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "Prebuild not found");
+        }
+        // Explicitly stopping the prebuild workspace now automatically cancels the prebuild
+        await this.stopWorkspace(ctx, prebuild.buildWorkspaceId);
+    }
+
+    public async createProject(ctx: TraceContext, params: CreateProjectParams): Promise<Project> {
+        traceAPIParams(ctx, { params });
+
+        const user = await this.checkUser("createProject");
+
+        // Anyone who can read a team's information (i.e. any team member) can create a new project.
+        await this.guardTeamOperation(params.teamId || "", "get");
+        await this.auth.checkPermissionOnOrganization(user.id, "create_project", params.teamId);
+
+        const project = await this.projectsService.createProject(params, user);
+
+        // update client registration for the logged in user
+        if (this.client && !this.disposables.disposed) {
+            const prebuildUpdateHandler = (ctx: TraceContext, update: PrebuildWithStatus) =>
+                TraceContext.withSpan(
+                    "forwardPrebuildUpdateToClient",
+                    (ctx) => {
+                        traceClientMetadata(ctx, this.clientMetadata);
+                        TraceContext.setJsonRPCMetadata(ctx, "onPrebuildUpdate");
+
+                        this.client?.onPrebuildUpdate(update);
+                    },
+                    ctx,
+                );
+
+            this.disposables.pushAll([
+                this.subscriber.listenForProjectPrebuildUpdates(project.id, prebuildUpdateHandler),
+            ]);
+        }
+
         return project;
     }
 
-    public async deleteProject(projectId: string): Promise<void> {
-        const user = this.checkUser("deleteProject");
-        await this.guardProjectOperation(user, projectId, "delete");
-        this.analytics.track({
-            userId: user.id,
-            event: "project_deleted",
-            properties: {
-                project_id: projectId
-            }
-        })
-        return this.projectsService.deleteProject(projectId);
+    public async updateProjectPartial(ctx: TraceContext, partialProject: PartialProject): Promise<void> {
+        traceAPIParams(ctx, {
+            // censor everything irrelevant
+            partialProject: {
+                id: partialProject.id,
+                settings: partialProject.settings,
+            },
+        });
+
+        const user = await this.checkUser("updateProjectPartial");
+        await this.guardProjectOperation(user, partialProject.id, "update");
+        await this.projectsService.updateProject(user, partialProject);
     }
 
-    public async deleteTeam(teamId: string, userId: string): Promise<void> {
-        const user = this.checkAndBlockUser("deleteTeam");
-        await this.guardTeamOperation(teamId, "delete");
-
-        const teamProjects = await this.projectsService.getTeamProjects(teamId);
-        teamProjects.forEach(project => {
-            this.deleteProject(project.id);
-        })
-
-        const teamMembers = await this.teamDB.findMembersByTeam(teamId);
-        teamMembers.forEach(member => {
-            this.removeTeamMember(teamId, member.userId);
-        })
-
-        await this.teamDB.deleteTeam(teamId);
-
-        return this.analytics.track({
-            userId: user.id,
-            event: "team_deleted",
-            properties: {
-                team_id: teamId
-            }
-        })
+    public async getGitpodTokens(ctx: TraceContext): Promise<GitpodToken[]> {
+        const user = await this.checkAndBlockUser("getGitpodTokens");
+        const gitpodTokens = await this.gitpodTokenService.getGitpodTokens(user.id, user.id);
+        await Promise.all(gitpodTokens.map((tkn) => this.guardAccess({ kind: "gitpodToken", subject: tkn }, "get")));
+        return gitpodTokens;
     }
 
-    public async getTeamProjects(teamId: string): Promise<Project[]> {
-        this.checkUser("getTeamProjects");
-        await this.guardTeamOperation(teamId, "get");
-        return this.projectsService.getTeamProjects(teamId);
+    public async generateNewGitpodToken(
+        ctx: TraceContext,
+        options: { name?: string; type: GitpodTokenType; scopes?: string[] },
+    ): Promise<string> {
+        traceAPIParams(ctx, { options });
+
+        const user = await this.checkAndBlockUser("generateNewGitpodToken");
+        return this.gitpodTokenService.generateNewGitpodToken(user.id, user.id, options, (dbToken: DBGitpodToken) => {
+            return this.guardAccess({ kind: "gitpodToken", subject: dbToken }, "create");
+        });
     }
 
-    public async getUserProjects(): Promise<Project[]> {
-        // Note: this operation is per-user only, hence needs no resource guard
-        const user = this.checkAndBlockUser("getUserProjects");
-        return this.projectsService.getUserProjects(user.id);
-    }
+    public async getGitpodTokenScopes(ctx: TraceContext, tokenHash: string): Promise<string[]> {
+        traceAPIParams(ctx, {}); // do not trace tokenHash
 
-    public async findPrebuilds(params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
-        const user = this.checkAndBlockUser("getPrebuilds");
-        await this.guardProjectOperation(user, params.projectId, "get");
-        return this.projectsService.findPrebuilds(user, params);
-    }
-
-    public async getProjectOverview(projectId: string): Promise<Project.Overview | undefined> {
-        const user = this.checkAndBlockUser("getProjectOverview");
-        const project = await this.projectsService.getProject(projectId);
-        if (!project) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "Project not found");
+        const user = await this.checkAndBlockUser("getGitpodTokenScopes");
+        const gitpodToken = await this.gitpodTokenService.findGitpodToken(user.id, user.id, tokenHash);
+        if (gitpodToken) {
+            await this.guardAccess({ kind: "gitpodToken", subject: gitpodToken }, "get");
         }
-        await this.guardProjectOperation(user, projectId, "get");
+        return gitpodToken?.scopes ?? [];
+    }
+
+    public async deleteGitpodToken(ctx: TraceContext, tokenHash: string): Promise<void> {
+        traceAPIParams(ctx, {}); // do not trace tokenHash
+
+        const user = await this.checkAndBlockUser("deleteGitpodToken");
+        return this.gitpodTokenService.deleteGitpodToken(user.id, user.id, tokenHash, (token: GitpodToken) => {
+            return this.guardAccess({ kind: "gitpodToken", subject: token }, "delete");
+        });
+    }
+
+    async guessGitTokenScopes(ctx: TraceContext, params: GuessGitTokenScopesParams): Promise<GuessedGitTokenScopes> {
+        traceAPIParams(ctx, { params: censor(params as any, "currentToken") });
+
+        const user = await this.checkAndBlockUser("guessGitTokenScopes");
+
+        return await this.scmService.guessTokenScopes(user.id, { ...params });
+    }
+
+    async adminGetUser(ctx: TraceContext, userId: string): Promise<User> {
+        traceAPIParams(ctx, { userId });
+
+        const admin = await this.guardAdminAccess("adminGetUser", { id: userId }, Permission.ADMIN_USERS);
+
+        return await this.userService.findUserById(admin.id, userId);
+    }
+
+    async adminGetUsers(ctx: TraceContext, req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>> {
+        traceAPIParams(ctx, { req: censor(req, "searchTerm") }); // searchTerm may contain PII
+
+        const admin = await this.guardAdminAccess("adminGetUsers", { req }, Permission.ADMIN_USERS);
+
+        return this.userService.listUsers(admin.id, {
+            ...req,
+            orderDir: req.orderDir === "asc" ? "ASC" : "DESC",
+        });
+    }
+
+    async adminGetBlockedRepositories(
+        ctx: TraceContext,
+        req: AdminGetListRequest<BlockedRepository>,
+    ): Promise<AdminGetListResult<BlockedRepository>> {
+        traceAPIParams(ctx, { req: censor(req, "searchTerm") }); // searchTerm may contain PII
+
+        const admin = await this.guardAdminAccess("adminGetBlockedRepositories", { req }, Permission.ADMIN_USERS);
+
         try {
-            return await this.projectsService.getProjectOverview(user, project);
-        } catch (error) {
-            if (UnauthorizedError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+            return await this.installationService.adminGetBlockedRepositories(admin.id, req);
+        } catch (e) {
+            throw new ApplicationError(ErrorCodes.INTERNAL_SERVER_ERROR, String(e));
+        }
+    }
+
+    async adminCreateBlockedRepository(
+        ctx: TraceContext,
+        urlRegexp: string,
+        blockUser: boolean,
+        blockFreeUsage: boolean,
+    ): Promise<BlockedRepository> {
+        traceAPIParams(ctx, { urlRegexp, blockUser });
+
+        const admin = await this.guardAdminAccess(
+            "adminCreateBlockedRepository",
+            { urlRegexp, blockUser },
+            Permission.ADMIN_USERS,
+        );
+
+        return await this.installationService.adminCreateBlockedRepository(admin.id, {
+            urlRegexp,
+            blockUser,
+            blockFreeUsage,
+        });
+    }
+
+    async adminDeleteBlockedRepository(ctx: TraceContext, id: number): Promise<void> {
+        traceAPIParams(ctx, { id });
+
+        const admin = await this.guardAdminAccess("adminDeleteBlockedRepository", { id }, Permission.ADMIN_USERS);
+
+        await this.installationService.adminDeleteBlockedRepository(admin.id, id);
+    }
+
+    async adminBlockUser(ctx: TraceContext, req: AdminBlockUserRequest): Promise<User> {
+        traceAPIParams(ctx, { req });
+
+        const admin = await this.guardAdminAccess("adminBlockUser", { req }, Permission.ADMIN_USERS);
+
+        const targetUser = await this.userAuthentication.blockUser(admin.id, req.id, req.blocked);
+
+        const stoppedWorkspaces = await this.workspaceService.stopRunningWorkspacesForUser(
+            ctx,
+            admin.id,
+            req.id,
+            "user blocked by admin",
+            StopWorkspacePolicy.IMMEDIATELY,
+        );
+
+        log.info(`Stopped ${stoppedWorkspaces.length} workspaces in response to admin initiated block.`, {
+            userId: targetUser.id,
+            workspaceIds: stoppedWorkspaces.map((w) => w.id),
+        });
+
+        return targetUser;
+    }
+
+    async adminDeleteUser(ctx: TraceContext, userId: string): Promise<void> {
+        traceAPIParams(ctx, { userId });
+
+        const admin = await this.guardAdminAccess("adminDeleteUser", { id: userId }, Permission.ADMIN_PERMISSIONS);
+
+        await this.userService.deleteUser(admin.id, userId);
+    }
+
+    async adminVerifyUser(ctx: TraceContext, userId: string): Promise<User> {
+        const admin = await this.guardAdminAccess("adminVerifyUser", { id: userId }, Permission.ADMIN_USERS);
+        await this.auth.checkPermissionOnUser(admin.id, "admin_control", userId);
+        const user = await this.userService.findUserById(admin.id, userId);
+        await this.userService.markUserAsVerified(user, undefined);
+        return user;
+    }
+
+    async adminModifyRoleOrPermission(ctx: TraceContext, req: AdminModifyRoleOrPermissionRequest): Promise<User> {
+        traceAPIParams(ctx, { req });
+
+        const admin = await this.guardAdminAccess("adminModifyRoleOrPermission", { req }, Permission.ADMIN_PERMISSIONS);
+
+        const target = await this.userService.findUserById(admin.id, req.id);
+        const rolesOrPermissions = new Set((target.rolesOrPermissions || []) as string[]);
+        req.rpp.forEach((e) => {
+            if (e.add) {
+                rolesOrPermissions.add(e.r as string);
+            } else {
+                rolesOrPermissions.delete(e.r as string);
             }
-            throw error;
-        }
+        });
+        target.rolesOrPermissions = Array.from(rolesOrPermissions.values()) as RoleOrPermission[];
+
+        await this.userService.updateRoleOrPermission(admin.id, target.id, [
+            ...req.rpp.map((e) => ({ role: e.r, add: e.add })),
+        ]);
+        return this.userService.findUserById(admin.id, req.id);
     }
 
-    public async triggerPrebuild(projectId: string, branchName: string | null): Promise<StartPrebuildResult> {
-        this.checkAndBlockUser("triggerPrebuild");
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Triggering Prebuilds is implemented in Gitpod's Enterprise Edition`);
-    }
+    async adminModifyPermanentWorkspaceFeatureFlag(
+        ctx: TraceContext,
+        req: AdminModifyPermanentWorkspaceFeatureFlagRequest,
+    ): Promise<User> {
+        traceAPIParams(ctx, { req });
 
-    public async setProjectConfiguration(projectId: string, configString: string): Promise<void> {
-        const user = this.checkAndBlockUser("setProjectConfiguration");
-        await this.guardProjectOperation(user, projectId, "update");
-        const parseResult = this.gitpodParser.parse(configString);
-        if (parseResult.validationErrors) {
-            throw new Error(`This configuration could not be parsed: ${parseResult.validationErrors.join(', ')}`);
-        }
-        await this.projectsService.setProjectConfiguration(projectId, { '.gitpod.yml': configString });
-    }
+        const admin = await this.guardAdminAccess(
+            "adminModifyPermanentWorkspaceFeatureFlag",
+            { req },
+            Permission.ADMIN_USERS,
+        );
+        await this.auth.checkPermissionOnUser(admin.id, "admin_control", req.id);
 
-    public async fetchProjectRepositoryConfiguration(projectId: string): Promise<string | undefined> {
-        const user = this.checkUser("fetchProjectRepositoryConfiguration");
-        const span = opentracing.globalTracer().startSpan("fetchProjectRepositoryConfiguration");
-        span.setTag("projectId", projectId);
+        const target = await this.userService.findUserById(admin.id, req.id);
 
-        await this.guardProjectOperation(user, projectId, "get");
-        try {
-            return await this.projectsService.fetchProjectRepositoryConfiguration({ span }, user, projectId);
-        } catch (error) {
-            if (UnauthorizedError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+        const featureSettings: UserFeatureSettings = target.featureFlags || {};
+        const featureFlags = new Set(featureSettings.permanentWSFeatureFlags || []);
+
+        req.changes.forEach((e) => {
+            if (e.add) {
+                featureFlags.add(e.featureFlag);
+            } else {
+                featureFlags.delete(e.featureFlag);
             }
-            throw error;
-        }
+        });
+        featureSettings.permanentWSFeatureFlags = Array.from(featureFlags);
+        target.featureFlags = featureSettings;
+
+        return await this.userDB.storeUser(target);
     }
 
-    public async guessProjectConfiguration(projectId: string): Promise<string | undefined> {
-        const user = this.checkUser("guessProjectConfiguration");
-        const span = opentracing.globalTracer().startSpan("guessProjectConfiguration");
-        span.setTag("projectId", projectId);
+    async adminGetWorkspaces(
+        ctx: TraceContext,
+        req: AdminGetWorkspacesRequest,
+    ): Promise<AdminGetListResult<WorkspaceAndInstance>> {
+        traceAPIParams(ctx, { req });
 
-        await this.guardProjectOperation(user, projectId, "get");
-        try {
-            return await this.projectsService.guessProjectConfiguration({ span }, user, projectId);
-        } catch (error) {
-            if (UnauthorizedError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
-            }
-            throw error;
-        }
-    }
+        const admin = await this.guardAdminAccess("adminGetWorkspaces", { req }, Permission.ADMIN_WORKSPACES);
 
-    public async getContentBlobUploadUrl(name: string): Promise<string> {
-        const user = this.checkAndBlockUser("getContentBlobUploadUrl");
-        await this.guardAccess({ kind: "contentBlob", name: name, userID: user.id }, "create");
+        const wss = await this.workspaceDb
+            .trace(ctx)
+            .findAllWorkspaceAndInstances(
+                req.offset,
+                req.limit,
+                req.orderBy,
+                req.orderDir === "asc" ? "ASC" : "DESC",
+                req,
+            );
 
-        const uploadUrlRequest = new UploadUrlRequest();
-        uploadUrlRequest.setName(name);
-        uploadUrlRequest.setOwnerId(user.id);
-
-        const uploadUrlPromise = new Promise<UploadUrlResponse>((resolve, reject) => {
-            this.blobServiceClient.uploadUrl(uploadUrlRequest, (err: any, resp: UploadUrlResponse) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(resp);
+        await Promise.all(
+            wss.rows.map(async (row) => {
+                if (!(await this.auth.hasPermissionOnWorkspace(admin.id, "access", row.workspaceId))) {
+                    wss.total--;
+                    wss.rows = wss.rows.filter((ws) => ws.workspaceId !== row.workspaceId);
                 }
-            });
-        });
-        try {
-            const resp = (await uploadUrlPromise).toObject();
-            return resp.url;
-        } catch (err) {
-            log.error("Error getting content blob upload url: ", err);
-            throw err;
+            }),
+        );
+        return wss;
+    }
+
+    async adminGetWorkspace(ctx: TraceContext, workspaceId: string): Promise<WorkspaceAndInstance> {
+        traceAPIParams(ctx, { workspaceId });
+
+        const admin = await this.guardAdminAccess(
+            "adminGetWorkspace",
+            { id: workspaceId },
+            Permission.ADMIN_WORKSPACES,
+        );
+        await this.auth.checkPermissionOnWorkspace(admin.id, "access", workspaceId);
+
+        const result = await this.workspaceDb.trace(ctx).findWorkspaceAndInstance(workspaceId);
+        if (!result) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "not found");
+        }
+        return result;
+    }
+
+    async adminGetWorkspaceInstances(ctx: TraceContext, workspaceId: string): Promise<WorkspaceInstance[]> {
+        traceAPIParams(ctx, { workspaceId });
+
+        const admin = await this.guardAdminAccess(
+            "adminGetWorkspaceInstances",
+            { id: workspaceId },
+            Permission.ADMIN_WORKSPACES,
+        );
+        await this.auth.checkPermissionOnWorkspace(admin.id, "access", workspaceId);
+
+        const result = await this.workspaceDb.trace(ctx).findInstances(workspaceId);
+        return result || [];
+    }
+
+    async adminForceStopWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
+
+        const admin = await this.guardAdminAccess(
+            "adminForceStopWorkspace",
+            { id: workspaceId },
+            Permission.ADMIN_WORKSPACES,
+        );
+        await this.auth.checkPermissionOnWorkspace(admin.id, "admin_control", workspaceId);
+
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (workspace) {
+            await this.internalStopWorkspace(
+                ctx,
+                admin.id,
+                workspace,
+                "stopped by admin",
+                StopWorkspacePolicy.IMMEDIATELY,
+                true,
+            );
         }
     }
 
-    public async getContentBlobDownloadUrl(name: string): Promise<string> {
-        const user = this.checkAndBlockUser("getContentBlobDownloadUrl");
-        await this.guardAccess({ kind: "contentBlob", name: name, userID: user.id }, "get");
+    async adminRestoreSoftDeletedWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
+        traceAPIParams(ctx, { workspaceId });
 
-        const downloadUrlRequest = new DownloadUrlRequest();
-        downloadUrlRequest.setName(name);
-        downloadUrlRequest.setOwnerId(user.id);
+        const admin = await this.guardAdminAccess(
+            "adminRestoreSoftDeletedWorkspace",
+            { id: workspaceId },
+            Permission.ADMIN_WORKSPACES,
+        );
+        await this.auth.checkPermissionOnWorkspace(admin.id, "admin_control", workspaceId);
 
-        const downloadUrlPromise = new Promise<DownloadUrlResponse>((resolve, reject) => {
-            this.blobServiceClient.downloadUrl(downloadUrlRequest, (err: any, resp: DownloadUrlResponse) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(resp);
-                }
-            });
-        });
-        try {
-            const resp = (await downloadUrlPromise).toObject();
-            return resp.url;
-        } catch (err) {
-            log.error("Error getting content blob download url: ", err);
-            throw err;
+        const ws = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!ws) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `No workspace with id '${workspaceId}' found.`);
         }
-    }
-
-    public async getGitpodTokens(): Promise<GitpodToken[]> {
-        const user = this.checkAndBlockUser("getGitpodTokens");
-        const res = (await this.userDB.findAllGitpodTokensOfUser(user.id)).filter(v => !v.deleted);
-        await Promise.all(res.map(tkn => this.guardAccess({ kind: "gitpodToken", subject: tkn }, "get")));
-        return res;
-    }
-
-    public async generateNewGitpodToken(options: { name?: string, type: GitpodTokenType, scopes?: [] }): Promise<string> {
-        const user = this.checkAndBlockUser("generateNewGitpodToken");
-        const token = crypto.randomBytes(30).toString('hex');
-        const tokenHash = crypto.createHash('sha256').update(token, 'utf8').digest("hex");
-        const dbToken: DBGitpodToken = {
-            tokenHash,
-            name: options.name,
-            type: options.type,
-            user: user as DBUser,
-            scopes: options.scopes || [],
-            created: new Date().toISOString(),
-        };
-        await this.guardAccess({ kind: "gitpodToken", subject: dbToken }, "create");
-
-        await this.userDB.storeGitpodToken(dbToken)
-        return token;
-    }
-
-    public async getGitpodTokenScopes(tokenHash: string): Promise<string[]> {
-        const user = this.checkAndBlockUser("getGitpodTokenScopes");
-        let token: GitpodToken | undefined;
+        if (!ws.softDeleted) {
+            return;
+        }
+        if (!!ws.contentDeletedTime) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "The workspace content was already garbage-collected.");
+        }
+        // @ts-ignore
+        ws.softDeleted = null;
+        ws.softDeletedTime = "";
+        ws.pinned = true;
         try {
-            token = await this.userDB.findGitpodTokensOfUser(user.id, tokenHash);
+            await this.workspaceDb.trace(ctx).transaction(async (db) => {
+                await db.store(ws);
+                await this.auth.addWorkspaceToOrg(ws.organizationId, ws.ownerId, ws.id, !!ws.shareable);
+            });
         } catch (error) {
-            log.error({ userId: user.id }, "failed to resolve gitpod token: ", error);
-            return [];
+            await this.auth.removeWorkspaceFromOrg(ws.organizationId, ws.ownerId, ws.id);
+            throw error;
         }
-        if (!token || token.deleted) {
-            return [];
-        }
-        await this.guardAccess({ kind: "gitpodToken", subject: token }, "get");
-        return token.scopes;
     }
 
-    public async deleteGitpodToken(tokenHash: string): Promise<void> {
-        const user = this.checkAndBlockUser("deleteGitpodToken");
-        const existingTokens = await this.getGitpodTokens(); // all tokens for logged in user
-        const tkn = existingTokens.find(token => token.tokenHash === tokenHash);
-        if (!tkn) {
-            throw new Error(`User ${user.id} tries to delete a token ${tokenHash} that does not exist.`);
-        }
-        await this.guardAccess({ kind: "gitpodToken", subject: tkn }, "delete");
-        return this.userDB.deleteGitpodToken(tokenHash);
-    }
-
-    public async hasPermission(permission: PermissionName): Promise<boolean> {
-        const user = this.checkUser("hasPermission");
-        return this.authorizationService.hasPermission(user, permission);
-    }
-
-    preparePluginUpload(params: PreparePluginUploadParams): Promise<string> {
-        const user = this.checkUser("preparePluginUpload");
-        return this.pluginService.preparePluginUpload(params, user.id);
-    }
-
-    async resolvePlugins(workspaceId: string, params: ResolvePluginsParams): Promise<ResolvedPlugins> {
-        this.checkUser("resolvePlugins")
-
-        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace({}));
-        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
-        const result = await this.pluginService.resolvePlugins(workspace.ownerId, params);
-        return result.resolved;
-    };
-
-    installUserPlugins(params: InstallPluginsParams): Promise<boolean> {
-        const userId = this.checkUser("installUserPlugins").id;
-        return this.pluginService.installUserPlugins(userId, params);
-    }
-
-    uninstallUserPlugin(params: UninstallPluginParams): Promise<boolean> {
-        const userId = this.checkUser("uninstallUserPlugin").id;
-        return this.pluginService.uninstallUserPlugin(userId, params);
-    }
-
-    async guessGitTokenScopes(params: GuessGitTokenScopesParams): Promise<GuessedGitTokenScopes> {
-        const authProviders = await this.getAuthProviders()
-        return this.gitTokenScopeGuesser.guessGitTokenScopes(authProviders.find(p => p.host == params.host), params);
-    }
-
-    async adminGetUsers(req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminGetUser(id: string): Promise<User> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminBlockUser(req: AdminBlockUserRequest): Promise<User> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminDeleteUser(_id: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminModifyRoleOrPermission(req: AdminModifyRoleOrPermissionRequest): Promise<User> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminModifyPermanentWorkspaceFeatureFlag(req: AdminModifyPermanentWorkspaceFeatureFlagRequest): Promise<User> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminGetWorkspaces(req: AdminGetWorkspacesRequest): Promise<AdminGetListResult<WorkspaceAndInstance>> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminGetWorkspace(id: string): Promise<WorkspaceAndInstance> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminForceStopWorkspace(id: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminRestoreSoftDeletedWorkspace(id: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async adminSetLicense(key: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Admin support is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async getLicenseInfo(): Promise<GetLicenseInfoResult> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Licensing is implemented in Gitpod's Enterprise Edition`);
-    }
-
-    async licenseIncludesFeature(feature: LicenseFeature): Promise<boolean> {
-        return false;
-    }
-
-    protected censorUser(user: User): User {
-        const res = { ...user };
-        delete (res.additionalData);
-        res.identities = res.identities.map(i => {
-            delete (i.tokens);
-
-            // The user field is not in the Identity shape, but actually exists on DBIdentity.
-            // Trying to push this object out via JSON RPC will fail because of the cyclic nature
-            // of this field.
-            delete ((i as any).user);
-            return i;
+    async adminGetProjectsBySearchTerm(
+        ctx: TraceContext,
+        req: AdminGetListRequest<Project>,
+    ): Promise<AdminGetListResult<Project>> {
+        const user = await this.guardAdminAccess("adminGetProjectsBySearchTerm", { req }, Permission.ADMIN_PROJECTS);
+        return await this.projectsService.findProjects(user.id, {
+            offset: req.offset,
+            limit: req.limit,
+            orderBy: req.orderBy,
+            orderDir: req.orderDir === "asc" ? "ASC" : "DESC",
+            searchTerm: req.searchTerm as string,
         });
-        return res;
     }
 
-    async validateLicense(): Promise<LicenseValidationResult> {
-        throw new ResponseError(ErrorCodes.EE_FEATURE, `Licensing is implemented in Gitpod's Enterprise Edition`);
+    async adminGetProjectById(ctx: TraceContext, id: string): Promise<Project | undefined> {
+        const user = await this.guardAdminAccess("adminGetProjectById", { id }, Permission.ADMIN_PROJECTS);
+        return await this.projectsService.getProject(user.id, id);
     }
 
-    async getOwnAuthProviders(): Promise<AuthProviderEntry[]> {
+    async adminGetTeams(ctx: TraceContext, req: AdminGetListRequest<Team>): Promise<AdminGetListResult<Team>> {
+        const admin = await this.guardAdminAccess("adminGetTeams", { req }, Permission.ADMIN_WORKSPACES);
+        return this.organizationService.listOrganizations(admin.id, req);
+    }
+
+    async adminGetTeamById(ctx: TraceContext, id: string): Promise<Team | undefined> {
+        const user = await this.guardAdminAccess("adminGetTeamById", { id }, Permission.ADMIN_WORKSPACES);
+        return this.organizationService.getOrganization(user.id, id);
+    }
+
+    async adminGetTeamMembers(ctx: TraceContext, teamId: string): Promise<TeamMemberInfo[]> {
+        const user = await this.guardAdminAccess("adminGetTeamMembers", { teamId }, Permission.ADMIN_WORKSPACES);
+        return this.organizationService.listMembers(user.id, teamId);
+    }
+
+    async adminSetTeamMemberRole(
+        ctx: TraceContext,
+        teamId: string,
+        memberId: string,
+        role: TeamMemberRole,
+    ): Promise<void> {
+        const user = await this.guardAdminAccess(
+            "adminSetTeamMemberRole",
+            { teamId, userId: memberId, role },
+            Permission.ADMIN_WORKSPACES,
+        );
+        return this.organizationService.addOrUpdateMember(user.id, teamId, memberId, role);
+    }
+
+    async getOwnAuthProviders(ctx: TraceContext): Promise<AuthProviderEntry[]> {
         const redacted = (entry: AuthProviderEntry) => AuthProviderEntry.redact(entry);
-        let userId: string;
-        try {
-            userId = this.checkAndBlockUser("getOwnAuthProviders").id;
-        } catch (error) {
-            userId = this.acceptNotAuthenticatedForInitialSetup(error);
-        }
-        const ownAuthProviders = await this.authProviderService.getAuthProvidersOfUser(userId);
+        const user = await this.checkAndBlockUser("getOwnAuthProviders");
+        const ownAuthProviders = await this.authProviderService.getAuthProvidersOfUser(user.id);
         return ownAuthProviders.map(redacted);
     }
-    protected acceptNotAuthenticatedForInitialSetup(error: any) {
-        if (error && error instanceof ResponseError) {
-            if (error.code === ErrorCodes.NOT_AUTHENTICATED ||
-                error.code === ErrorCodes.SETUP_REQUIRED) {
-                return "no-user";
-            }
-        }
-        throw error;
-    }
 
-    // from https://stackoverflow.com/questions/106179/regular-expression-to-match-dns-hostname-or-ip-address/106223#106223
-    // adapted to allow for hostnames
-    //   from [foo.bar] pumped up to [foo.(foo.)bar]
-    // and also for a trailing path segments
-    //   for example [foo.bar/gitlab]
-    protected validHostNameRegexp = /^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)+([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])(\/([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9]))?$/;
+    async updateOwnAuthProvider(
+        ctx: TraceContext,
+        { entry }: GitpodServer.UpdateOwnAuthProviderParams,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, {}); // entry contains PII
 
-    async updateOwnAuthProvider({ entry }: GitpodServer.UpdateOwnAuthProviderParams): Promise<AuthProviderEntry> {
-        let userId: string;
-        try {
-            userId = this.checkAndBlockUser("updateOwnAuthProvider").id;
-        } catch (error) {
-            userId = this.acceptNotAuthenticatedForInitialSetup(error);
-        }
-
-        if (userId !== entry.ownerId) {
-            throw new ResponseError(ErrorCodes.PERMISSION_DENIED, 'Not allowed to modify this resource.');
+        const user = await this.checkAndBlockUser("updateOwnAuthProvider");
+        if (user.id !== entry.ownerId) {
+            throw new ApplicationError(ErrorCodes.PERMISSION_DENIED, "Not allowed to modify this resource.");
         }
 
         const safeProvider = this.redactUpdateOwnAuthProviderParams({ entry });
         try {
-            if ("host" in safeProvider) {
-                // on creating we're are checking for already existing runtime providers
-
-                const host = safeProvider.host && safeProvider.host.toLowerCase();
-
-                if (!this.validHostNameRegexp.exec(host)) {
-                    log.debug(`Invalid auth provider host.`, { entry, safeProvider });
-                    throw new Error("Invalid host name.");
-                }
-
-                const hostContext = this.hostContextProvider.get(host);
-                if (hostContext) {
-                    const builtInExists = hostContext.authProvider.params.ownerId === undefined;
-                    log.debug(`Attempt to override existing auth provider.`, { entry, safeProvider, builtInExists });
-                    throw new Error("Provider for this host already exists.");
-                }
+            if ("id" in safeProvider) {
+                const result = await this.authProviderService.updateAuthProviderOfUser(user.id, safeProvider);
+                return AuthProviderEntry.redact(result);
             }
-            const result = await this.authProviderService.updateAuthProvider(safeProvider);
-            return AuthProviderEntry.redact(result)
+            if ("host" in safeProvider) {
+                const result = await this.authProviderService.createAuthProviderOfUser(user.id, safeProvider);
+                return AuthProviderEntry.redact(result);
+            }
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "Unexpected parameters.");
         } catch (error) {
-            const message = error && error.message ? error.message : "Failed to update the provider.";
-            throw new ResponseError(ErrorCodes.CONFLICT, message);
+            if (ApplicationError.hasErrorCode(error)) {
+                throw error;
+            }
+            const message = error ? String(error) : "Failed to update the provider.";
+            throw new ApplicationError(ErrorCodes.CONFLICT, message);
         }
     }
-    protected redactUpdateOwnAuthProviderParams({ entry }: GitpodServer.UpdateOwnAuthProviderParams) {
-        const safeEntry = "id" in entry ? <AuthProviderEntry.UpdateEntry>{
-            id: entry.id,
-            clientId: entry.clientId,
-            clientSecret: entry.clientSecret,
-            ownerId: entry.ownerId,
-        } : <AuthProviderEntry.NewEntry>{
+    private redactUpdateOwnAuthProviderParams({ entry }: GitpodServer.UpdateOwnAuthProviderParams) {
+        const safeEntry =
+            "id" in entry
+                ? <AuthProviderEntry.UpdateEntry>{
+                      id: entry.id,
+                      clientId: entry.clientId,
+                      clientSecret: entry.clientSecret,
+                      ownerId: entry.ownerId,
+                  }
+                : <AuthProviderEntry.NewEntry>{
+                      host: entry.host,
+                      type: entry.type,
+                      clientId: entry.clientId,
+                      clientSecret: entry.clientSecret,
+                      ownerId: entry.ownerId,
+                  };
+        return safeEntry;
+    }
+
+    async deleteOwnAuthProvider(ctx: TraceContext, params: GitpodServer.DeleteOwnAuthProviderParams): Promise<void> {
+        traceAPIParams(ctx, { params });
+
+        const user = await this.checkAndBlockUser("deleteOwnAuthProvider");
+
+        await this.authProviderService.deleteAuthProviderOfUser(user.id, params.id);
+    }
+
+    async createOrgAuthProvider(
+        ctx: TraceContext,
+        { entry }: GitpodServer.CreateOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, {}); // entry contains PII
+
+        const user = await this.checkAndBlockUser("createOrgAuthProvider");
+
+        // map params to a new provider
+        const newProvider = <AuthProviderEntry.NewOrgEntry>{
             host: entry.host,
             type: entry.type,
             clientId: entry.clientId,
             clientSecret: entry.clientSecret,
-            ownerId: entry.ownerId,
-        }
-        return safeEntry;
-    }
-
-    async deleteOwnAuthProvider(params: GitpodServer.DeleteOwnAuthProviderParams): Promise<void> {
-        let userId: string;
-        try {
-            userId = this.checkAndBlockUser("deleteOwnAuthProvider").id;
-        } catch (error) {
-            userId = this.acceptNotAuthenticatedForInitialSetup(error);
-        }
-
-        const ownProviders = await this.authProviderService.getAuthProvidersOfUser(userId);
-        const authProvider = ownProviders.find(p => p.id === params.id);
-        if (!authProvider) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, 'User resource not found.');
-        }
-        try {
-            await this.authProviderService.deleteAuthProvider(authProvider);
-        } catch (error) {
-            const message = error && error.message ? error.message : "Failed to delete the provider.";
-            throw new ResponseError(ErrorCodes.CONFLICT, message);
-        }
-    }
-
-    public async trackEvent(event: RemoteTrackMessage): Promise<void> {
-        // Beware: DO NOT just event... the message, but consume it individually as the message is coming from
-        //         the wire and we have no idea what's in it. Even passing the context and properties directly
-        //         is questionable. Considering we're handing down the msg and do not know how the analytics library
-        //         handles potentially broken or malicious input, we better err on the side of caution.
-        const msg = {
-            event: event.event,
-            messageId: event.messageId,
-            context: event.context,
-            properties: event.properties
-        }
-
-        //either the user is authenticated...
-        if (this.user) {
-            const trackMessage: TrackMessage = {
-                userId: this.user.id,
-                ...msg
-            }
-            this.analytics.track(trackMessage);
-            return;
-        }
-
-        //... or an anonymous id was passed. else, no tracking call is made
-        if (event.anonymousId) {
-            const trackMessage: TrackMessage = {
-                anonymousId: event.anonymousId,
-                ...msg
-            }
-            this.analytics.track(trackMessage);
+            ownerId: user.id,
+            organizationId: entry.organizationId,
         };
-    }
 
-    public async trackLocation(event: RemotePageMessage): Promise<void> {
-        //either an anonymousId was passed, signifying that we want to make a privacy preserving page call...
-        if (event.anonymousId) {
-            // we are making a reduced page call that respects user's privacy by not using any PII
-            this.analytics.page({
-                anonymousId: event.anonymousId,
-                messageId: event.messageId,
-                context: {},
-                properties: event.properties
-            });
-            return;
+        if (!newProvider.organizationId || !uuidValidate(newProvider.organizationId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+        if (!newProvider.host) {
+            throw new ApplicationError(
+                ErrorCodes.BAD_REQUEST,
+                "Must provider a host value when creating a new auth provider.",
+            );
         }
 
-        //...or we associate the page call with the authenticated user. else no page call is made.
-        if (this.user) {
-            const msg: PageMessage = {
-                userId: this.user.id,
-                messageId: event.messageId,
-                context: {
-                    ip: this.clientHeaderFields?.ip,
-                    userAgent: this.clientHeaderFields?.userAgent
-                },
-                properties: event.properties,
+        await this.guardWithFeatureFlag("orgGitAuthProviders", user, newProvider.organizationId);
+
+        await this.guardTeamOperation(newProvider.organizationId, "update");
+
+        try {
+            const result = await this.authProviderService.createOrgAuthProvider(user.id, newProvider);
+            return AuthProviderEntry.redact(result);
+        } catch (error) {
+            if (ApplicationError.hasErrorCode(error)) {
+                throw error;
             }
-            this.analytics.page(msg);
+            const message = error ? String(error) : "Failed to create the provider.";
+            throw new ApplicationError(ErrorCodes.INTERNAL_SERVER_ERROR, message);
         }
     }
 
-    async getTerms(): Promise<Terms> {
-        // Terms are publicly available, thus no user check here.
+    async updateOrgAuthProvider(
+        ctx: TraceContext,
+        { entry }: GitpodServer.UpdateOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, {}); // entry contains PII
 
-        return this.termsProvider.getCurrent();
+        const user = await this.checkAndBlockUser("updateOrgAuthProvider");
+
+        // map params to a provider update
+        const providerUpdate: AuthProviderEntry.UpdateOrgEntry = {
+            id: entry.id,
+            clientId: entry.clientId,
+            clientSecret: entry.clientSecret,
+            organizationId: entry.organizationId,
+        };
+
+        if (!providerUpdate.organizationId || !uuidValidate(providerUpdate.organizationId)) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", user, providerUpdate.organizationId);
+
+        await this.guardTeamOperation(providerUpdate.organizationId, "update");
+
+        try {
+            const result = await this.authProviderService.updateOrgAuthProvider(user.id, providerUpdate);
+            return AuthProviderEntry.redact(result);
+        } catch (error) {
+            if (ApplicationError.hasErrorCode(error)) {
+                throw error;
+            }
+            const message = error ? String(error) : "Failed to update the provider.";
+            throw new ApplicationError(ErrorCodes.CONFLICT, message);
+        }
     }
 
+    async getOrgAuthProviders(
+        ctx: TraceContext,
+        params: GitpodServer.GetOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry[]> {
+        traceAPIParams(ctx, { params });
+
+        const user = await this.checkAndBlockUser("getOrgAuthProviders");
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", user, params.organizationId);
+
+        await this.guardTeamOperation(params.organizationId, "get");
+
+        try {
+            const result = await this.authProviderService.getAuthProvidersOfOrg(user.id, params.organizationId);
+            return result.map(AuthProviderEntry.redact.bind(AuthProviderEntry));
+        } catch (error) {
+            if (ApplicationError.hasErrorCode(error)) {
+                throw error;
+            }
+            const message = error ? String(error) : "Error retrieving auth providers for organization.";
+            throw new ApplicationError(ErrorCodes.INTERNAL_SERVER_ERROR, message);
+        }
+    }
+
+    async deleteOrgAuthProvider(ctx: TraceContext, params: GitpodServer.DeleteOrgAuthProviderParams): Promise<void> {
+        traceAPIParams(ctx, { params });
+
+        const user = await this.checkAndBlockUser("deleteOrgAuthProvider");
+
+        // check for "orgGitAuthProviders" feature flag
+        const team = await this.getTeam(ctx, params.organizationId);
+        if (!team) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+        await this.guardWithFeatureFlag("orgGitAuthProviders", user, team.id);
+
+        await this.guardTeamOperation(params.organizationId || "", "update");
+
+        await this.authProviderService.deleteAuthProviderOfOrg(user.id, params.organizationId, params.id);
+    }
+
+    async getAuthProvider(ctx: TraceContextWithSpan, id: string): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, { id });
+
+        const user = await this.checkAndBlockUser("getAuthProvider");
+
+        const result = await this.authProviderService.getAuthProvider(user.id, id);
+        return AuthProviderEntry.redact(result);
+    }
+
+    /**
+     * Delegates to `deleteOrgAuthProvider` or `deleteOwnAuthProvider` depending on the ownership
+     * of the specified auth provider.
+     */
+    async deleteAuthProvider(ctx: TraceContextWithSpan, id: string): Promise<void> {
+        traceAPIParams(ctx, { id });
+
+        const user = await this.checkAndBlockUser("deleteAuthProvider");
+
+        // TODO(at) get rid of the additional read here when user-level providers are migrated to org-level.
+        const authProvider = await this.authProviderService.getAuthProvider(user.id, id);
+        if (authProvider.organizationId) {
+            return this.deleteOrgAuthProvider(ctx, { id, organizationId: authProvider.organizationId });
+        } else {
+            return this.deleteOwnAuthProvider(ctx, { id });
+        }
+    }
+
+    /**
+     * Delegates to `updateOrgAuthProvider` or `updateOwnAuthProvider` depending on the ownership
+     * of the specified auth provider.
+     */
+    async updateAuthProvider(
+        ctx: TraceContextWithSpan,
+        id: string,
+        update: AuthProviderEntry.UpdateOAuth2Config,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, { id });
+
+        const user = await this.checkAndBlockUser("updateAuthProvider");
+
+        const authProvider = await this.authProviderService.getAuthProvider(user.id, id);
+
+        if (authProvider.organizationId) {
+            return this.updateOrgAuthProvider(ctx, {
+                entry: {
+                    organizationId: authProvider.organizationId,
+                    id: authProvider.id,
+                    clientId: update.clientId,
+                    clientSecret: update.clientSecret,
+                },
+            });
+        } else {
+            return this.updateOwnAuthProvider(ctx, {
+                entry: {
+                    id: authProvider.id,
+                    clientId: update.clientId,
+                    clientSecret: update.clientSecret,
+                    ownerId: user.id,
+                },
+            });
+        }
+    }
+
+    async getOnboardingState(ctx: TraceContext): Promise<GitpodServer.OnboardingState> {
+        return this.installationService.getOnboardingState();
+    }
+
+    private async guardWithFeatureFlag(flagName: string, user: User, teamId: string) {
+        // Guard method w/ a feature flag check
+        const isEnabled = await getExperimentsClientForBackend().getValueAsync(flagName, false, {
+            user: {
+                id: user.id,
+                email: getPrimaryEmail(user),
+            },
+            teamId,
+        });
+        if (!isEnabled) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "Method not available");
+        }
+    }
+
+    public async trackEvent(ctx: TraceContext, event: RemoteTrackMessage): Promise<void> {
+        this.analyticsController.trackEvent(this.userID, event, this.clientHeaderFields);
+    }
+
+    public async trackLocation(ctx: TraceContext, event: RemotePageMessage): Promise<void> {
+        this.analyticsController.trackLocation(this.userID, event, this.clientHeaderFields);
+    }
+
+    public async identifyUser(ctx: TraceContext, event: RemoteIdentifyMessage): Promise<void> {
+        // traceAPIParams(ctx, { event }); tracing analytics does not make much sense
+
+        //Identify calls collect user informmation. If the user is unknown, we don't make a call (privacy preservation)
+        const user = await this.checkUser("identifyUser");
+        this.analyticsController.identifyUser(user.id, event, this.clientHeaderFields);
+    }
+
+    async getIDEOptions(ctx: TraceContext): Promise<IDEOptions> {
+        const user = await this.checkUser("identifyUser");
+        const email = getPrimaryEmail(user);
+        const ideConfig = await this.ideService.getIDEConfig({ user: { id: user.id, email } });
+
+        const updatedOptions: Record<string, IDEOption> = {};
+        for (const [key, value] of Object.entries(ideConfig.ideOptions.options)) {
+            const opt = filter(value, (key) => key !== "versions") as IDEOption;
+            opt.pinnable = !!value.versions && value.versions.length > 0;
+            updatedOptions[key] = opt;
+        }
+        const clonedIdeOptions = {
+            ...ideConfig.ideOptions,
+            options: updatedOptions,
+        };
+
+        return clonedIdeOptions;
+    }
+
+    async getIDEVersions(ctx: TraceContext, ide: string): Promise<string[] | undefined> {
+        const user = await this.checkUser("identifyUser");
+        const email = getPrimaryEmail(user);
+        return this.ideService.getIDEVersions(ide, { user: { id: user.id, email } });
+    }
+
+    async getSupportedWorkspaceClasses(ctx: TraceContext): Promise<SupportedWorkspaceClass[]> {
+        const user = await this.checkAndBlockUser("getSupportedWorkspaceClasses");
+        return this.workspaceService.getSupportedWorkspaceClasses(user);
+    }
 
     //#region gitpod.io concerns
-    //
-    async adminGetAccountStatement(userId: string): Promise<AccountStatement> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+    async getLinkedInClientId(ctx: TraceContextWithSpan): Promise<string> {
+        traceAPIParams(ctx, {});
+        await this.checkAndBlockUser("getLinkedInClientID");
+        const clientId = this.config.linkedInSecrets?.clientId;
+        if (!clientId) {
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                "LinkedIn is not properly configured (no Client ID)",
+            );
+        }
+        return clientId;
     }
-    async adminSetProfessionalOpenSource(userId: string, shouldGetProfOSS: boolean): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+
+    async connectWithLinkedIn(ctx: TraceContextWithSpan, code: string): Promise<LinkedInProfile> {
+        traceAPIParams(ctx, { code });
+        const user = await this.checkAndBlockUser("connectWithLinkedIn");
+        const profile = await this.linkedInService.connectWithLinkedIn(user, code);
+        return profile;
     }
-    async adminIsStudent(userId: string): Promise<boolean> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async adminAddStudentEmailDomain(userId: string, domain: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async adminGrantExtraHours(userId: string, extraHours: number): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async isStudent(): Promise<boolean> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getPrivateRepoTrialEndDate(): Promise<string | undefined> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getAccountStatement(options: GitpodServer.GetAccountStatementOptions): Promise<AccountStatement | undefined> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getRemainingUsageHours(): Promise<number> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getChargebeeSiteId(): Promise<string> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async createPortalSession(): Promise<{}> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async checkout(planId: string, planQuantity?: number): Promise<{}> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getAvailableCoupons(): Promise<PlanCoupon[]> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getAppliedCoupons(): Promise<PlanCoupon[]> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getShowPaymentUI(): Promise<boolean> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async isChargebeeCustomer(): Promise<boolean> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async subscriptionUpgradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async subscriptionDowngradeTo(subscriptionId: string, chargebeePlanId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async subscriptionCancel(subscriptionId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async subscriptionCancelDowngrade(subscriptionId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsGet(): Promise<TeamSubscription[]> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsGetSlots(): Promise<TeamSubscriptionSlotResolved[]> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsGetUnassignedSlot(teamSubscriptionId: string): Promise<TeamSubscriptionSlot | undefined> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsAddSlots(teamSubscriptionId: string, quantity: number): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsAssignSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string, identityStr: string | undefined): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsReassignSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string, newIdentityStr: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsDeactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async tsReactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
-    async getGithubUpgradeUrls(): Promise<GithubUpgradeURL[]> {
-        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
-    }
+
     //
     //#endregion
 
+    /**
+     * TODO(ak)
+     * @deprecated remove it after dashboard is deployed. It was replaced with error reporting in GCP.
+     */
+    async reportErrorBoundary(ctx: TraceContextWithSpan, url: string, message: string): Promise<void> {
+        // no-op
+    }
+
+    async getIDToken(): Promise<void> {}
+
+    public async controlAdmission(ctx: TraceContext, workspaceId: string, level: "owner" | "everyone"): Promise<void> {
+        traceAPIParams(ctx, { workspaceId, level });
+        traceWI(ctx, { workspaceId });
+
+        const user = await this.checkAndBlockUser("controlAdmission");
+
+        await this.workspaceService.controlAdmission(user.id, workspaceId, level, (workspace, instance) => {
+            if (instance) {
+                return this.guardAccess(
+                    { kind: "workspaceInstance", subject: instance, workspace: workspace },
+                    "update",
+                );
+            } else {
+                return this.guardAccess({ kind: "workspace", subject: workspace }, "update");
+            }
+        });
+    }
+
+    async getStripePublishableKey(ctx: TraceContext): Promise<string> {
+        await this.checkAndBlockUser("getStripePublishableKey");
+        const publishableKey = this.config.stripeSecrets?.publishableKey;
+        if (!publishableKey) {
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                "Stripe is not properly configured (no publishable key)",
+            );
+        }
+        return publishableKey;
+    }
+
+    async findStripeSubscriptionId(ctx: TraceContext, attributionId: string): Promise<string | undefined> {
+        const user = await this.checkUser("findStripeSubscriptionId", { attributionId });
+
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        try {
+            await this.guardTeamOperation(attrId.teamId, "get");
+            await this.auth.checkPermissionOnOrganization(user.id, "read_billing", attrId.teamId);
+            const subscriptionId = await this.stripeService.findUncancelledSubscriptionByAttributionId(attributionId);
+            return subscriptionId;
+        } catch (error) {
+            log.error(`Failed to get Stripe Subscription ID for '${attributionId}'`, error);
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                `Failed to get Stripe Subscription ID for '${attributionId}'`,
+            );
+        }
+    }
+
+    async getPriceInformation(ctx: TraceContext, attributionId: string): Promise<string | undefined> {
+        const user = await this.checkUser("getPriceInformation", { attributionId });
+
+        const attrId = AttributionId.parse(attributionId);
+        if (!attrId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attributionId '${attributionId}'`);
+        }
+
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+        return this.stripeService.getPriceInformation(attributionId);
+    }
+
+    async createStripeCustomerIfNeeded(ctx: TraceContext, attributionId: string, currency: string): Promise<void> {
+        const user = await this.checkAndBlockUser("createStripeCustomerIfNeeded");
+        const attrId = AttributionId.parse(attributionId);
+        if (!attrId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attributionId '${attributionId}'`);
+        }
+
+        const org = await this.organizationService.getOrganization(user.id, attrId.teamId);
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+        //TODO billing email should be editable within the org
+        const billingEmail = getPrimaryEmail(user);
+        const billingName = org.name;
+
+        let customer: StripeCustomer | undefined;
+        try {
+            customer = (await this.billingService.getStripeCustomer({ attributionId })).customer;
+        } catch (e) {
+            log.info(e);
+        }
+        if (customer) {
+            // NOTE: this is a temporary workaround, as long as we're not automatically re-create the customer
+            // entity on Stripe to support a switch of currencies, we're taking an exit here.
+            if (customer.currency && customer.currency !== currency) {
+                throw new ApplicationError(
+                    ErrorCodes.SUBSCRIPTION_ERROR,
+                    `Your previous subscription was in ${customer.currency}. If you'd like to change currencies, please contact our support.`,
+                    { hint: "currency", oldValue: customer.currency, value: currency },
+                );
+            }
+            // customer already exists, we don't need to create a new one.
+            return;
+        }
+
+        // otherwise we need to create a new customer.
+        try {
+            await this.billingService.createStripeCustomer({
+                attributionId,
+                currency,
+                email: billingEmail,
+                name: billingName,
+                billingCreatorUserId: user.id,
+            });
+            return;
+        } catch (error) {
+            log.error(`Failed to create Stripe customer profile for '${attributionId}'`, error);
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                `Failed to create Stripe customer profile for '${attributionId}'`,
+            );
+        }
+    }
+
+    async createHoldPaymentIntent(
+        ctx: TraceContext,
+        attributionId: string,
+    ): Promise<{ paymentIntentId: string; paymentIntentClientSecret: string }> {
+        const user = await this.checkAndBlockUser("createHoldPaymentIntent");
+
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+        try {
+            const response = await this.billingService.createHoldPaymentIntent({ attributionId: attributionId });
+            return {
+                paymentIntentId: response.paymentIntentId,
+                paymentIntentClientSecret: response.paymentIntentClientSecret,
+            };
+        } catch (error) {
+            log.error(`Failed to subscribe '${attributionId}' to Stripe`, error);
+            if (error instanceof ClientError) {
+                throw new ApplicationError(ErrorCodes.INTERNAL_SERVER_ERROR, error.details);
+            }
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                `Failed to subscribe '${attributionId}' to Stripe`,
+            );
+        }
+    }
+
+    async subscribeToStripe(
+        ctx: TraceContext,
+        attributionId: string,
+        paymentIntentId: string,
+        usageLimit: number,
+    ): Promise<number | undefined> {
+        const user = await this.checkAndBlockUser("subscribeToStripe");
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        try {
+            await this.guardTeamOperation(attrId.teamId, "update");
+            await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+            const customerId = await this.stripeService.findCustomerByAttributionId(attributionId);
+            if (!customerId) {
+                throw new Error(`No Stripe customer profile for '${attributionId}'`);
+            }
+
+            await this.billingService.createStripeSubscription({
+                attributionId,
+                paymentIntentId,
+                usageLimit,
+            });
+
+            // Creating a cost center for this customer
+            // TODO stripe should be the authority to change the billing strategy. On subscribe -> set to stripe, on unsubscribe -> set to other
+            await this.usageService.subscribeToStripe(user.id, attrId.teamId, usageLimit);
+            const costCenter = await this.usageService.getCostCenter(user.id, attrId.teamId);
+            // marking all members as verified
+            try {
+                await this.verificationService.verifyOrgMembers(attrId.teamId);
+            } catch (err) {
+                log.error(`Failed to verify org members`, err, { organizationId: attrId.teamId });
+            }
+
+            return costCenter.spendingLimit;
+        } catch (error) {
+            log.error(`Failed to subscribe '${attributionId}' to Stripe`, error);
+            if (error instanceof ClientError) {
+                throw new ApplicationError(ErrorCodes.INTERNAL_SERVER_ERROR, error.details);
+            }
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                `Failed to subscribe '${attributionId}' to Stripe`,
+            );
+        }
+    }
+
+    async getStripePortalUrl(ctx: TraceContext, attributionId: string): Promise<string> {
+        const user = await this.checkAndBlockUser("getStripePortalUrl");
+
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        const returnUrl = this.config.hostUrl
+            .with(() => ({ pathname: `/billing`, search: `org=${attrId.kind === "team" ? attrId.teamId : "0"}` }))
+            .toString();
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+        let url: string;
+        try {
+            url = await this.stripeService.getPortalUrlForAttributionId(attributionId, returnUrl);
+        } catch (error) {
+            log.error(`Failed to get Stripe portal URL for '${attributionId}'`, error);
+            throw new ApplicationError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                `Failed to get Stripe portal URL for '${attributionId}'`,
+            );
+        }
+        return url;
+    }
+
+    async getCostCenter(ctx: TraceContext, attributionId: string): Promise<CostCenterJSON | undefined> {
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        const user = await this.checkAndBlockUser("getCostCenter");
+        await this.guardTeamOperation(attrId.teamId, "get");
+        await this.auth.checkPermissionOnOrganization(user.id, "read_billing", attrId.teamId);
+
+        return await this.usageService.getCostCenter(user.id, attrId.teamId);
+    }
+
+    async setUsageLimit(ctx: TraceContext, attributionId: string, usageLimit: number): Promise<void> {
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+        if (typeof usageLimit !== "number" || usageLimit < 0) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Unexpected usageLimit value: ${usageLimit}`);
+        }
+        const user = await this.checkAndBlockUser("setUsageLimit");
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+        await this.usageService.setUsageLimit(user.id, attrId.teamId, usageLimit);
+    }
+
+    async listUsage(ctx: TraceContext, req: ListUsageRequest): Promise<ListUsageResponse> {
+        const attributionId = AttributionId.parse(req.attributionId);
+        if (!attributionId) {
+            throw new ApplicationError(ErrorCodes.INVALID_COST_CENTER, "Bad attribution ID", {
+                attributionId: req.attributionId,
+            });
+        }
+        const user = await this.checkAndBlockUser("listUsage");
+
+        // we are adding this check here inline because we are moving to the new fine-grained permissions model but are not quite ready yet.
+        const members = await this.teamDB.findMembersByTeam(attributionId.teamId);
+        const member = members.find((m) => m.userId === user.id);
+        if (!member) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "Organization not found.");
+        }
+        const isMemberUsageEnabled = await getExperimentsClientForBackend().getValueAsync("member_usage", false, {
+            user: {
+                id: user.id,
+                email: getPrimaryEmail(user),
+            },
+            teamId: attributionId.teamId,
+        });
+        if (isMemberUsageEnabled && member.role !== "owner") {
+            req.userId = user.id;
+        }
+        return this.usageService.listUsage(user.id, req);
+    }
+
+    async getUsageBalance(ctx: TraceContext, attributionId: string): Promise<number> {
+        const user = await this.checkAndBlockUser("listUsage");
+        const parsedAttributionId = AttributionId.parse(attributionId);
+        if (!parsedAttributionId) {
+            throw new ApplicationError(ErrorCodes.INVALID_COST_CENTER, "Bad attribution ID", {
+                attributionId,
+            });
+        }
+        await this.guardTeamOperation(parsedAttributionId.teamId, "get");
+        await this.auth.checkPermissionOnOrganization(user.id, "read_billing", parsedAttributionId.teamId);
+        const result = await this.usageService.getCurrentBalance(user.id, parsedAttributionId.teamId);
+        return result.usedCredits;
+    }
+
+    async getBillingModeForTeam(ctx: TraceContextWithSpan, teamId: string): Promise<BillingMode> {
+        traceAPIParams(ctx, { teamId });
+
+        const user = await this.checkAndBlockUser("getBillingModeForTeam");
+        await this.guardTeamOperation(teamId, "get");
+        await this.auth.checkPermissionOnOrganization(user.id, "read_billing", teamId);
+
+        return this.billingModes.getBillingMode(user.id, teamId);
+    }
+
+    async isCustomerBillingAddressInvalid(ctx: TraceContext, attributionId: string): Promise<boolean> {
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        const user = await this.checkAndBlockUser("isCustomerBillingAddressInvalid");
+        await this.guardTeamOperation(attrId.teamId, "update");
+        await this.auth.checkPermissionOnOrganization(user.id, "write_billing", attrId.teamId);
+
+        try {
+            const customer = (await this.billingService.getStripeCustomer({ attributionId })).customer;
+            return customer?.invalidBillingAddress ?? false;
+        } catch (e) {
+            log.error(`Failed to get Stripe customer profile for '${attributionId}'`, e);
+            return false;
+        }
+    }
+
+    // (SaaS) – admin
+    async adminGetBillingMode(ctx: TraceContextWithSpan, attributionId: string): Promise<BillingMode> {
+        traceAPIParams(ctx, { attributionId });
+
+        const admin = await this.checkAndBlockUser("adminGetBillingMode");
+        if (!this.authorizationService.hasPermission(admin, Permission.ADMIN_USERS)) {
+            throw new ApplicationError(ErrorCodes.PERMISSION_DENIED, "not allowed");
+        }
+
+        const parsedAttributionId = AttributionId.parse(attributionId);
+        if (!parsedAttributionId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "Unable to parse attributionId");
+        }
+        await this.auth.checkPermissionOnOrganization(admin.id, "read_billing", parsedAttributionId.teamId);
+        return this.billingModes.getBillingMode(admin.id, parsedAttributionId.teamId);
+    }
+
+    async adminGetCostCenter(ctx: TraceContext, attributionId: string): Promise<CostCenterJSON | undefined> {
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+
+        const user = await this.checkAndBlockUser("adminGetCostCenter");
+        await this.guardAdminAccess("adminGetCostCenter", { id: user.id }, Permission.ADMIN_USERS);
+
+        return await this.usageService.getCostCenter(user.id, attrId.teamId);
+    }
+
+    async adminSetUsageLimit(ctx: TraceContext, attributionId: string, usageLimit: number): Promise<void> {
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+        const adminUser = await this.checkAndBlockUser("adminSetUsageLimit");
+        await this.guardAdminAccess("adminSetUsageLimit", { id: adminUser.id }, Permission.ADMIN_USERS);
+
+        await this.usageService.setUsageLimit(adminUser.id, attrId.teamId, usageLimit);
+    }
+
+    async adminListUsage(ctx: TraceContext, req: ListUsageRequest): Promise<ListUsageResponse> {
+        traceAPIParams(ctx, { req });
+        const adminUser = await this.checkAndBlockUser("adminListUsage");
+        await this.guardAdminAccess("adminListUsage", { id: adminUser.id }, Permission.ADMIN_USERS);
+        return this.usageService.listUsage(adminUser.id, req);
+    }
+
+    async adminGetUsageBalance(ctx: TraceContext, attributionId: string): Promise<number> {
+        traceAPIParams(ctx, { attributionId });
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+        const user = await this.checkAndBlockUser("adminGetUsageBalance");
+        await this.guardAdminAccess("adminGetUsageBalance", { id: user.id }, Permission.ADMIN_USERS);
+        const result = await this.usageService.getCurrentBalance(user.id, attrId.teamId);
+        return result.usedCredits;
+    }
+
+    async adminAddUsageCreditNote(
+        ctx: TraceContext,
+        attributionId: string,
+        credits: number,
+        description: string,
+    ): Promise<void> {
+        traceAPIParams(ctx, { attributionId, credits, note: description });
+        const attrId = AttributionId.parse(attributionId);
+        if (attrId === undefined) {
+            log.error(`Invalid attribution id: ${attributionId}`);
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, `Invalid attribution id: ${attributionId}`);
+        }
+        const user = await this.checkAndBlockUser("adminAddUsageCreditNote");
+        await this.guardAdminAccess("adminAddUsageCreditNote", { id: user.id }, Permission.ADMIN_USERS);
+        await this.usageService.addCreditNote(user.id, attrId.teamId, credits, description);
+    }
+
+    async adminGetBlockedEmailDomains(ctx: TraceContextWithSpan): Promise<EmailDomainFilterEntry[]> {
+        const user = await this.checkAndBlockUser("adminGetBlockedEmailDomains");
+        await this.guardAdminAccess("adminGetBlockedEmailDomains", { id: user.id }, Permission.ADMIN_USERS);
+        return await this.installationService.adminGetBlockedEmailDomains(user.id);
+    }
+
+    async adminSaveBlockedEmailDomain(
+        ctx: TraceContextWithSpan,
+        domainFilterentry: EmailDomainFilterEntry,
+    ): Promise<void> {
+        const user = await this.checkAndBlockUser("adminSaveBlockedEmailDomain");
+        await this.guardAdminAccess("adminSaveBlockedEmailDomain", { id: user.id }, Permission.ADMIN_USERS);
+        await this.installationService.adminCreateBlockedEmailDomain(user.id, domainFilterentry);
+    }
 }

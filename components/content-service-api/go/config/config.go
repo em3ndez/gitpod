@@ -1,18 +1,13 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package config
 
 import (
-	"crypto/tls"
 	"os"
 
-	"golang.org/x/xerrors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
-	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
+	"github.com/gitpod-io/gitpod/common-go/baseserver"
 )
 
 // StorageConfig configures the remote storage we use
@@ -24,16 +19,13 @@ type StorageConfig struct {
 	Kind RemoteStorageType `json:"kind"`
 
 	// GCloudConfig configures the Google Bucket remote storage
-	GCloudConfig GCPConfig `json:"gcloud"`
+	GCloudConfig GCPConfig `json:"gcloud,omitempty"`
 
 	// MinIOConfig configures the MinIO remote storage
-	MinIOConfig MinIOConfig `json:"minio"`
+	MinIOConfig MinIOConfig `json:"minio,omitempty"`
 
-	// BackupTrail maintains a number of backups for the same workspace
-	BackupTrail struct {
-		Enabled   bool `json:"enabled"`
-		MaxLength int  `json:"maxLength"`
-	} `json:"backupTrail"`
+	// S3Config configures the S3 remote storage
+	S3Config *S3Config `json:"s3,omitempty"`
 
 	BlobQuota int64 `json:"blobQuota"`
 }
@@ -61,6 +53,10 @@ const (
 
 	// MinIOStorage stores workspaces in a MinIO/S3 storage
 	MinIOStorage RemoteStorageType = "minio"
+
+	// S3Storage stores workspaces in a S3 storage. It assumes the AWS-typical credentials
+	// exist in the environment. See https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/config#LoadDefaultConfig for more details.
+	S3Storage RemoteStorageType = "s3"
 
 	// NullStorage does not synchronize workspaces at all
 	NullStorage RemoteStorageType = ""
@@ -96,64 +92,42 @@ type GCPConfig struct {
 	CredentialsFile string `json:"credentialsFile"`
 	Region          string `json:"region"`
 	Project         string `json:"projectId"`
-	ParallelUpload  int    `json:"parallelUpload"`
-
-	MaximumBackupCount int `json:"maximumBackupCount"`
 }
 
 // MinIOConfig MinIOconfigures the MinIO remote storage backend
 type MinIOConfig struct {
-	Endpoint        string `json:"endpoint"`
-	AccessKeyID     string `json:"accessKey"`
-	SecretAccessKey string `json:"secretKey"`
-	Secure          bool   `json:"secure,omitempty"`
+	Endpoint            string `json:"endpoint"`
+	AccessKeyID         string `json:"accessKey"`
+	AccessKeyIdFile     string `json:"accessKeyFile"`
+	SecretAccessKey     string `json:"secretKey"`
+	SecretAccessKeyFile string `json:"secretKeyFile"`
+	Secure              bool   `json:"secure,omitempty"`
 
 	Region         string `json:"region"`
 	ParallelUpload uint   `json:"parallelUpload,omitempty"`
+
+	BucketName string `json:"bucket,omitempty"`
 }
 
-type Service struct {
-	Addr string    `json:"address"`
-	TLS  TLSConfig `json:"tls"`
-}
-
-type Prometheus struct {
-	Addr string `json:"address"`
+// S3Config configures the S3 remote storage backend
+type S3Config struct {
+	Bucket          string `json:"bucket"`
+	Region          string `json:"region"`
+	CredentialsFile string `json:"credentialsFile"`
 }
 
 type PProf struct {
 	Addr string `json:"address"`
 }
 
+// UsageReportConfig configures the upload of workspace instance usage reports
+type UsageReportConfig struct {
+	BucketName string `json:"bucketName"`
+}
+
 type ServiceConfig struct {
-	// Daemon  daemon.Config `json:"daemon"`
-	Service    Service       `json:"service"`
-	Prometheus Prometheus    `json:"prometheus"`
-	PProf      PProf         `json:"pprof"`
-	Storage    StorageConfig `json:"storage"`
-}
-
-type TLSConfig struct {
-	Authority   string `json:"ca"`
-	Certificate string `json:"crt"`
-	PrivateKey  string `json:"key"`
-}
-
-// ServerOption produces the GRPC option that configures a server to use this TLS configuration
-func (c *TLSConfig) ServerOption() (grpc.ServerOption, error) {
-	if c.Authority == "" || c.Certificate == "" || c.PrivateKey == "" {
-		return nil, nil
-	}
-
-	tlsConfig, err := common_grpc.ClientAuthTLSConfig(
-		c.Authority, c.Certificate, c.PrivateKey,
-		common_grpc.WithSetClientCAs(true),
-		common_grpc.WithClientAuth(tls.RequireAndVerifyClientCert),
-		common_grpc.WithServerName("ws-manager"),
-	)
-	if err != nil {
-		return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
-	}
-
-	return grpc.Creds(credentials.NewTLS(tlsConfig)), nil
+	Service baseserver.ServerConfiguration `json:"service"`
+	Storage StorageConfig                  `json:"storage"`
+	// Deprecated
+	_ UsageReportConfig `json:"usageReport"`
 }
