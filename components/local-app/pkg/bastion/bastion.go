@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package bastion
 
@@ -29,6 +29,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
 	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
@@ -152,6 +153,7 @@ func (s *SSHConfigWritingCallback) InstanceUpdate(w *Workspace) {
 				&ssh_config.KV{Key: "User", Value: "gitpod"},
 				&ssh_config.KV{Key: "Port", Value: port},
 				&ssh_config.KV{Key: "IdentityFile", Value: ws.SSHPrivateFN},
+				&ssh_config.KV{Key: "IdentitiesOnly", Value: "yes"},
 			},
 		})
 	}
@@ -163,16 +165,18 @@ func (s *SSHConfigWritingCallback) InstanceUpdate(w *Workspace) {
 	}
 }
 
-func New(client gitpod.APIInterface, cb Callbacks) *Bastion {
+func New(client gitpod.APIInterface, localAppTimeout time.Duration, cb Callbacks) *Bastion {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Bastion{
-		Client:        client,
-		Callbacks:     cb,
-		workspaces:    make(map[string]*Workspace),
-		ctx:           ctx,
-		stop:          cancel,
-		updates:       make(chan *WorkspaceUpdateRequest, 10),
-		subscriptions: make(map[*StatusSubscription]struct{}, 10),
+		Client:                 client,
+		Callbacks:              cb,
+		workspaces:             make(map[string]*Workspace),
+		localAppTimeout:        localAppTimeout,
+		workspaceMapChangeChan: make(chan int),
+		ctx:                    ctx,
+		stop:                   cancel,
+		updates:                make(chan *WorkspaceUpdateRequest, 10),
+		subscriptions:          make(map[*StatusSubscription]struct{}, 10),
 	}
 }
 
@@ -191,6 +195,9 @@ type Bastion struct {
 	workspacesMu sync.RWMutex
 	workspaces   map[string]*Workspace
 
+	localAppTimeout        time.Duration
+	workspaceMapChangeChan chan int
+
 	ctx  context.Context
 	stop context.CancelFunc
 
@@ -201,7 +208,7 @@ type Bastion struct {
 }
 
 func (b *Bastion) Run() error {
-	updates, err := b.Client.InstanceUpdates(b.ctx, "")
+	updates, err := b.Client.WorkspaceUpdates(b.ctx, "")
 	if err != nil {
 		return err
 	}
@@ -220,6 +227,11 @@ func (b *Bastion) Run() error {
 			s.Close()
 		}
 	}()
+
+	go b.handleTimeout()
+	if b.localAppTimeout != 0 {
+		b.workspaceMapChangeChan <- 0
+	}
 
 	go func() {
 		for u := range b.updates {
@@ -267,6 +279,25 @@ func (b *Bastion) Update(workspaceID string) *Workspace {
 		done:     done,
 	}
 	return <-done
+}
+
+func (b *Bastion) handleTimeout() {
+	if b.localAppTimeout == 0 {
+		return
+	}
+	var timer *time.Timer
+	for count := range b.workspaceMapChangeChan {
+		if count == 0 && timer == nil {
+			logrus.Debugf("local app will terminate in %v", b.localAppTimeout)
+			timer = time.AfterFunc(b.localAppTimeout, func() {
+				os.Exit(0)
+			})
+		} else if count != 0 && timer != nil {
+			logrus.Debugln("reset local app terminate timeout")
+			timer.Stop()
+			timer = nil
+		}
+	}
 }
 
 func (b *Bastion) handleUpdate(ur *WorkspaceUpdateRequest) {
@@ -326,7 +357,7 @@ func (b *Bastion) handleUpdate(ur *WorkspaceUpdateRequest) {
 
 		if ws.supervisorClient == nil && ws.supervisorListener != nil {
 			var err error
-			ws.supervisorClient, err = grpc.Dial(ws.supervisorListener.LocalAddr, grpc.WithInsecure())
+			ws.supervisorClient, err = grpc.Dial(ws.supervisorListener.LocalAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				logrus.WithError(err).WithField("workspace", ws.WorkspaceID).Error("error connecting to supervisor")
 			} else {
@@ -361,11 +392,17 @@ func (b *Bastion) handleUpdate(ur *WorkspaceUpdateRequest) {
 		ws.cancel()
 		delete(b.workspaces, u.ID)
 		b.Callbacks.InstanceUpdate(ws)
+		if b.localAppTimeout != 0 {
+			b.workspaceMapChangeChan <- len(b.workspaces)
+		}
 		return
 	}
 
 	b.workspaces[u.ID] = ws
 	b.Callbacks.InstanceUpdate(ws)
+	if b.localAppTimeout != 0 {
+		b.workspaceMapChangeChan <- len(b.workspaces)
+	}
 }
 
 func generateSSHKeys(instanceID string) (privateKeyFN string, publicKey string, err error) {
@@ -723,6 +760,9 @@ func (b *Bastion) tunnelPorts(ws *Workspace) {
 }
 
 func (b *Bastion) doTunnelPorts(ctx context.Context, ws *Workspace) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	statusService := supervisor.NewStatusServiceClient(ws.supervisorClient)
 	status, err := statusService.PortsStatus(ctx, &supervisor.PortsStatusRequest{
 		Observe: true,

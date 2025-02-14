@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
@@ -28,9 +28,7 @@ func TestFindBindMountCandidates(t *testing.T) {
 				"/dev",
 				"/sys",
 				"/workspace",
-				"/etc/hosts",
 				"/etc/hostname",
-				"/etc/resolv.conf",
 			},
 		},
 		{
@@ -40,9 +38,7 @@ func TestFindBindMountCandidates(t *testing.T) {
 			Expectation: []string{
 				"/dev",
 				"/sys",
-				"/etc/hosts",
 				"/etc/hostname",
-				"/etc/resolv.conf",
 			},
 		},
 		{
@@ -58,9 +54,7 @@ func TestFindBindMountCandidates(t *testing.T) {
 				"/dev",
 				"/sys",
 				"/workspace",
-				"/etc/hosts",
 				"/etc/hostname",
-				"/etc/resolv.conf",
 				"/custom-certs",
 			},
 		},

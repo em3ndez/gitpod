@@ -1,16 +1,16 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { IPrefixContextParser } from "./context-parser";
-import { User, WorkspaceContext, UserEnvVarValue, WithEnvvarsContext } from "@gitpod/gitpod-protocol";
+import { User, WorkspaceContext, WithEnvvarsContext } from "@gitpod/gitpod-protocol";
 import { injectable } from "inversify";
+import { EnvVarWithValue } from "@gitpod/gitpod-protocol/lib/protocol";
 
 @injectable()
 export class EnvvarPrefixParser implements IPrefixContextParser {
-
     public findPrefix(user: User, context: string): string | undefined {
         const result = this.parse(context);
         return result && result.prefix;
@@ -22,13 +22,13 @@ export class EnvvarPrefixParser implements IPrefixContextParser {
             return context;
         }
 
-        const envvars: UserEnvVarValue[] = [];
+        const envvars: EnvVarWithValue[] = [];
         for (const [k, v] of result.envVarMap.entries()) {
-            envvars.push({ name: k, value: decodeURIComponent(v), repositoryPattern: "#/#" });
+            envvars.push({ name: k, value: decodeURIComponent(v) });
         }
         return <WithEnvvarsContext>{
             ...context,
-            envvars
+            envvars,
         };
     }
 
@@ -40,7 +40,7 @@ export class EnvvarPrefixParser implements IPrefixContextParser {
         const envVarMap = new Map<string, string>();
         const prefix = splitBySlash[0];
         const kvCandidates = prefix.split(",");
-        for (let kvCandidate of kvCandidates) {
+        for (const kvCandidate of kvCandidates) {
             const kv = kvCandidate.split("=");
             if (kv.length !== 2 || !kv[0] || !kv[1] || !kv[0].match(/^[\w-_]+$/)) {
                 continue;
@@ -52,8 +52,7 @@ export class EnvvarPrefixParser implements IPrefixContextParser {
         }
         return {
             prefix: prefix + "/",
-            envVarMap
-        }
+            envVarMap,
+        };
     }
-
 }

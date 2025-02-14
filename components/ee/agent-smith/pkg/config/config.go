@@ -1,6 +1,6 @@
-// Copyright (c) 2021 Gitpod GmbH. All rights reserved.
-// Licensed under the Gitpod Enterprise Source Code License,
-// See License.enterprise.txt in the project root folder.
+// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License.AGPL.txt in the project root for license information.
 
 package config
 
@@ -12,9 +12,7 @@ import (
 
 	"github.com/gitpod-io/gitpod/agent-smith/pkg/classifier"
 	"github.com/gitpod-io/gitpod/agent-smith/pkg/common"
-	"github.com/gitpod-io/gitpod/common-go/util"
 	"golang.org/x/xerrors"
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func GetConfig(cfgFile string) (*ServiceConfig, error) {
@@ -56,9 +54,6 @@ type ServiceConfig struct {
 	// We have had memory leak issues with agent smith in the past due to experimental gRPC use.
 	// This upper limit causes agent smith to stop itself should it go above this limit.
 	MaxSysMemMib uint64 `json:"systemMemoryLimitMib,omitempty"`
-
-	HostURL        string `json:"hostURL,omitempty"`
-	GitpodAPIToken string `json:"gitpodAPIToken,omitempty"`
 }
 
 type Enforcement struct {
@@ -99,8 +94,6 @@ type InfringementKind string
 const (
 	// InfringementExec means a user executed a blocklisted executable
 	InfringementExec InfringementKind = "blocklisted executable"
-	// InfringementExcessiveEgress means a user produced too much egress traffic
-	InfringementExcessiveEgress InfringementKind = "excessive egress"
 )
 
 // PenaltyKind describes a kind of penalty for a violating workspace
@@ -144,7 +137,6 @@ func (g GradedInfringementKind) Kind() (InfringementKind, error) {
 	wopfx := strings.TrimSpace(strings.TrimPrefix(string(g), string(g.Severity())))
 
 	validKinds := []InfringementKind{
-		InfringementExcessiveEgress,
 		InfringementExec,
 	}
 	for _, k := range validKinds {
@@ -173,38 +165,34 @@ type Kubernetes struct {
 
 // Config configures Agent Smith
 type Config struct {
-	GitpodAPI           GitpodAPI `json:"gitpodAPI"`
-	KubernetesNamespace string    `json:"namespace"`
+	WorkspaceManager    WorkspaceManagerConfig `json:"wsman"`
+	GitpodAPI           GitpodAPI              `json:"gitpodAPI"`
+	KubernetesNamespace string                 `json:"namespace"`
 
 	Blocklists *Blocklists `json:"blocklists,omitempty"`
 
-	EgressTraffic     *EgressTraffic     `json:"egressTraffic,omitempty"`
 	Enforcement       Enforcement        `json:"enforcement,omitempty"`
 	ExcessiveCPUCheck *ExcessiveCPUCheck `json:"excessiveCPUCheck,omitempty"`
-	SlackWebhooks     *SlackWebhooks     `json:"slackWebhooks,omitempty"`
 	Kubernetes        Kubernetes         `json:"kubernetes"`
 
 	ProbePath string `json:"probePath,omitempty"`
+}
+
+type TLS struct {
+	Authority   string `json:"ca"`
+	Certificate string `json:"crt"`
+	PrivateKey  string `json:"key"`
+}
+
+type WorkspaceManagerConfig struct {
+	Address string `json:"address"`
+	TLS     TLS    `json:"tls,omitempty"`
 }
 
 // Slackwebhooks holds slack notification configuration for different levels of penalty severity
 type SlackWebhooks struct {
 	Audit   string `json:"audit,omitempty"`
 	Warning string `json:"warning,omitempty"`
-}
-
-// EgressTraffic configures an upper limit of allowed egress traffic over time
-type EgressTraffic struct {
-	WindowDuration util.Duration `json:"dt"`
-
-	ExcessiveLevel     *PerLevelEgressTraffic `json:"excessive"`
-	VeryExcessiveLevel *PerLevelEgressTraffic `json:"veryExcessive"`
-}
-
-// PerLevelEgressTraffic configures the egress traffic threshold per level
-type PerLevelEgressTraffic struct {
-	BaseBudget resource.Quantity `json:"baseBudget"`
-	Threshold  resource.Quantity `json:"perDtThreshold"`
 }
 
 // Blocklists list s/signature blocklists for various levels of infringement
@@ -214,28 +202,27 @@ type Blocklists struct {
 	Very   *PerLevelBlocklist `json:"very,omitempty"`
 }
 
-func (b *Blocklists) Classifier() (classifier.ProcessClassifier, error) {
+func (b *Blocklists) Classifier() (res classifier.ProcessClassifier, err error) {
+	defer func() {
+		if res == nil {
+			return
+		}
+		res = classifier.NewCountingMetricsClassifier("all", res)
+	}()
+
 	if b == nil {
-		return &classifier.CommandlineClassifier{}, nil
+		return classifier.NewCommandlineClassifier("empty", classifier.LevelAudit, nil, nil)
 	}
 
-	var err error
-	res := make(classifier.GradedClassifier)
-
-	res[classifier.LevelAudit], err = b.Audit.Classifier()
-	if err != nil {
-		return nil, err
+	gres := make(classifier.GradedClassifier)
+	for level, bl := range b.Levels() {
+		lvl := classifier.Level(level)
+		gres[lvl], err = bl.Classifier(string(level), lvl)
+		if err != nil {
+			return nil, err
+		}
 	}
-	res[classifier.LevelBarely], err = b.Barely.Classifier()
-	if err != nil {
-		return nil, err
-	}
-	res[classifier.LevelVery], err = b.Very.Classifier()
-	if err != nil {
-		return nil, err
-	}
-
-	return res, nil
+	return gres, nil
 }
 
 func (b *Blocklists) Levels() map[common.Severity]*PerLevelBlocklist {
@@ -265,16 +252,20 @@ type PerLevelBlocklist struct {
 	Signatures []*classifier.Signature `json:"signatures,omitempty"`
 }
 
-func (p *PerLevelBlocklist) Classifier() (classifier.ProcessClassifier, error) {
+func (p *PerLevelBlocklist) Classifier(name string, level classifier.Level) (classifier.ProcessClassifier, error) {
 	if p == nil {
 		return classifier.CompositeClassifier{}, nil
 	}
 
-	cmdl, err := classifier.NewCommandlineClassifier(p.AllowList, p.Binaries)
+	cmdl, err := classifier.NewCommandlineClassifier(name, level, p.AllowList, p.Binaries)
 	if err != nil {
 		return nil, err
 	}
-	sigs := classifier.NewSignatureMatchClassifier(p.Signatures)
+	cmdlc := classifier.NewCountingMetricsClassifier("cmd_"+name, cmdl)
 
-	return classifier.CompositeClassifier{cmdl, sigs}, nil
+	sigsc := classifier.NewCountingMetricsClassifier("sig_"+name,
+		classifier.NewSignatureMatchClassifier(name, level, p.Signatures),
+	)
+
+	return classifier.CompositeClassifier{cmdlc, sigsc}, nil
 }

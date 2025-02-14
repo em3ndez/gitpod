@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
- * Licensed under the Gitpod Enterprise Source Code License,
- * See License.enterprise.txt in the project root folder.
+ * Licensed under the GNU Affero General Public License (AGPL).
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { injectable, inject } from "inversify";
@@ -14,7 +14,6 @@ import { DBEmailDomainFilterEntry } from "./entity/db-email-domain-filter-entry"
 
 @injectable()
 export class EmailDomainFilterDBImpl implements EmailDomainFilterDB {
-
     @inject(TypeORM) typeorm: TypeORM;
 
     protected async getManager(): Promise<EntityManager> {
@@ -22,20 +21,27 @@ export class EmailDomainFilterDBImpl implements EmailDomainFilterDB {
     }
 
     protected async getRepo(): Promise<Repository<EmailDomainFilterEntry>> {
-        return await (await this.getManager()).getRepository<DBEmailDomainFilterEntry>(DBEmailDomainFilterEntry);
+        return (await this.getManager()).getRepository<DBEmailDomainFilterEntry>(DBEmailDomainFilterEntry);
     }
 
-    async storeFilterEntry(entry: EmailDomainFilterEntry): Promise<void> {
+    async storeFilterEntry(entry: EmailDomainFilterEntry): Promise<EmailDomainFilterEntry> {
         const repo = await this.getRepo();
-        await repo.save(entry);
+        return await repo.save(entry);
     }
 
-    async filter(domain: string): Promise<boolean> {
+    async getFilterEntries(): Promise<EmailDomainFilterEntry[]> {
         const repo = await this.getRepo();
-        const result = await repo.createQueryBuilder("entry")
-            .where(`entry.domain = :domain`, { domain: domain })
+        return repo.find();
+    }
+
+    async isBlocked(domain: string): Promise<boolean> {
+        const repo = await this.getRepo();
+        const result = await repo
+            .createQueryBuilder("entry")
+            .where(`:domain LIKE entry.domain`, { domain: domain })
+            .andWhere(`entry.domain != '%'`) // this ensures we do not accidentally block _all_ new users
             .andWhere(`entry.negative = '1'`)
             .getOne();
-        return !result;
+        return !!result;
     }
 }

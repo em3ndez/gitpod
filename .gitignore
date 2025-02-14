@@ -2,9 +2,7 @@ dist/
 components/*/lib/
 components/ee/*/lib/
 components/*/typescript/lib/
-components/theia/app/lib/
-components/theia/packages/*/lib/
-components/theia/supervisor-api/*/lib/
+components/*/typescript-*/lib/
 components/local-app-api/*/lib/
 components/supervisor/frontend/lib/
 src-gen/
@@ -33,6 +31,7 @@ components/versions/versions.json
 .helm-chart-release
 *.tgz
 
+
 # Symbolic links created by scripts for building docker images
 /.dockerignore
 
@@ -41,9 +40,6 @@ venv/
 .eggs/
 *.egg-info
 *.pyc
-
-# Generated
-components/theia/app/gen-webpack.config.js
 
 # Generated (in Jenkins builds)
 /dev-http-cache/
@@ -55,8 +51,13 @@ components/theia/app/gen-webpack.config.js
 charts/gitpod_io/secrets/decrypted
 
 # Build artifacts
-components/ws-scheduler/ws-scheduler
 components/ws-proxy/ws-proxy
 
 # Logs
 components/server/*.log
+
+# Jetbrains workspace files
+.idea/misc.xml
+
+# Local redis dump files
+dump.rdb

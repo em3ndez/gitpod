@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package main
 
@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prometheus/procfs"
 	"golang.org/x/sys/unix"
@@ -22,12 +24,27 @@ import (
 )
 
 func main() {
+	done := make(chan struct{})
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/shutdown", shugtdownHandler(done))
+		_ = http.ListenAndServe(":8080", mux)
+	}()
+
 	err := enterSupervisorNamespaces()
 	if err != nil {
 		panic(fmt.Sprintf("enterSupervisorNamespaces: %v", err))
 	}
 
-	integration.ServeAgent(new(WorkspaceAgent))
+	integration.ServeAgent(done, new(WorkspaceAgent))
+}
+
+func shugtdownHandler(done chan struct{}) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		close(done)
+		w.Write([]byte("shutdown"))
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
 func enterSupervisorNamespaces() error {
@@ -123,13 +140,15 @@ func (*WorkspaceAgent) WriteFile(req *api.WriteFileRequest, resp *api.WriteFileR
 // Exec executes a command in the workspace
 func (*WorkspaceAgent) Exec(req *api.ExecRequest, resp *api.ExecResponse) (err error) {
 	cmd := exec.Command(req.Command, req.Args...)
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, req.Env...)
+	if req.Dir != "" {
+		cmd.Dir = req.Dir
+	}
 	var (
 		stdout bytes.Buffer
 		stderr bytes.Buffer
 	)
-	if req.Dir != "" {
-		cmd.Dir = req.Dir
-	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err = cmd.Run()
@@ -151,4 +170,23 @@ func (*WorkspaceAgent) Exec(req *api.ExecRequest, resp *api.ExecResponse) (err e
 		Stderr:   stderr.String(),
 	}
 	return
+}
+
+func (*WorkspaceAgent) BurnCpu(req *api.BurnCpuRequest, resp *api.BurnCpuResponse) error {
+	done := make(chan int)
+	for i := 0; i < int(req.Procs); i++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}()
+	}
+
+	time.Sleep(req.Timeout)
+	close(done)
+	return nil
 }

@@ -1,6 +1,6 @@
-// Copyright (c) 2021 Gitpod GmbH. All rights reserved.
-// Licensed under the Gitpod Enterprise Source Code License,
-// See License.enterprise.txt in the project root folder.
+// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License.AGPL.txt in the project root for license information.
 
 package main
 
@@ -10,11 +10,12 @@ import (
 )
 
 func main() {
-	time.Sleep(1 * time.Second)
+	time.Sleep(30 * time.Second)
 	agentSmithTestTarget()
 }
 
 // don't inline to produce an elf entry
+//
 //go:noinline
 func agentSmithTestTarget() {
 	fmt.Println("something")

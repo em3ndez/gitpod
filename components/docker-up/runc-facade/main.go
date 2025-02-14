@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package main
 
@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/xerrors"
 )
+
+const RETRY = 10
 
 var (
 	defaultOOMScoreAdj = 1000
@@ -38,7 +41,7 @@ func main() {
 	}
 
 	if useFacade {
-		err = createAndRunc(runcPath)
+		err = createAndRunc(runcPath, log)
 	} else {
 		err = syscall.Exec(runcPath, os.Args, os.Environ())
 	}
@@ -47,7 +50,7 @@ func main() {
 	}
 }
 
-func createAndRunc(runcPath string) error {
+func createAndRunc(runcPath string, log *logrus.Logger) error {
 	fc, err := os.ReadFile("config.json")
 	if err != nil {
 		return xerrors.Errorf("cannot read config.json: %w", err)
@@ -61,6 +64,14 @@ func createAndRunc(runcPath string) error {
 
 	cfg.Process.OOMScoreAdj = &defaultOOMScoreAdj
 	delete(cfg.Linux.Sysctl, "net.ipv4.ip_unprivileged_port_start")
+	// TODO(toru): Drop the `kernel.domainame`` setting as it currently fails in the rootless container.
+	// - https://github.com/opencontainers/runc/issues/2091
+	// - https://github.com/opencontainers/runtime-spec/issues/592
+	// Perhaps using OCI hooks can solve this problem, but it's a bit tricky and hard.
+	if _, ok := cfg.Linux.Sysctl["kernel.domainname"]; ok {
+		log.Warnln("Since the rootless container cannot use domainname yet, we ignored it.")
+		delete(cfg.Linux.Sysctl, "kernel.domainname")
+	}
 	cfg.Process.Capabilities.Ambient = append(cfg.Process.Capabilities.Ambient, "CAP_NET_BIND_SERVICE")
 	cfg.Process.Capabilities.Bounding = append(cfg.Process.Capabilities.Bounding, "CAP_NET_BIND_SERVICE")
 	cfg.Process.Capabilities.Effective = append(cfg.Process.Capabilities.Effective, "CAP_NET_BIND_SERVICE")
@@ -71,16 +82,33 @@ func createAndRunc(runcPath string) error {
 	if err != nil {
 		return xerrors.Errorf("cannot encode config.json: %w", err)
 	}
-	for _, fn := range []string{"config.json", "/tmp/debug.json"} {
-		err = os.WriteFile(fn, fc, 0644)
-		if err != nil {
-			return xerrors.Errorf("cannot encode config.json: %w", err)
-		}
+	err = os.WriteFile("config.json", fc, 0644)
+	if err != nil {
+		return xerrors.Errorf("cannot encode config.json: %w", err)
 	}
 
-	err = syscall.Exec(runcPath, os.Args, os.Environ())
-	if err != nil {
-		return xerrors.Errorf("exec %s: %w", runcPath, err)
+	// See here for more details on why retries are necessary.
+	// https://github.com/gitpod-io/gitpod/issues/12365
+	for i := 0; i <= RETRY; i++ {
+
+		cmd := exec.Command(runcPath, os.Args[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stderr = os.Stderr
+		cmd.Stdout = os.Stdout
+		err = cmd.Run()
+
+		if err != nil {
+			log.WithError(err).Warn("runc failed")
+
+			// runc creation failures can be caused by timing issues with workspacekit/seccomp notify under load.
+			// Easing of on the pressure here lowers the likelihood of that error.
+			// NOTE(cw): glossing over races with delays is bad style, but also pragmatic.
+			//
+			// Context: https://linear.app/gitpod/issue/ENG-797/docker-containers-sometimes-fail-to-start
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return nil
 	}
-	return nil
+	return xerrors.Errorf("exec %s: %w", runcPath, err)
 }

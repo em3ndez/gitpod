@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { Column, PrimaryColumn, Entity, Index } from "typeorm";
@@ -10,9 +10,11 @@ import { TypeORM } from "../typeorm";
 import { Transformer } from "../transformer";
 
 @Entity()
-@Index("ind_dbsync", ["creationTime"])   // DBSync
+@Index("ind_dbsync", ["creationTime"]) // DBSync
 export class DBAppInstallation implements AppInstallation {
-    @PrimaryColumn()
+    @PrimaryColumn({
+        type: "varchar",
+    })
     platform: AppInstallationPlatform;
 
     @PrimaryColumn()
@@ -20,30 +22,31 @@ export class DBAppInstallation implements AppInstallation {
 
     @Column({
         ...TypeORM.UUID_COLUMN_TYPE,
-        nullable: true
+        nullable: true,
     })
     ownerUserID?: string;
 
     @Column()
     platformUserID?: string;
 
-    @PrimaryColumn()
+    @PrimaryColumn({
+        type: "varchar",
+    })
     state: AppInstallationState;
 
     @Column({
-        type: 'timestamp',
+        type: "timestamp",
         precision: 6,
-        default: () => 'CURRENT_TIMESTAMP(6)',
-        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP
+        default: () => "CURRENT_TIMESTAMP(6)",
+        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP,
     })
     creationTime: string;
 
     @Column({
-        type: 'timestamp',
+        type: "timestamp",
         precision: 6,
-        default: () => 'CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)',
-        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP
+        default: () => "CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)",
+        transformer: Transformer.MAP_ISO_STRING_TO_TIMESTAMP_DROP,
     })
     lastUpdateTime: string;
-
 }

@@ -1,34 +1,18 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package config
 
 import (
-	"crypto/tls"
-
-	"golang.org/x/xerrors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
-	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
+	"github.com/gitpod-io/gitpod/common-go/baseserver"
 )
-
-type PProf struct {
-	Addr string `json:"address"`
-}
-
-type Service struct {
-	Addr string    `json:"address"`
-	TLS  TLSConfig `json:"tls"`
-}
 
 type ServiceConfig struct {
 	Orchestrator Configuration  `json:"orchestrator"`
 	RefCache     RefCacheConfig `json:"refCache,omitempty"`
-	Service      Service        `json:"service"`
-	Prometheus   Service        `json:"prometheus"`
-	PProf        PProf          `json:"pprof"`
+
+	Server *baseserver.Configuration `json:"server"`
 }
 
 type RefCacheConfig struct {
@@ -36,37 +20,17 @@ type RefCacheConfig struct {
 	Refs     []string `json:"refs"`
 }
 
-type TLSConfig struct {
-	Authority   string `json:"ca"`
-	Certificate string `json:"crt"`
-	PrivateKey  string `json:"key"`
-}
-
-// ServerOption produces the GRPC option that configures a server to use this TLS configuration
-func (c *TLSConfig) ServerOption() (grpc.ServerOption, error) {
-	if c.Authority == "" || c.Certificate == "" || c.PrivateKey == "" {
-		return nil, nil
-	}
-
-	tlsConfig, err := common_grpc.ClientAuthTLSConfig(
-		c.Authority, c.Certificate, c.PrivateKey,
-		common_grpc.WithSetClientCAs(true),
-		common_grpc.WithClientAuth(tls.RequireAndVerifyClientCert),
-		common_grpc.WithServerName("ws-manager"),
-	)
-	if err != nil {
-		return nil, xerrors.Errorf("cannot load certs: %w", err)
-	}
-
-	return grpc.Creds(credentials.NewTLS(tlsConfig)), nil
-}
-
 // Configuration configures the orchestrator
 type Configuration struct {
 	WorkspaceManager WorkspaceManagerConfig `json:"wsman"`
 
-	// AuthFile points to a Docker configuration file from which we draw registry authentication
-	AuthFile string `json:"authFile"`
+	// PullSecret names a Kubernetes secret which contains a `.dockerconfigjson` entry
+	// carrying the Docker authentication credentials to interact with the baseImageRepository
+	// and workspaceImageRepository.
+	PullSecret string `json:"pullSecret,omitempty"`
+
+	// PullSecretFile points to a mount of the .dockerconfigjson file of the PullSecret.
+	PullSecretFile string `json:"pullSecretFile,omitempty"`
 
 	// BaseImageRepository configures repository where we'll push base images to.
 	BaseImageRepository string `json:"baseImageRepository"`
@@ -78,9 +42,15 @@ type Configuration struct {
 	// BuilderImage is an image ref to the workspace builder image
 	BuilderImage string `json:"builderImage"`
 
-	// BuilderAuthKeyFile points to a keyfile shared by the builder workspaces and this service.
-	// The key is used to encypt authentication data shipped across environment varibales.
-	BuilderAuthKeyFile string `json:"builderAuthKeyFile,omitempty"`
+	// EnableAdditionalECRAuth adds additional ECR auth using IRSA.
+	// This will attempt to add ECR auth for any ECR repo a user is
+	// trying to access.
+	EnableAdditionalECRAuth bool `json:"enableAdditionalECRAuth"`
+
+	// SubassemblyBucketName configures the subassembly bucket
+	SubassemblyBucketName string `json:"subassemblyBucketName,omitempty"`
+	// SubassemblyBucketPrefix configures an optional key prefix used for locating subassemblies in the bucket
+	SubassemblyBucketPrefix string `json:"subassemblyBucketPrefix,omitempty"`
 }
 
 type TLS struct {

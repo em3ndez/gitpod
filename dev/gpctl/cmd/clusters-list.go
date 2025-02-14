@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
@@ -33,12 +33,15 @@ var clustersListCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		tpl := `NAME	URL	STATIC	STATE	SCORE	GOVERNED	ADMISSION CONSTRAINTS
+		tpl := `NAME	URL	STATIC	STATE	SCORE	GOVERNED	REGION	ADMISSION CONSTRAINTS
 {{- range .Status }}
-{{ .Name }}	{{ .Url }}	{{ .Static }}	{{ .State }}	{{ .Score }}	{{ .Governed }}	{{ .AdmissionConstraints -}}
+{{ .Name }}	{{ .Url }}	{{ .Static }}	{{ .State }}	{{ .Score }}	{{ .Governed }}	{{ .Region }}	{{ .AdmissionConstraint -}}
 {{ end }}
 `
-		getOutputFormat(tpl, "{..name}").Print(resp)
+		err = getOutputFormat(tpl, "{..name}").Print(resp)
+		if err != nil {
+			log.Fatal(err)
+		}
 	},
 }
 

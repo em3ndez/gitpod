@@ -1,29 +1,31 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 //go:generate ./generate-mock.sh
 
 package protocol
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
 	"sync"
+	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"golang.org/x/xerrors"
 
 	"github.com/sirupsen/logrus"
 )
 
 // APIInterface wraps the
 type APIInterface interface {
+	io.Closer
+
+	GetOwnerToken(ctx context.Context, workspaceID string) (res string, err error)
 	AdminBlockUser(ctx context.Context, req *AdminBlockUserRequest) (err error)
 	GetLoggedInUser(ctx context.Context) (res *User, err error)
 	UpdateLoggedInUser(ctx context.Context, user *User) (res *User, err error)
@@ -31,19 +33,16 @@ type APIInterface interface {
 	GetOwnAuthProviders(ctx context.Context) (res []*AuthProviderEntry, err error)
 	UpdateOwnAuthProvider(ctx context.Context, params *UpdateOwnAuthProviderParams) (err error)
 	DeleteOwnAuthProvider(ctx context.Context, params *DeleteOwnAuthProviderParams) (err error)
-	GetBranding(ctx context.Context) (res *Branding, err error)
 	GetConfiguration(ctx context.Context) (res *Configuration, err error)
 	GetGitpodTokenScopes(ctx context.Context, tokenHash string) (res []string, err error)
 	GetToken(ctx context.Context, query *GetTokenSearchOptions) (res *Token, err error)
-	GetPortAuthenticationToken(ctx context.Context, workspaceID string) (res *Token, err error)
 	DeleteAccount(ctx context.Context) (err error)
 	GetClientRegion(ctx context.Context) (res string, err error)
-	HasPermission(ctx context.Context, permission *PermissionName) (res bool, err error)
 	GetWorkspaces(ctx context.Context, options *GetWorkspacesOptions) (res []*WorkspaceInfo, err error)
 	GetWorkspaceOwner(ctx context.Context, workspaceID string) (res *UserInfo, err error)
 	GetWorkspaceUsers(ctx context.Context, workspaceID string) (res []*WorkspaceInstanceUser, err error)
-	GetFeaturedRepositories(ctx context.Context) (res []*WhitelistedRepository, err error)
 	GetWorkspace(ctx context.Context, id string) (res *WorkspaceInfo, err error)
+	GetIDEOptions(ctx context.Context) (res *IDEOptions, err error)
 	IsWorkspaceOwner(ctx context.Context, workspaceID string) (res bool, err error)
 	CreateWorkspace(ctx context.Context, options *CreateWorkspaceOptions) (res *WorkspaceCreationResult, err error)
 	StartWorkspace(ctx context.Context, id string, options *StartWorkspaceOptions) (res *StartWorkspaceResult, err error)
@@ -55,40 +54,64 @@ type APIInterface interface {
 	SendHeartBeat(ctx context.Context, options *SendHeartBeatOptions) (err error)
 	WatchWorkspaceImageBuildLogs(ctx context.Context, workspaceID string) (err error)
 	IsPrebuildDone(ctx context.Context, pwsid string) (res bool, err error)
-	SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration *WorkspaceTimeoutDuration) (res *SetWorkspaceTimeoutResult, err error)
+	SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration time.Duration) (res *SetWorkspaceTimeoutResult, err error)
 	GetWorkspaceTimeout(ctx context.Context, workspaceID string) (res *GetWorkspaceTimeoutResult, err error)
 	GetOpenPorts(ctx context.Context, workspaceID string) (res []*WorkspaceInstancePort, err error)
 	OpenPort(ctx context.Context, workspaceID string, port *WorkspaceInstancePort) (res *WorkspaceInstancePort, err error)
 	ClosePort(ctx context.Context, workspaceID string, port float32) (err error)
-	GetUserStorageResource(ctx context.Context, options *GetUserStorageResourceOptions) (res string, err error)
-	UpdateUserStorageResource(ctx context.Context, options *UpdateUserStorageResourceOptions) (err error)
-	GetEnvVars(ctx context.Context) (res []*UserEnvVarValue, err error)
+	UpdateGitStatus(ctx context.Context, workspaceID string, status *WorkspaceInstanceRepoStatus) (err error)
+	GetWorkspaceEnvVars(ctx context.Context, workspaceID string) (res []*EnvVar, err error)
 	SetEnvVar(ctx context.Context, variable *UserEnvVarValue) (err error)
 	DeleteEnvVar(ctx context.Context, variable *UserEnvVarValue) (err error)
-	GetContentBlobUploadURL(ctx context.Context, name string) (url string, err error)
-	GetContentBlobDownloadURL(ctx context.Context, name string) (url string, err error)
+	HasSSHPublicKey(ctx context.Context) (res bool, err error)
+	GetSSHPublicKeys(ctx context.Context) (res []*UserSSHPublicKeyValue, err error)
+	AddSSHPublicKey(ctx context.Context, value *SSHPublicKeyValue) (res *UserSSHPublicKeyValue, err error)
+	DeleteSSHPublicKey(ctx context.Context, id string) (err error)
 	GetGitpodTokens(ctx context.Context) (res []*APIToken, err error)
 	GenerateNewGitpodToken(ctx context.Context, options *GenerateNewGitpodTokenOptions) (res string, err error)
 	DeleteGitpodToken(ctx context.Context, tokenHash string) (err error)
-	SendFeedback(ctx context.Context, feedback string) (res string, err error)
 	RegisterGithubApp(ctx context.Context, installationID string) (err error)
 	TakeSnapshot(ctx context.Context, options *TakeSnapshotOptions) (res string, err error)
+	WaitForSnapshot(ctx context.Context, snapshotId string) (err error)
 	GetSnapshots(ctx context.Context, workspaceID string) (res []*string, err error)
-	StoreLayout(ctx context.Context, workspaceID string, layoutData string) (err error)
-	GetLayout(ctx context.Context, workspaceID string) (res string, err error)
-	PreparePluginUpload(ctx context.Context, params *PreparePluginUploadParams) (res string, err error)
-	ResolvePlugins(ctx context.Context, workspaceID string, params *ResolvePluginsParams) (res *ResolvedPlugins, err error)
-	InstallUserPlugins(ctx context.Context, params *InstallPluginsParams) (res bool, err error)
-	UninstallUserPlugin(ctx context.Context, params *UninstallPluginParams) (res bool, err error)
 	GuessGitTokenScopes(ctx context.Context, params *GuessGitTokenScopesParams) (res *GuessedGitTokenScopes, err error)
+	TrackEvent(ctx context.Context, event *RemoteTrackMessage) (err error)
+	GetSupportedWorkspaceClasses(ctx context.Context) (res []*SupportedWorkspaceClass, err error)
 
-	InstanceUpdates(ctx context.Context, instanceID string) (<-chan *WorkspaceInstance, error)
+	// Teams
+	GetTeam(ctx context.Context, teamID string) (*Team, error)
+	GetTeams(ctx context.Context) ([]*Team, error)
+	CreateTeam(ctx context.Context, teamName string) (*Team, error)
+	DeleteTeam(ctx context.Context, teamID string) error
+	GetTeamMembers(ctx context.Context, teamID string) ([]*TeamMemberInfo, error)
+	JoinTeam(ctx context.Context, teamID string) (*Team, error)
+	GetGenericInvite(ctx context.Context, teamID string) (*TeamMembershipInvite, error)
+	ResetGenericInvite(ctx context.Context, teamID string) (*TeamMembershipInvite, error)
+	SetTeamMemberRole(ctx context.Context, teamID, userID string, role TeamMemberRole) error
+	RemoveTeamMember(ctx context.Context, teamID, userID string) error
+
+	// Organization
+	GetOrgSettings(ctx context.Context, orgID string) (*OrganizationSettings, error)
+
+	GetDefaultWorkspaceImage(ctx context.Context, params *GetDefaultWorkspaceImageParams) (res *GetDefaultWorkspaceImageResult, err error)
+
+	// Projects
+	CreateProject(ctx context.Context, options *CreateProjectOptions) (*Project, error)
+	DeleteProject(ctx context.Context, projectID string) error
+	GetTeamProjects(ctx context.Context, teamID string) ([]*Project, error)
+
+	WorkspaceUpdates(ctx context.Context, workspaceID string) (<-chan *WorkspaceInstance, error)
+
+	// GetIDToken doesn't actually do anything, it just authorises
+	GetIDToken(ctx context.Context) (err error)
 }
 
 // FunctionName is the name of an RPC function
 type FunctionName string
 
 const (
+	// FunctionGetOwnerToken is the name of the getOwnerToken function
+	FunctionGetOwnerToken FunctionName = "getOwnerToken"
 	// FunctionAdminBlockUser is the name of the adminBlockUser function
 	FunctionAdminBlockUser FunctionName = "adminBlockUser"
 	// FunctionGetLoggedInUser is the name of the getLoggedInUser function
@@ -103,32 +126,26 @@ const (
 	FunctionUpdateOwnAuthProvider FunctionName = "updateOwnAuthProvider"
 	// FunctionDeleteOwnAuthProvider is the name of the deleteOwnAuthProvider function
 	FunctionDeleteOwnAuthProvider FunctionName = "deleteOwnAuthProvider"
-	// FunctionGetBranding is the name of the getBranding function
-	FunctionGetBranding FunctionName = "getBranding"
 	// FunctionGetConfiguration is the name of the getConfiguration function
 	FunctionGetConfiguration FunctionName = "getConfiguration"
 	// FunctionGetGitpodTokenScopes is the name of the GetGitpodTokenScopes function
 	FunctionGetGitpodTokenScopes FunctionName = "getGitpodTokenScopes"
 	// FunctionGetToken is the name of the getToken function
 	FunctionGetToken FunctionName = "getToken"
-	// FunctionGetPortAuthenticationToken is the name of the getPortAuthenticationToken function
-	FunctionGetPortAuthenticationToken FunctionName = "getPortAuthenticationToken"
 	// FunctionDeleteAccount is the name of the deleteAccount function
 	FunctionDeleteAccount FunctionName = "deleteAccount"
 	// FunctionGetClientRegion is the name of the getClientRegion function
 	FunctionGetClientRegion FunctionName = "getClientRegion"
-	// FunctionHasPermission is the name of the hasPermission function
-	FunctionHasPermission FunctionName = "hasPermission"
 	// FunctionGetWorkspaces is the name of the getWorkspaces function
 	FunctionGetWorkspaces FunctionName = "getWorkspaces"
 	// FunctionGetWorkspaceOwner is the name of the getWorkspaceOwner function
 	FunctionGetWorkspaceOwner FunctionName = "getWorkspaceOwner"
 	// FunctionGetWorkspaceUsers is the name of the getWorkspaceUsers function
 	FunctionGetWorkspaceUsers FunctionName = "getWorkspaceUsers"
-	// FunctionGetFeaturedRepositories is the name of the getFeaturedRepositories function
-	FunctionGetFeaturedRepositories FunctionName = "getFeaturedRepositories"
 	// FunctionGetWorkspace is the name of the getWorkspace function
 	FunctionGetWorkspace FunctionName = "getWorkspace"
+	// FunctionGetIDEOptions is the name of the getIDEOptions function
+	FunctionGetIDEOptions FunctionName = "getIDEOptions"
 	// FunctionIsWorkspaceOwner is the name of the isWorkspaceOwner function
 	FunctionIsWorkspaceOwner FunctionName = "isWorkspaceOwner"
 	// FunctionCreateWorkspace is the name of the createWorkspace function
@@ -161,51 +178,75 @@ const (
 	FunctionOpenPort FunctionName = "openPort"
 	// FunctionClosePort is the name of the closePort function
 	FunctionClosePort FunctionName = "closePort"
-	// FunctionGetUserStorageResource is the name of the getUserStorageResource function
-	FunctionGetUserStorageResource FunctionName = "getUserStorageResource"
-	// FunctionUpdateUserStorageResource is the name of the updateUserStorageResource function
-	FunctionUpdateUserStorageResource FunctionName = "updateUserStorageResource"
-	// FunctionGetEnvVars is the name of the getEnvVars function
-	FunctionGetEnvVars FunctionName = "getEnvVars"
 	// FunctionSetEnvVar is the name of the setEnvVar function
 	FunctionSetEnvVar FunctionName = "setEnvVar"
 	// FunctionDeleteEnvVar is the name of the deleteEnvVar function
 	FunctionDeleteEnvVar FunctionName = "deleteEnvVar"
-	// FunctionGetContentBlobUploadURL is the name fo the getContentBlobUploadUrl function
-	FunctionGetContentBlobUploadURL FunctionName = "getContentBlobUploadUrl"
-	// FunctionGetContentBlobDownloadURL is the name fo the getContentBlobDownloadUrl function
-	FunctionGetContentBlobDownloadURL FunctionName = "getContentBlobDownloadUrl"
+	// FunctionHasSSHPublicKey is the name of the hasSSHPublicKey function
+	FunctionHasSSHPublicKey FunctionName = "hasSSHPublicKey"
+	// FunctionGetSSHPublicKeys is the name of the getSSHPublicKeys function
+	FunctionGetSSHPublicKeys FunctionName = "getSSHPublicKeys"
+	// FunctionAddSSHPublicKey is the name of the addSSHPublicKey function
+	FunctionAddSSHPublicKey FunctionName = "addSSHPublicKey"
+	// FunctionDeleteSSHPublicKey is the name of the deleteSSHPublicKey function
+	FunctionDeleteSSHPublicKey FunctionName = "deleteSSHPublicKey"
 	// FunctionGetGitpodTokens is the name of the getGitpodTokens function
 	FunctionGetGitpodTokens FunctionName = "getGitpodTokens"
 	// FunctionGenerateNewGitpodToken is the name of the generateNewGitpodToken function
 	FunctionGenerateNewGitpodToken FunctionName = "generateNewGitpodToken"
 	// FunctionDeleteGitpodToken is the name of the deleteGitpodToken function
 	FunctionDeleteGitpodToken FunctionName = "deleteGitpodToken"
-	// FunctionSendFeedback is the name of the sendFeedback function
-	FunctionSendFeedback FunctionName = "sendFeedback"
 	// FunctionRegisterGithubApp is the name of the registerGithubApp function
 	FunctionRegisterGithubApp FunctionName = "registerGithubApp"
 	// FunctionTakeSnapshot is the name of the takeSnapshot function
 	FunctionTakeSnapshot FunctionName = "takeSnapshot"
 	// FunctionGetSnapshots is the name of the getSnapshots function
 	FunctionGetSnapshots FunctionName = "getSnapshots"
-	// FunctionStoreLayout is the name of the storeLayout function
-	FunctionStoreLayout FunctionName = "storeLayout"
-	// FunctionGetLayout is the name of the getLayout function
-	FunctionGetLayout FunctionName = "getLayout"
-	// FunctionPreparePluginUpload is the name of the preparePluginUpload function
-	FunctionPreparePluginUpload FunctionName = "preparePluginUpload"
-	// FunctionResolvePlugins is the name of the resolvePlugins function
-	FunctionResolvePlugins FunctionName = "resolvePlugins"
-	// FunctionInstallUserPlugins is the name of the installUserPlugins function
-	FunctionInstallUserPlugins FunctionName = "installUserPlugins"
-	// FunctionUninstallUserPlugin is the name of the uninstallUserPlugin function
-	FunctionUninstallUserPlugin FunctionName = "uninstallUserPlugin"
 	// FunctionGuessGitTokenScopes is the name of the guessGitTokenScopes function
 	FunctionGuessGitTokenScope FunctionName = "guessGitTokenScopes"
+	// FunctionTrackEvent is the name of the trackEvent function
+	FunctionTrackEvent FunctionName = "trackEvent"
+	// FunctionGetSupportedWorkspaceClasses is the name of the getSupportedWorkspaceClasses function
+	FunctionGetSupportedWorkspaceClasses FunctionName = "getSupportedWorkspaceClasses"
+
+	// Teams
+	// FunctionGetTeam is the name of the getTeam function
+	FunctionGetTeam FunctionName = "getTeam"
+	// FunctionGetTeams is the name of the getTeams function
+	FunctionGetTeams FunctionName = "getTeams"
+	// FunctionCreateTeam is the name of the createTeam function
+	FunctionCreateTeam FunctionName = "createTeam"
+	// FunctionJoinTeam is the name of the joinTeam function
+	FunctionJoinTeam FunctionName = "joinTeam"
+	// FunctionGetTeamMembers is the name of the getTeamMembers function
+	FunctionGetTeamMembers FunctionName = "getTeamMembers"
+	// FunctionGetGenericInvite is the name of the getGenericInvite function
+	FunctionGetGenericInvite FunctionName = "getGenericInvite"
+	// FunctionResetGenericInvite is the name of the resetGenericInvite function
+	FunctionResetGenericInvite FunctionName = "resetGenericInvite"
+	// FunctionSetTeamMemberRole is the name of the setTeamMemberRole function
+	FunctionSetTeamMemberRole FunctionName = "setTeamMemberRole"
+	// FunctionRemoveTeamMember is the name of the removeTeamMember function
+	FunctionRemoveTeamMember FunctionName = "removeTeamMember"
+	// FunctionDeleteTeam is the name of the deleteTeam function
+	FunctionDeleteTeam FunctionName = "deleteTeam"
+
+	// Organizations
+	// FunctionGetOrgSettings is the name of the getOrgSettings function
+	FunctionGetOrgSettings FunctionName = "getOrgSettings"
+
+	// FunctionGetDefaultWorkspaceImage is the name of the getDefaultWorkspaceImage function
+	FunctionGetDefaultWorkspaceImage FunctionName = "getDefaultWorkspaceImage"
+
+	// Projects
+	FunctionCreateProject   FunctionName = "createProject"
+	FunctionDeleteProject   FunctionName = "deleteProject"
+	FunctionGetTeamProjects FunctionName = "getTeamProjects"
 
 	// FunctionOnInstanceUpdate is the name of the onInstanceUpdate callback function
 	FunctionOnInstanceUpdate = "onInstanceUpdate"
+
+	FunctionGetIDToken FunctionName = "getIDToken"
 )
 
 var errNotConnected = errors.New("not connected to Gitpod server")
@@ -214,9 +255,12 @@ var errNotConnected = errors.New("not connected to Gitpod server")
 type ConnectToServerOpts struct {
 	Context             context.Context
 	Token               string
+	Cookie              string
+	Origin              string
 	Log                 *logrus.Entry
 	ReconnectionHandler func()
 	CloseHandler        func(error)
+	ExtraHeaders        map[string]string
 }
 
 // ConnectToServer establishes a new websocket connection to the server
@@ -225,24 +269,20 @@ func ConnectToServer(endpoint string, opts ConnectToServerOpts) (*APIoverJSONRPC
 		opts.Context = context.Background()
 	}
 
-	epURL, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, xerrors.Errorf("invalid endpoint URL: %w", err)
-	}
-
-	var protocol string
-	if epURL.Scheme == "wss:" {
-		protocol = "https"
-	} else {
-		protocol = "http"
-	}
-	origin := fmt.Sprintf("%s://%s/", protocol, epURL.Hostname())
-
 	reqHeader := http.Header{}
-	reqHeader.Set("Origin", origin)
+	reqHeader.Set("Origin", opts.Origin)
+
+	for k, v := range opts.ExtraHeaders {
+		reqHeader.Set(k, v)
+	}
 	if opts.Token != "" {
 		reqHeader.Set("Authorization", "Bearer "+opts.Token)
 	}
+
+	if opts.Cookie != "" {
+		reqHeader.Set("Cookie", opts.Cookie)
+	}
+
 	ws := NewReconnectingWebsocket(endpoint, reqHeader, opts.Log)
 	ws.ReconnectionHandler = opts.ReconnectionHandler
 	go func() {
@@ -263,8 +303,8 @@ type APIoverJSONRPC struct {
 	C   jsonrpc2.JSONRPC2
 	log *logrus.Entry
 
-	mu   sync.RWMutex
-	subs map[string]map[chan *WorkspaceInstance]struct{}
+	mu            sync.RWMutex
+	workspaceSubs map[string]map[chan *WorkspaceInstance]struct{}
 }
 
 // Close closes the connection
@@ -280,22 +320,21 @@ func (gp *APIoverJSONRPC) Close() (err error) {
 	return nil
 }
 
-// InstanceUpdates subscribes to workspace instance updates until the context is canceled or the workspace
-// instance is stopped.
-func (gp *APIoverJSONRPC) InstanceUpdates(ctx context.Context, instanceID string) (<-chan *WorkspaceInstance, error) {
+// WorkspaceUpdates subscribes to workspace instance updates until the context is canceled
+func (gp *APIoverJSONRPC) WorkspaceUpdates(ctx context.Context, workspaceID string) (<-chan *WorkspaceInstance, error) {
 	if gp == nil {
 		return nil, errNotConnected
 	}
 	chn := make(chan *WorkspaceInstance)
 
 	gp.mu.Lock()
-	if gp.subs == nil {
-		gp.subs = make(map[string]map[chan *WorkspaceInstance]struct{})
+	if gp.workspaceSubs == nil {
+		gp.workspaceSubs = make(map[string]map[chan *WorkspaceInstance]struct{})
 	}
-	if sub, ok := gp.subs[instanceID]; ok {
+	if sub, ok := gp.workspaceSubs[workspaceID]; ok {
 		sub[chn] = struct{}{}
 	} else {
-		gp.subs[instanceID] = map[chan *WorkspaceInstance]struct{}{chn: {}}
+		gp.workspaceSubs[workspaceID] = map[chan *WorkspaceInstance]struct{}{chn: {}}
 	}
 	gp.mu.Unlock()
 
@@ -303,7 +342,7 @@ func (gp *APIoverJSONRPC) InstanceUpdates(ctx context.Context, instanceID string
 		<-ctx.Done()
 
 		gp.mu.Lock()
-		delete(gp.subs[instanceID], chn)
+		delete(gp.workspaceSubs[workspaceID], chn)
 		close(chn)
 		gp.mu.Unlock()
 	}()
@@ -329,19 +368,36 @@ func (gp *APIoverJSONRPC) handler(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	gp.mu.RLock()
 	defer gp.mu.RUnlock()
-	for chn := range gp.subs[instance.ID] {
+	for chn := range gp.workspaceSubs[instance.WorkspaceID] {
 		select {
 		case chn <- &instance:
 		default:
 		}
 	}
-	for chn := range gp.subs[""] {
+	for chn := range gp.workspaceSubs[""] {
 		select {
 		case chn <- &instance:
 		default:
 		}
 	}
 
+	return
+}
+
+func (gp *APIoverJSONRPC) GetOwnerToken(ctx context.Context, workspaceID string) (res string, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+	_params = append(_params, workspaceID)
+
+	var _result string
+	err = gp.C.Call(ctx, "getOwnerToken", _params, &_result)
+	if err != nil {
+		return "", err
+	}
+	res = _result
 	return
 }
 
@@ -356,6 +412,23 @@ func (gp *APIoverJSONRPC) AdminBlockUser(ctx context.Context, message *AdminBloc
 
 	var _result interface{}
 	err = gp.C.Call(ctx, "adminBlockUser", _params, &_result)
+	if err != nil {
+		return err
+	}
+	return
+}
+
+// AdminVerifyUser calls adminVerifyUser on the server
+func (gp *APIoverJSONRPC) AdminVerifyUser(ctx context.Context, userId string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+	_params = append(_params, userId)
+
+	var _result interface{}
+	err = gp.C.Call(ctx, "adminVerifyUser", _params, &_result)
 	if err != nil {
 		return err
 	}
@@ -472,24 +545,6 @@ func (gp *APIoverJSONRPC) DeleteOwnAuthProvider(ctx context.Context, params *Del
 	return
 }
 
-// GetBranding calls getBranding on the server
-func (gp *APIoverJSONRPC) GetBranding(ctx context.Context) (res *Branding, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	var result Branding
-	err = gp.C.Call(ctx, "getBranding", _params, &result)
-	if err != nil {
-		return
-	}
-	res = &result
-
-	return
-}
-
 // GetConfiguration calls getConfiguration on the server
 func (gp *APIoverJSONRPC) GetConfiguration(ctx context.Context) (res *Configuration, err error) {
 	if gp == nil {
@@ -548,26 +603,6 @@ func (gp *APIoverJSONRPC) GetToken(ctx context.Context, query *GetTokenSearchOpt
 	return
 }
 
-// GetPortAuthenticationToken calls getPortAuthenticationToken on the server
-func (gp *APIoverJSONRPC) GetPortAuthenticationToken(ctx context.Context, workspaceID string) (res *Token, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, workspaceID)
-
-	var result Token
-	err = gp.C.Call(ctx, "getPortAuthenticationToken", _params, &result)
-	if err != nil {
-		return
-	}
-	res = &result
-
-	return
-}
-
 // DeleteAccount calls deleteAccount on the server
 func (gp *APIoverJSONRPC) DeleteAccount(ctx context.Context) (err error) {
 	if gp == nil {
@@ -594,26 +629,6 @@ func (gp *APIoverJSONRPC) GetClientRegion(ctx context.Context) (res string, err 
 
 	var result string
 	err = gp.C.Call(ctx, "getClientRegion", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// HasPermission calls hasPermission on the server
-func (gp *APIoverJSONRPC) HasPermission(ctx context.Context, permission *PermissionName) (res bool, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, permission)
-
-	var result bool
-	err = gp.C.Call(ctx, "hasPermission", _params, &result)
 	if err != nil {
 		return
 	}
@@ -682,24 +697,6 @@ func (gp *APIoverJSONRPC) GetWorkspaceUsers(ctx context.Context, workspaceID str
 	return
 }
 
-// GetFeaturedRepositories calls getFeaturedRepositories on the server
-func (gp *APIoverJSONRPC) GetFeaturedRepositories(ctx context.Context) (res []*WhitelistedRepository, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	var result []*WhitelistedRepository
-	err = gp.C.Call(ctx, "getFeaturedRepositories", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
 // GetWorkspace calls getWorkspace on the server
 func (gp *APIoverJSONRPC) GetWorkspace(ctx context.Context, id string) (res *WorkspaceInfo, err error) {
 	if gp == nil {
@@ -715,6 +712,25 @@ func (gp *APIoverJSONRPC) GetWorkspace(ctx context.Context, id string) (res *Wor
 	if err != nil {
 		return
 	}
+	res = &result
+
+	return
+}
+
+// GetIDEOptions calls getIDEOptions on the server
+func (gp *APIoverJSONRPC) GetIDEOptions(ctx context.Context) (res *IDEOptions, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	var result IDEOptions
+	err = gp.C.Call(ctx, "getIDEOptions", _params, &result)
+	if err != nil {
+		return
+	}
+
 	res = &result
 
 	return
@@ -894,7 +910,7 @@ func (gp *APIoverJSONRPC) IsPrebuildDone(ctx context.Context, pwsid string) (res
 }
 
 // SetWorkspaceTimeout calls setWorkspaceTimeout on the server
-func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration *WorkspaceTimeoutDuration) (res *SetWorkspaceTimeoutResult, err error) {
+func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration time.Duration) (res *SetWorkspaceTimeoutResult, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
@@ -902,7 +918,7 @@ func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID s
 	var _params []interface{}
 
 	_params = append(_params, workspaceID)
-	_params = append(_params, duration)
+	_params = append(_params, fmt.Sprintf("%dm", int(duration.Minutes())))
 
 	var result SetWorkspaceTimeoutResult
 	err = gp.C.Call(ctx, "setWorkspaceTimeout", _params, &result)
@@ -1031,37 +1047,17 @@ func (gp *APIoverJSONRPC) ClosePort(ctx context.Context, workspaceID string, por
 	return
 }
 
-// GetUserStorageResource calls getUserStorageResource on the server
-func (gp *APIoverJSONRPC) GetUserStorageResource(ctx context.Context, options *GetUserStorageResourceOptions) (res string, err error) {
+// UpdateGitStatus calls UpdateGitStatus on the server
+func (gp *APIoverJSONRPC) UpdateGitStatus(ctx context.Context, workspaceID string, status *WorkspaceInstanceRepoStatus) (err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
 	}
 	var _params []interface{}
+	_params = append(_params, workspaceID)
+	_params = append(_params, status)
 
-	_params = append(_params, options)
-
-	var result string
-	err = gp.C.Call(ctx, "getUserStorageResource", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// UpdateUserStorageResource calls updateUserStorageResource on the server
-func (gp *APIoverJSONRPC) UpdateUserStorageResource(ctx context.Context, options *UpdateUserStorageResourceOptions) (err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, options)
-
-	err = gp.C.Call(ctx, "updateUserStorageResource", _params, nil)
+	err = gp.C.Call(ctx, "updateGitStatus", _params, nil)
 	if err != nil {
 		return
 	}
@@ -1069,16 +1065,18 @@ func (gp *APIoverJSONRPC) UpdateUserStorageResource(ctx context.Context, options
 	return
 }
 
-// GetEnvVars calls getEnvVars on the server
-func (gp *APIoverJSONRPC) GetEnvVars(ctx context.Context) (res []*UserEnvVarValue, err error) {
+// GetWorkspaceEnvVars calls GetWorkspaceEnvVars on the server
+func (gp *APIoverJSONRPC) GetWorkspaceEnvVars(ctx context.Context, workspaceID string) (res []*EnvVar, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
 	}
 	var _params []interface{}
 
-	var result []*UserEnvVarValue
-	err = gp.C.Call(ctx, "getEnvVars", _params, &result)
+	_params = append(_params, workspaceID)
+
+	var result []*EnvVar
+	err = gp.C.Call(ctx, "getWorkspaceEnvVars", _params, &result)
 	if err != nil {
 		return
 	}
@@ -1123,43 +1121,47 @@ func (gp *APIoverJSONRPC) DeleteEnvVar(ctx context.Context, variable *UserEnvVar
 	return
 }
 
-// GetContentBlobUploadURL calls getContentBlobUploadUrl on the server
-func (gp *APIoverJSONRPC) GetContentBlobUploadURL(ctx context.Context, name string) (url string, err error) {
+// HasSSHPublicKey calls hasSSHPublicKey on the server
+func (gp *APIoverJSONRPC) HasSSHPublicKey(ctx context.Context) (res bool, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
 	}
 	var _params []interface{}
-
-	_params = append(_params, name)
-
-	var result string
-	err = gp.C.Call(ctx, string(FunctionGetContentBlobUploadURL), _params, &result)
-	if err != nil {
-		return
-	}
-	url = result
-
+	err = gp.C.Call(ctx, "hasSSHPublicKey", _params, &res)
 	return
 }
 
-// GetContentBlobDownloadURL calls getContentBlobDownloadUrl on the server
-func (gp *APIoverJSONRPC) GetContentBlobDownloadURL(ctx context.Context, name string) (url string, err error) {
+// GetSSHPublicKeys calls getSSHPublicKeys on the server
+func (gp *APIoverJSONRPC) GetSSHPublicKeys(ctx context.Context) (res []*UserSSHPublicKeyValue, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
 	}
 	var _params []interface{}
+	err = gp.C.Call(ctx, "getSSHPublicKeys", _params, &res)
+	return
+}
 
-	_params = append(_params, name)
-
-	var result string
-	err = gp.C.Call(ctx, string(FunctionGetContentBlobDownloadURL), _params, &result)
-	if err != nil {
+// AddSSHPublicKey calls addSSHPublicKey on the server
+func (gp *APIoverJSONRPC) AddSSHPublicKey(ctx context.Context, value *SSHPublicKeyValue) (res *UserSSHPublicKeyValue, err error) {
+	if gp == nil {
+		err = errNotConnected
 		return
 	}
-	url = result
+	_params := []interface{}{value}
+	err = gp.C.Call(ctx, "addSSHPublicKey", _params, &res)
+	return
+}
 
+// DeleteSSHPublicKey calls deleteSSHPublicKey on the server
+func (gp *APIoverJSONRPC) DeleteSSHPublicKey(ctx context.Context, id string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{id}
+	err = gp.C.Call(ctx, "deleteSSHPublicKey", _params, nil)
 	return
 }
 
@@ -1219,26 +1221,6 @@ func (gp *APIoverJSONRPC) DeleteGitpodToken(ctx context.Context, tokenHash strin
 	return
 }
 
-// SendFeedback calls sendFeedback on the server
-func (gp *APIoverJSONRPC) SendFeedback(ctx context.Context, feedback string) (res string, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, feedback)
-
-	var result string
-	err = gp.C.Call(ctx, "sendFeedback", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
 // RegisterGithubApp calls registerGithubApp on the server
 func (gp *APIoverJSONRPC) RegisterGithubApp(ctx context.Context, installationID string) (err error) {
 	if gp == nil {
@@ -1277,6 +1259,21 @@ func (gp *APIoverJSONRPC) TakeSnapshot(ctx context.Context, options *TakeSnapsho
 	return
 }
 
+// WaitForSnapshot calls waitForSnapshot on the server
+func (gp *APIoverJSONRPC) WaitForSnapshot(ctx context.Context, snapshotId string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	_params = append(_params, snapshotId)
+
+	var result string
+	err = gp.C.Call(ctx, "waitForSnapshot", _params, &result)
+	return
+}
+
 // GetSnapshots calls getSnapshots on the server
 func (gp *APIoverJSONRPC) GetSnapshots(ctx context.Context, workspaceID string) (res []*string, err error) {
 	if gp == nil {
@@ -1289,126 +1286,6 @@ func (gp *APIoverJSONRPC) GetSnapshots(ctx context.Context, workspaceID string) 
 
 	var result []*string
 	err = gp.C.Call(ctx, "getSnapshots", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// StoreLayout calls storeLayout on the server
-func (gp *APIoverJSONRPC) StoreLayout(ctx context.Context, workspaceID string, layoutData string) (err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, workspaceID)
-	_params = append(_params, layoutData)
-
-	err = gp.C.Call(ctx, "storeLayout", _params, nil)
-	if err != nil {
-		return
-	}
-
-	return
-}
-
-// GetLayout calls getLayout on the server
-func (gp *APIoverJSONRPC) GetLayout(ctx context.Context, workspaceID string) (res string, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, workspaceID)
-
-	var result string
-	err = gp.C.Call(ctx, "getLayout", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// PreparePluginUpload calls preparePluginUpload on the server
-func (gp *APIoverJSONRPC) PreparePluginUpload(ctx context.Context, params *PreparePluginUploadParams) (res string, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result string
-	err = gp.C.Call(ctx, "preparePluginUpload", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// ResolvePlugins calls resolvePlugins on the server
-func (gp *APIoverJSONRPC) ResolvePlugins(ctx context.Context, workspaceID string, params *ResolvePluginsParams) (res *ResolvedPlugins, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, workspaceID)
-	_params = append(_params, params)
-
-	var result ResolvedPlugins
-	err = gp.C.Call(ctx, "resolvePlugins", _params, &result)
-	if err != nil {
-		return
-	}
-	res = &result
-
-	return
-}
-
-// InstallUserPlugins calls installUserPlugins on the server
-func (gp *APIoverJSONRPC) InstallUserPlugins(ctx context.Context, params *InstallPluginsParams) (res bool, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result bool
-	err = gp.C.Call(ctx, "installUserPlugins", _params, &result)
-	if err != nil {
-		return
-	}
-	res = result
-
-	return
-}
-
-// UninstallUserPlugin calls uninstallUserPlugin on the server
-func (gp *APIoverJSONRPC) UninstallUserPlugin(ctx context.Context, params *UninstallPluginParams) (res bool, err error) {
-	if gp == nil {
-		err = errNotConnected
-		return
-	}
-	var _params []interface{}
-
-	_params = append(_params, params)
-
-	var result bool
-	err = gp.C.Call(ctx, "uninstallUserPlugin", _params, &result)
 	if err != nil {
 		return
 	}
@@ -1437,24 +1314,202 @@ func (gp *APIoverJSONRPC) GuessGitTokenScopes(ctx context.Context, params *Guess
 	return
 }
 
+// TrackEvent calls trackEvent on the server
+func (gp *APIoverJSONRPC) TrackEvent(ctx context.Context, params *RemoteTrackMessage) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	_params = append(_params, params)
+	err = gp.C.Call(ctx, "trackEvent", _params, nil)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetSupportedWorkspaceClasses(ctx context.Context) (res []*SupportedWorkspaceClass, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{}
+	err = gp.C.Call(ctx, "getSupportedWorkspaceClasses", _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetTeam(ctx context.Context, teamID string) (res *Team, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionGetTeam), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetTeams(ctx context.Context) (res []*Team, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{}
+	err = gp.C.Call(ctx, string(FunctionGetTeams), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) CreateTeam(ctx context.Context, teamName string) (res *Team, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamName}
+	err = gp.C.Call(ctx, string(FunctionCreateTeam), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetTeamMembers(ctx context.Context, teamID string) (res []*TeamMemberInfo, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionGetTeamMembers), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) JoinTeam(ctx context.Context, inviteID string) (res *Team, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{inviteID}
+	err = gp.C.Call(ctx, string(FunctionJoinTeam), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetGenericInvite(ctx context.Context, teamID string) (res *TeamMembershipInvite, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionGetGenericInvite), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) ResetGenericInvite(ctx context.Context, teamID string) (res *TeamMembershipInvite, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionResetGenericInvite), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) SetTeamMemberRole(ctx context.Context, teamID, userID string, role TeamMemberRole) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID, userID, role}
+	err = gp.C.Call(ctx, string(FunctionSetTeamMemberRole), _params, nil)
+	return
+}
+
+func (gp *APIoverJSONRPC) RemoveTeamMember(ctx context.Context, teamID, userID string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID, userID}
+	err = gp.C.Call(ctx, string(FunctionRemoveTeamMember), _params, nil)
+	return
+}
+
+func (gp *APIoverJSONRPC) DeleteTeam(ctx context.Context, teamID string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionDeleteTeam), _params, nil)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetOrgSettings(ctx context.Context, orgID string) (res *OrganizationSettings, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{orgID}
+	err = gp.C.Call(ctx, string(FunctionGetOrgSettings), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetDefaultWorkspaceImage(ctx context.Context, params *GetDefaultWorkspaceImageParams) (res *GetDefaultWorkspaceImageResult, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	_params = append(_params, params)
+
+	err = gp.C.Call(ctx, string(FunctionGetDefaultWorkspaceImage), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) CreateProject(ctx context.Context, options *CreateProjectOptions) (res *Project, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{options}
+	err = gp.C.Call(ctx, string(FunctionCreateProject), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) DeleteProject(ctx context.Context, projectID string) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{projectID}
+	err = gp.C.Call(ctx, string(FunctionDeleteProject), _params, nil)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetTeamProjects(ctx context.Context, teamID string) (res []*Project, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{teamID}
+	err = gp.C.Call(ctx, string(FunctionGetTeamProjects), _params, &res)
+	return
+}
+
+func (gp *APIoverJSONRPC) GetIDToken(ctx context.Context) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{}
+	err = gp.C.Call(ctx, string(FunctionGetIDToken), _params, nil)
+	return
+}
+
 // PermissionName is the name of a permission
 type PermissionName string
 
 const (
-	// PermissionNameMonitor is the "monitor" permission
-	PermissionNameMonitor PermissionName = "monitor"
-	// PermissionNameEnforcement is the "enforcement" permission
-	PermissionNameEnforcement PermissionName = "enforcement"
-	// PermissionNamePrivilegedWs is the "privileged-ws" permission
-	PermissionNamePrivilegedWs PermissionName = "privileged-ws"
 	// PermissionNameRegistryAccess is the "registry-access" permission
 	PermissionNameRegistryAccess PermissionName = "registry-access"
 	// PermissionNameAdminUsers is the "admin-users" permission
 	PermissionNameAdminUsers PermissionName = "admin-users"
 	// PermissionNameAdminWorkspaces is the "admin-workspaces" permission
 	PermissionNameAdminWorkspaces PermissionName = "admin-workspaces"
-	// PermissionNameAdminAPI is the "admin-api" permission
-	PermissionNameAdminAPI PermissionName = "admin-api"
 )
 
 // AdmissionLevel is the admission level to a workspace
@@ -1479,33 +1534,17 @@ const (
 	PinActionToggle PinAction = "toggle"
 )
 
-// WorkspaceTimeoutDuration is the durations one have set for the workspace timeout
-type WorkspaceTimeoutDuration string
-
-const (
-	// WorkspaceTimeoutDuration30m sets "30m" as timeout duration
-	WorkspaceTimeoutDuration30m = "30m"
-	// WorkspaceTimeoutDuration60m sets "60m" as timeout duration
-	WorkspaceTimeoutDuration60m = "60m"
-	// WorkspaceTimeoutDuration180m sets "180m" as timeout duration
-	WorkspaceTimeoutDuration180m = "180m"
-)
-
 // UserInfo is the UserInfo message type
 type UserInfo struct {
 	Name string `json:"name,omitempty"`
 }
 
-// GetUserStorageResourceOptions is the GetUserStorageResourceOptions message type
-type GetUserStorageResourceOptions struct {
-	URI string `json:"uri,omitempty"`
-}
-
 // GetWorkspacesOptions is the GetWorkspacesOptions message type
 type GetWorkspacesOptions struct {
-	Limit        float64 `json:"limit,omitempty"`
-	PinnedOnly   bool    `json:"pinnedOnly,omitempty"`
-	SearchString string  `json:"searchString,omitempty"`
+	Limit          float64 `json:"limit,omitempty"`
+	SearchString   string  `json:"searchString,omitempty"`
+	PinnedOnly     bool    `json:"pinnedOnly,omitempty"`
+	OrganizationId string  `json:"organizationId,omitempty"`
 }
 
 // StartWorkspaceResult is the StartWorkspaceResult message type
@@ -1535,11 +1574,6 @@ type APIToken struct {
 
 	// The user the token belongs to.
 	User *User `json:"user,omitempty"`
-}
-
-// InstallPluginsParams is the InstallPluginsParams message type
-type InstallPluginsParams struct {
-	PluginIds []string `json:"pluginIds,omitempty"`
 }
 
 // OAuth2Config is the OAuth2Config message type
@@ -1598,19 +1632,9 @@ type Repository struct {
 
 // WorkspaceCreationResult is the WorkspaceCreationResult message type
 type WorkspaceCreationResult struct {
-	CreatedWorkspaceID         string                    `json:"createdWorkspaceId,omitempty"`
-	ExistingWorkspaces         []*WorkspaceInfo          `json:"existingWorkspaces,omitempty"`
-	RunningPrebuildWorkspaceID string                    `json:"runningPrebuildWorkspaceID,omitempty"`
-	RunningWorkspacePrebuild   *RunningWorkspacePrebuild `json:"runningWorkspacePrebuild,omitempty"`
-	WorkspaceURL               string                    `json:"workspaceURL,omitempty"`
-}
-
-// RunningWorkspacePrebuild is the RunningWorkspacePrebuild message type
-type RunningWorkspacePrebuild struct {
-	PrebuildID  string `json:"prebuildID,omitempty"`
-	SameCluster bool   `json:"sameCluster,omitempty"`
-	Starting    string `json:"starting,omitempty"`
-	WorkspaceID string `json:"workspaceID,omitempty"`
+	CreatedWorkspaceID string           `json:"createdWorkspaceId,omitempty"`
+	ExistingWorkspaces []*WorkspaceInfo `json:"existingWorkspaces,omitempty"`
+	WorkspaceURL       string           `json:"workspaceURL,omitempty"`
 }
 
 // Workspace is the Workspace message type
@@ -1639,10 +1663,11 @@ type Workspace struct {
 	// The source where to get the workspace base image from. This source is resolved
 	// during workspace creation. Once a base image has been built the information in here
 	// is superseded by baseImageNameResolved.
-	ImageSource interface{} `json:"imageSource,omitempty"`
-	OwnerID     string      `json:"ownerId,omitempty"`
-	Pinned      bool        `json:"pinned,omitempty"`
-	Shareable   bool        `json:"shareable,omitempty"`
+	ImageSource    interface{} `json:"imageSource,omitempty"`
+	OrganizationId string      `json:"organizationId,omitempty"`
+	OwnerID        string      `json:"ownerId,omitempty"`
+	Pinned         bool        `json:"pinned,omitempty"`
+	Shareable      bool        `json:"shareable,omitempty"`
 
 	// Mark as deleted (user-facing). The actual deletion of the workspace content is executed
 	// with a (configurable) delay
@@ -1670,7 +1695,6 @@ type WorkspaceConfig struct {
 	// Where the config object originates from.
 	//
 	// repo - from the repository
-	// definitely-gp - from github.com/gitpod-io/definitely-gp
 	// derived - computed based on analyzing the repository
 	// default - our static catch-all default config
 	Origin            string        `json:"_origin,omitempty"`
@@ -1686,6 +1710,10 @@ type WorkspaceContext struct {
 	ForceCreateNewWorkspace bool   `json:"forceCreateNewWorkspace,omitempty"`
 	NormalizedContextURL    string `json:"normalizedContextURL,omitempty"`
 	Title                   string `json:"title,omitempty"`
+
+	// Commit context
+	Repository *Repository `json:"repository,omitempty"`
+	Revision   string      `json:"revision,omitempty"`
 }
 
 // WorkspaceImageSourceDocker is the WorkspaceImageSourceDocker message type
@@ -1719,6 +1747,7 @@ type WorkspaceInstance struct {
 	Region         string                          `json:"region,omitempty"`
 	StartedTime    string                          `json:"startedTime,omitempty"`
 	Status         *WorkspaceInstanceStatus        `json:"status,omitempty"`
+	GitStatus      *WorkspaceInstanceRepoStatus    `json:"gitStatus,omitempty"`
 	StoppedTime    string                          `json:"stoppedTime,omitempty"`
 	WorkspaceID    string                          `json:"workspaceId,omitempty"`
 	WorkspaceImage string                          `json:"workspaceImage,omitempty"`
@@ -1731,14 +1760,21 @@ type WorkspaceInstanceConditions struct {
 	FirstUserActivity string `json:"firstUserActivity,omitempty"`
 	NeededImageBuild  bool   `json:"neededImageBuild,omitempty"`
 	PullingImages     bool   `json:"pullingImages,omitempty"`
-	ServiceExists     bool   `json:"serviceExists,omitempty"`
 	Timeout           string `json:"timeout,omitempty"`
 }
 
 // WorkspaceInstanceConfiguration is the WorkspaceInstanceConfiguration message type
 type WorkspaceInstanceConfiguration struct {
-	FeatureFlags []string `json:"featureFlags,omitempty"`
-	TheiaVersion string   `json:"theiaVersion,omitempty"`
+	FeatureFlags []string                    `json:"featureFlags,omitempty"`
+	TheiaVersion string                      `json:"theiaVersion,omitempty"`
+	IDEConfig    *WorkspaceInstanceIDEConfig `json:"ideConfig,omitempty"`
+}
+
+// WorkspaceInstanceIDEConfig is the ide config information of a workspace instance
+type WorkspaceInstanceIDEConfig struct {
+	UseLatest     bool   `json:"useLatest,omitempty"`
+	IDE           string `json:"ide,omitempty"`
+	PreferToolbox bool   `json:"preferToolbox,omitempty"`
 }
 
 // WorkspaceInstanceRepoStatus is the WorkspaceInstanceRepoStatus message type
@@ -1761,28 +1797,42 @@ type WorkspaceInstanceStatus struct {
 	NodeName     string                       `json:"nodeName,omitempty"`
 	OwnerToken   string                       `json:"ownerToken,omitempty"`
 	Phase        string                       `json:"phase,omitempty"`
-	Repo         *WorkspaceInstanceRepoStatus `json:"repo,omitempty"`
 	Timeout      string                       `json:"timeout,omitempty"`
+	Version      int                          `json:"version,omitempty"`
 }
 
 // StartWorkspaceOptions is the StartWorkspaceOptions message type
 type StartWorkspaceOptions struct {
-	ForceDefaultImage bool `json:"forceDefaultImage,omitempty"`
+	ForceDefaultImage bool         `json:"forceDefaultImage,omitempty"`
+	WorkspaceClass    string       `json:"workspaceClass,omitempty"`
+	IdeSettings       *IDESettings `json:"ideSettings,omitempty"`
+	Region            string       `json:"region,omitempty"`
 }
 
 // GetWorkspaceTimeoutResult is the GetWorkspaceTimeoutResult message type
 type GetWorkspaceTimeoutResult struct {
-	CanChange bool   `json:"canChange,omitempty"`
-	Duration  string `json:"duration,omitempty"`
+	CanChange             bool   `json:"canChange,omitempty"`
+	Duration              string `json:"duration,omitempty"`
+	HumanReadableDuration string `json:"humanReadableDuration,omitempty"`
 }
 
 // WorkspaceInstancePort is the WorkspaceInstancePort message type
 type WorkspaceInstancePort struct {
 	Port       float64 `json:"port,omitempty"`
-	TargetPort float64 `json:"targetPort,omitempty"`
 	URL        string  `json:"url,omitempty"`
 	Visibility string  `json:"visibility,omitempty"`
+	Protocol   string  `json:"protocol,omitempty"`
 }
+
+const (
+	PortVisibilityPublic  = "public"
+	PortVisibilityPrivate = "private"
+)
+
+const (
+	PortProtocolHTTP  = "http"
+	PortProtocolHTTPS = "https"
+)
 
 // GithubAppConfig is the GithubAppConfig message type
 type GithubAppConfig struct {
@@ -1792,7 +1842,7 @@ type GithubAppConfig struct {
 // GithubAppPrebuildConfig is the GithubAppPrebuildConfig message type
 type GithubAppPrebuildConfig struct {
 	AddBadge              bool        `json:"addBadge,omitempty"`
-	AddCheck              bool        `json:"addCheck,omitempty"`
+	AddCheck              interface{} `json:"addCheck,omitempty"`
 	AddComment            bool        `json:"addComment,omitempty"`
 	AddLabel              interface{} `json:"addLabel,omitempty"`
 	Branches              bool        `json:"branches,omitempty"`
@@ -1809,20 +1859,12 @@ type ImageConfigFile struct {
 
 // PortConfig is the PortConfig message type
 type PortConfig struct {
-	OnOpen     string  `json:"onOpen,omitempty"`
-	Port       float64 `json:"port,omitempty"`
-	Visibility string  `json:"visibility,omitempty"`
-}
-
-// ResolvedPlugins is the ResolvedPlugins message type
-type ResolvedPlugins struct {
-	AdditionalProperties map[string]*ResolvedPlugin `json:"-,omitempty"`
-}
-
-// ResolvePluginsParams is the ResolvePluginsParams message type
-type ResolvePluginsParams struct {
-	Builtins *ResolvedPlugins `json:"builtins,omitempty"`
-	Config   *WorkspaceConfig `json:"config,omitempty"`
+	OnOpen      string  `json:"onOpen,omitempty"`
+	Port        float64 `json:"port,omitempty"`
+	Visibility  string  `json:"visibility,omitempty"`
+	Description string  `json:"description,omitempty"`
+	Name        string  `json:"name,omitempty"`
+	Protocol    string  `json:"protocol,omitempty"`
 }
 
 // TaskConfig is the TaskConfig message type
@@ -1842,67 +1884,16 @@ type VSCodeConfig struct {
 	Extensions []string `json:"extensions,omitempty"`
 }
 
-// MarshalJSON marshals to JSON
-func (strct *ResolvedPlugins) MarshalJSON() ([]byte, error) {
-	buf := bytes.NewBuffer(make([]byte, 0))
-	buf.WriteString("{")
-	comma := false
-	// Marshal any additional Properties
-	for k, v := range strct.AdditionalProperties {
-		if comma {
-			buf.WriteString(",")
-		}
-		buf.WriteString(fmt.Sprintf("\"%s\":", k))
-		tmp, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-
-		buf.Write(tmp)
-		comma = true
-	}
-
-	buf.WriteString("}")
-	rv := buf.Bytes()
-	return rv, nil
-}
-
-// UnmarshalJSON marshals from JSON
-func (strct *ResolvedPlugins) UnmarshalJSON(b []byte) error {
-	var jsonMap map[string]json.RawMessage
-	if err := json.Unmarshal(b, &jsonMap); err != nil {
-		return err
-	}
-	// parse all the defined properties
-	for k, v := range jsonMap {
-		switch k {
-		default:
-			// an additional "*ResolvedPlugin" value
-			var additionalValue *ResolvedPlugin
-			if err := json.Unmarshal([]byte(v), &additionalValue); err != nil {
-				return err // invalid additionalProperty
-			}
-			if strct.AdditionalProperties == nil {
-				strct.AdditionalProperties = make(map[string]*ResolvedPlugin)
-			}
-			strct.AdditionalProperties[k] = additionalValue
-		}
-	}
-	return nil
-}
-
 // Configuration is the Configuration message type
 type Configuration struct {
-	DaysBeforeGarbageCollection float64 `json:"daysBeforeGarbageCollection,omitempty"`
-	GarbageCollectionStartDate  float64 `json:"garbageCollectionStartDate,omitempty"`
+	IsDedicatedInstallation bool `json:"isDedicatedInstallation,omitempty"`
 }
 
-// WhitelistedRepository is the WhitelistedRepository message type
-type WhitelistedRepository struct {
-	Avatar      string `json:"avatar,omitempty"`
-	Description string `json:"description,omitempty"`
-	Name        string `json:"name,omitempty"`
-	URL         string `json:"url,omitempty"`
+// EnvVar is the EnvVar message type
+type EnvVar struct {
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Value string `json:"value,omitempty"`
 }
 
 // UserEnvVarValue is the UserEnvVarValue message type
@@ -1911,6 +1902,20 @@ type UserEnvVarValue struct {
 	Name              string `json:"name,omitempty"`
 	RepositoryPattern string `json:"repositoryPattern,omitempty"`
 	Value             string `json:"value,omitempty"`
+}
+
+type SSHPublicKeyValue struct {
+	Name string `json:"name,omitempty"`
+	Key  string `json:"key,omitempty"`
+}
+
+type UserSSHPublicKeyValue struct {
+	ID           string `json:"id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	CreationTime string `json:"creationTime,omitempty"`
+	LastUsedTime string `json:"lastUsedTime,omitempty"`
 }
 
 // GenerateNewGitpodTokenOptions is the GenerateNewGitpodTokenOptions message type
@@ -1923,13 +1928,8 @@ type GenerateNewGitpodTokenOptions struct {
 
 // TakeSnapshotOptions is the TakeSnapshotOptions message type
 type TakeSnapshotOptions struct {
-	LayoutData  string `json:"layoutData,omitempty"`
 	WorkspaceID string `json:"workspaceId,omitempty"`
-}
-
-// PreparePluginUploadParams is the PreparePluginUploadParams message type
-type PreparePluginUploadParams struct {
-	FullPluginName string `json:"fullPluginName,omitempty"`
+	DontWait    bool   `json:"dontWait,omitempty"`
 }
 
 // AdminBlockUserRequest is the AdminBlockUserRequest message type
@@ -1965,23 +1965,14 @@ type UpdateOwnAuthProviderParams struct {
 
 // CreateWorkspaceOptions is the CreateWorkspaceOptions message type
 type CreateWorkspaceOptions struct {
-	ContextURL string `json:"contextUrl,omitempty"`
-	Mode       string `json:"mode,omitempty"`
-}
-
-// Root is the Root message type
-type Root map[string]*ResolvedPlugin
-
-// ResolvedPlugin is the ResolvedPlugin message type
-type ResolvedPlugin struct {
-	FullPluginName string `json:"fullPluginName,omitempty"`
-	Kind           string `json:"kind,omitempty"`
-	URL            string `json:"url,omitempty"`
-}
-
-// UninstallPluginParams is the UninstallPluginParams message type
-type UninstallPluginParams struct {
-	PluginID string `json:"pluginId,omitempty"`
+	StartWorkspaceOptions
+	ContextURL                         string `json:"contextUrl,omitempty"`
+	ProjectId                          string `json:"projectId,omitempty"`
+	OrganizationId                     string `json:"organizationId,omitempty"`
+	IgnoreRunningWorkspaceOnSameCommit bool   `json:"ignoreRunningWorkspaceOnSameCommit,omitempty"`
+	ForceDefaultConfig                 bool   `json:"forceDefaultConfig,omitempty"`
+	IgnoreRunningPrebuild              bool   `json:"ignoreRunningPrebuild,omitempty"`
+	AllowUsingPreviousPrebuilds        bool   `json:"allowUsingPreviousPrebuilds,omitempty"`
 }
 
 // DeleteOwnAuthProviderParams is the DeleteOwnAuthProviderParams message type
@@ -2009,47 +2000,19 @@ type GuessedGitTokenScopes struct {
 	Message string   `json:"message,omitempty"`
 }
 
-// BrandingLink is the BrandingLink message type
-type BrandingLink struct {
-	Name string `json:"name,omitempty"`
-	URL  string `json:"url,omitempty"`
+// SupportedWorkspaceClass is the GetSupportedWorkspaceClasses message type
+type SupportedWorkspaceClass struct {
+	ID          string `json:"id,omitempty"`
+	Category    string `json:"category,omitempty"`
+	DisplayName string `json:"displayName,omitempty"`
+	Description string `json:"description,omitempty"`
+	Powerups    int    `json:"powerups,omitempty"`
+	IsDefault   bool   `json:"isDefault,omitempty"`
 }
 
-// BrandingSocialLink is the BrandingSocialLink message type
-type BrandingSocialLink struct {
-	Type string `json:"type,omitempty"`
-	URL  string `json:"url,omitempty"`
-}
-
-// Ide is the Ide message type
-type Ide struct {
-	HelpMenu         []*BrandingLink `json:"helpMenu,omitempty"`
-	Logo             string          `json:"logo,omitempty"`
-	ShowReleaseNotes bool            `json:"showReleaseNotes,omitempty"`
-}
-
-// Links is the Links message type
-type Links struct {
-	Footer []*BrandingLink       `json:"footer,omitempty"`
-	Header []*BrandingLink       `json:"header,omitempty"`
-	Legal  []*BrandingLink       `json:"legal,omitempty"`
-	Social []*BrandingSocialLink `json:"social,omitempty"`
-}
-
-// Branding is the Branding message type
-type Branding struct {
-	Favicon  string `json:"favicon,omitempty"`
-	Homepage string `json:"homepage,omitempty"`
-	Ide      *Ide   `json:"ide,omitempty"`
-	Links    *Links `json:"links,omitempty"`
-
-	// Either including domain OR absolute path (interpreted relative to host URL)
-	Logo                          string `json:"logo,omitempty"`
-	Name                          string `json:"name,omitempty"`
-	RedirectURLAfterLogout        string `json:"redirectUrlAfterLogout,omitempty"`
-	RedirectURLIfNotAuthenticated string `json:"redirectUrlIfNotAuthenticated,omitempty"`
-	ShowProductivityTips          bool   `json:"showProductivityTips,omitempty"`
-	StartupLogo                   string `json:"startupLogo,omitempty"`
+type RemoteTrackMessage struct {
+	Event      string      `json:"event,omitempty"`
+	Properties interface{} `json:"properties,omitempty"`
 }
 
 // WorkspaceInstanceUser is the WorkspaceInstanceUser message type
@@ -2068,16 +2031,20 @@ type SendHeartBeatOptions struct {
 	WasClosed     bool    `json:"wasClosed,omitempty"`
 }
 
-// UpdateUserStorageResourceOptions is the UpdateUserStorageResourceOptions message type
-type UpdateUserStorageResourceOptions struct {
-	Content string `json:"content,omitempty"`
-	URI     string `json:"uri,omitempty"`
-}
-
 // AdditionalUserData is the AdditionalUserData message type
 type AdditionalUserData struct {
 	EmailNotificationSettings *EmailNotificationSettings `json:"emailNotificationSettings,omitempty"`
 	Platforms                 []*UserPlatform            `json:"platforms,omitempty"`
+	IdeSettings               *IDESettings               `json:"ideSettings,omitempty"`
+}
+
+// IDESettings is the IDESettings message type
+type IDESettings struct {
+	DefaultIde        string `json:"defaultIde,omitempty"`
+	UseDesktopIde     bool   `json:"useDesktopIde,omitempty"`
+	DefaultDesktopIde string `json:"defaultDesktopIde,omitempty"`
+	UseLatestVersion  bool   `json:"useLatestVersion"`
+	PreferToolbox     bool   `json:"preferToolbox"`
 }
 
 // EmailNotificationSettings is the EmailNotificationSettings message type
@@ -2092,10 +2059,11 @@ type Identity struct {
 	AuthProviderID string `json:"authProviderId,omitempty"`
 
 	// This is a flag that triggers the HARD DELETION of this entity
-	Deleted      bool     `json:"deleted,omitempty"`
-	PrimaryEmail string   `json:"primaryEmail,omitempty"`
-	Readonly     bool     `json:"readonly,omitempty"`
-	Tokens       []*Token `json:"tokens,omitempty"`
+	Deleted        bool     `json:"deleted,omitempty"`
+	PrimaryEmail   string   `json:"primaryEmail,omitempty"`
+	Readonly       bool     `json:"readonly,omitempty"`
+	Tokens         []*Token `json:"tokens,omitempty"`
+	LastSigninTime string   `json:"lastSigninTime,omitempty"`
 }
 
 // User is the User message type
@@ -2125,6 +2093,9 @@ type User struct {
 	MarkedDeleted bool   `json:"markedDeleted,omitempty"`
 	Name          string `json:"name,omitempty"`
 
+	// The ID of the Organization this user is owned by. If empty, the user is owned by the installation
+	OrganizationId string `json:"organizationId,omitempty"`
+
 	// whether this user can run workspaces in privileged mode
 	Privileged bool `json:"privileged,omitempty"`
 
@@ -2149,12 +2120,6 @@ type UserFeatureSettings struct {
 	// Permanent feature flags are added to each and every workspace instance
 	// this user starts.
 	PermanentWSFeatureFlags []string `json:"permanentWSFeatureFlags,omitempty"`
-
-	// This field is used as marker to grant users a free trial for using private repositories,
-	// independent of any subscription or Chargebee.
-	//   - it is set when the user uses their first private repo
-	//   - whether the trial is expired or not is juged by the UserService
-	PrivateRepoTrialStartDate string `json:"privateRepoTrialStartDate,omitempty"`
 }
 
 // UserPlatform is the UserPlatform message type
@@ -2206,6 +2171,7 @@ type GetTokenSearchOptions struct {
 // SetWorkspaceTimeoutResult is the SetWorkspaceTimeoutResult message type
 type SetWorkspaceTimeoutResult struct {
 	ResetTimeoutOnWorkspaces []string `json:"resetTimeoutOnWorkspaces,omitempty"`
+	HumanReadableDuration    string   `json:"humanReadableDuration,omitempty"`
 }
 
 // UserMessage is the UserMessage message type
@@ -2217,4 +2183,172 @@ type UserMessage struct {
 	ID    string `json:"id,omitempty"`
 	Title string `json:"title,omitempty"`
 	URL   string `json:"url,omitempty"`
+}
+
+type Team struct {
+	ID           string `json:"id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Slug         string `json:"slug,omitempty"`
+	CreationTime string `json:"creationTime,omitempty"`
+}
+
+type TeamMemberRole string
+
+const (
+	TeamMember_Owner  TeamMemberRole = "owner"
+	TeamMember_Member TeamMemberRole = "member"
+)
+
+type TeamMemberInfo struct {
+	UserId              string         `json:"userId,omitempty"`
+	FullName            string         `json:"fullName,omitempty"`
+	PrimaryEmail        string         `json:"primaryEmail,omitempty"`
+	AvatarUrl           string         `json:"avatarUrl,omitempty"`
+	Role                TeamMemberRole `json:"role,omitempty"`
+	MemberSince         string         `json:"memberSince,omitempty"`
+	OwnedByOrganization bool           `json:"ownedByOrganization,omitempty"`
+}
+
+type TeamMembershipInvite struct {
+	ID               string         `json:"id,omitempty"`
+	TeamID           string         `json:"teamId,omitempty"`
+	Role             TeamMemberRole `json:"role,omitempty"`
+	CreationTime     string         `json:"creationTime,omitempty"`
+	InvalidationTime string         `json:"invalidationTime,omitempty"`
+	InvitedEmail     string         `json:"invitedEmail,omitempty"`
+}
+
+type OrganizationSettings struct {
+	WorkspaceSharingDisabled bool   `json:"workspaceSharingDisabled,omitempty"`
+	DefaultWorkspaceImage    string `json:"defaultWorkspaceImage,omitempty"`
+}
+
+type Project struct {
+	ID                string           `json:"id,omitempty"`
+	UserID            string           `json:"userId,omitempty"`
+	TeamID            string           `json:"teamId,omitempty"`
+	Name              string           `json:"name,omitempty"`
+	Slug              string           `json:"slug,omitempty"`
+	CloneURL          string           `json:"cloneUrl,omitempty"`
+	AppInstallationID string           `json:"appInstallationId,omitempty"`
+	Settings          *ProjectSettings `json:"settings,omitempty"`
+	CreationTime      string           `json:"creationTime,omitempty"`
+}
+
+type ProjectSettings struct {
+	UsePersistentVolumeClaim   bool                      `json:"usePersistentVolumeClaim,omitempty"`
+	WorkspaceClasses           *WorkspaceClassesSettings `json:"workspaceClasses,omitempty"`
+	PrebuildSettings           *PrebuildSettings         `json:"prebuilds,omitempty"`
+	RestrictedWorkspaceClasses *[]string                 `json:"restrictedWorkspaceClasses,omitempty"`
+}
+type PrebuildSettings struct {
+	Enable                *bool   `json:"enable,omitempty"`
+	PrebuildInterval      *int32  `json:"prebuildInterval,omitempty"`
+	BranchStrategy        *string `json:"branchStrategy,omitempty"`
+	BranchMatchingPattern *string `json:"branchMatchingPattern,omitempty"`
+	WorkspaceClass        *string `json:"workspaceClass,omitempty"`
+}
+
+type WorkspaceClassesSettings struct {
+	Regular  string `json:"regular,omitempty"`
+	Prebuild string `json:"prebuild,omitempty"`
+}
+
+type CreateProjectOptions struct {
+	UserID            string `json:"userId,omitempty"`
+	TeamID            string `json:"teamId,omitempty"`
+	Name              string `json:"name,omitempty"`
+	Slug              string `json:"slug,omitempty"`
+	CloneURL          string `json:"cloneUrl,omitempty"`
+	AppInstallationID string `json:"appInstallationId,omitempty"`
+}
+
+type IDEType string
+
+const (
+	IDETypeBrowser IDEType = "browser"
+	IDETypeDesktop IDEType = "desktop"
+)
+
+type IDEConfig struct {
+	SupervisorImage string     `json:"supervisorImage"`
+	IdeOptions      IDEOptions `json:"ideOptions"`
+}
+
+type IDEOptions struct {
+	// Options is a list of available IDEs.
+	Options map[string]IDEOption `json:"options"`
+	// DefaultIde when the user has not specified one.
+	DefaultIde string `json:"defaultIde"`
+	// DefaultDesktopIde when the user has not specified one.
+	DefaultDesktopIde string `json:"defaultDesktopIde"`
+	// Clients specific IDE options.
+	Clients map[string]IDEClient `json:"clients"`
+}
+
+type IDEOption struct {
+	// OrderKey to ensure a stable order one can set an `orderKey`.
+	OrderKey string `json:"orderKey,omitempty"`
+	// Title with human readable text of the IDE (plain text only).
+	Title string `json:"title"`
+	// Type of the IDE, currently 'browser' or 'desktop'.
+	Type IDEType `json:"type"`
+	// Logo URL for the IDE. See also components/ide-proxy/static/image/ide-log/ folder
+	Logo string `json:"logo"`
+	// Tooltip plain text only
+	Tooltip string `json:"tooltip,omitempty"`
+	// Label is next to the IDE option like “Browser” (plain text only).
+	Label string `json:"label,omitempty"`
+	// Notes to the IDE option that are rendered in the preferences when a user chooses this IDE.
+	Notes []string `json:"notes,omitempty"`
+	// Hidden this IDE option is not visible in the IDE preferences.
+	Hidden bool `json:"hidden,omitempty"`
+	// Experimental this IDE option is to only be shown to some users
+	Experimental bool `json:"experimental,omitempty"`
+	// Image ref to the IDE image.
+	Image string `json:"image"`
+	// LatestImage ref to the IDE image, this image ref always resolve to digest.
+	LatestImage string `json:"latestImage,omitempty"`
+	// ResolveImageDigest when this is `true`, the tag of this image is resolved to the latest image digest regularly.
+	// This is useful if this image points to a tag like `nightly` that will be updated regularly. When `resolveImageDigest` is `true`, we make sure that we resolve the tag regularly to the most recent image version.
+	ResolveImageDigest bool `json:"resolveImageDigest,omitempty"`
+	// PluginImage ref for the IDE image, this image ref always resolve to digest.
+	// DEPRECATED use ImageLayers instead
+	PluginImage string `json:"pluginImage,omitempty"`
+	// PluginLatestImage ref for the latest IDE image, this image ref always resolve to digest.
+	// DEPRECATED use LatestImageLayers instead
+	PluginLatestImage string `json:"pluginLatestImage,omitempty"`
+	// ImageVersion the semantic version of the IDE image.
+	ImageVersion string `json:"imageVersion,omitempty"`
+	// LatestImageVersion the semantic version of the latest IDE image.
+	LatestImageVersion string `json:"latestImageVersion,omitempty"`
+	// ImageLayers for additional ide layers and dependencies
+	ImageLayers []string `json:"imageLayers,omitempty"`
+	// LatestImageLayers for latest additional ide layers and dependencies
+	LatestImageLayers []string `json:"latestImageLayers,omitempty"`
+}
+
+type IDEClient struct {
+	// DefaultDesktopIDE when the user has not specified one.
+	DefaultDesktopIDE string `json:"defaultDesktopIDE,omitempty"`
+	// DesktopIDEs supported by the client.
+	DesktopIDEs []string `json:"desktopIDEs,omitempty"`
+	// InstallationSteps to install the client on user machine.
+	InstallationSteps []string `json:"installationSteps,omitempty"`
+}
+
+type GetDefaultWorkspaceImageParams struct {
+	WorkspaceID string `json:"workspaceId,omitempty"`
+}
+
+type WorkspaceImageSource string
+
+const (
+	WorkspaceImageSourceInstallation WorkspaceImageSource = "installation"
+	WorkspaceImageSourceOrganization WorkspaceImageSource = "organization"
+)
+
+type GetDefaultWorkspaceImageResult struct {
+	Image  string               `json:"image,omitempty"`
+	Source WorkspaceImageSource `json:"source,omitempty"`
 }

@@ -1,13 +1,13 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { inject, injectable } from "inversify";
 import { EntityManager, Repository } from "typeorm";
-import * as uuidv4 from 'uuid/v4';
-import { TypeORM } from './typeorm';
+import { v4 as uuidv4 } from "uuid";
+import { TypeORM } from "./typeorm";
 import { OneTimeSecretDB } from "../one-time-secret-db";
 import { DBOneTimeSecret } from "./entity/db-one-time-secret";
 
@@ -28,7 +28,7 @@ export class TypeORMOneTimeSecretDBImpl implements OneTimeSecretDB {
             deleted: false,
             expirationTime: expirationTime.toISOString(),
             id: uuidv4(),
-            value: secret
+            value: secret,
         };
 
         const repo = await this.getRepo();
@@ -39,7 +39,7 @@ export class TypeORMOneTimeSecretDBImpl implements OneTimeSecretDB {
 
     public async get(key: string): Promise<string | undefined> {
         const repo = await this.getRepo();
-        const r = await repo.findOneById(key);
+        const r = await repo.findOne(key);
         if (!r) {
             return undefined;
         }
@@ -60,12 +60,10 @@ export class TypeORMOneTimeSecretDBImpl implements OneTimeSecretDB {
 
     public async remove(key: string): Promise<void> {
         const repo = await this.getRepo();
-        await repo.deleteById(key);
+        await repo.delete(key);
     }
 
     public async pruneExpired(): Promise<void> {
-        await (await this.getEntityManager()).query("UPDATE d_b_one_time_secret SET deleted = 1 WHERE deleted = 0 AND expirationTime < NOW()");
+        await (await this.getEntityManager()).query("DELETE FROM d_b_one_time_secret WHERE expirationTime < NOW()");
     }
-
-
 }
