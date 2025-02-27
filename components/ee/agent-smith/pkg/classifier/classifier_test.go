@@ -1,6 +1,6 @@
-// Copyright (c) 2021 Gitpod GmbH. All rights reserved.
-// Licensed under the Gitpod Enterprise Source Code License,
-// See License.enterprise.txt in the project root folder.
+// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License.AGPL.txt in the project root for license information.
 
 package classifier_test
 
@@ -41,7 +41,7 @@ func TestCommandlineClassifier(t *testing.T) {
 		{
 			Name:        "blocked exec positive",
 			BlockList:   blocked,
-			Input:       Input{Executable: blocked[0]},
+			Input:       Input{Executable: "./" + blocked[0]},
 			Expectation: &classifier.Classification{Level: classifier.LevelAudit, Classifier: classifier.ClassifierCommandline, Message: `matched "blocked"`},
 		},
 		{
@@ -74,7 +74,7 @@ func TestCommandlineClassifier(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
-			class, err := classifier.NewCommandlineClassifier(test.AllowList, test.BlockList)
+			class, err := classifier.NewCommandlineClassifier("test", classifier.LevelAudit, test.AllowList, test.BlockList)
 			if err != nil {
 				t.Fatal(err)
 			}

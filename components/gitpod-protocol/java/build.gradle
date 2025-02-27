@@ -15,7 +15,7 @@ dependencies {
     implementation group: 'org.eclipse.lsp4j', name: 'org.eclipse.lsp4j.jsonrpc', version: '0.12.0'
     implementation group: 'org.eclipse.lsp4j', name: 'org.eclipse.lsp4j.websocket', version: '0.12.0'
     compileOnly group: 'javax.websocket', name: 'javax.websocket-api', version: '1.1'
-    implementation group: 'org.glassfish.tyrus.bundles', name: 'tyrus-standalone-client', version: '1.18'
+    implementation("org.eclipse.jetty.websocket:javax-websocket-client-impl:9.4.44.v20210927")
 }
 
 application {
@@ -27,22 +27,15 @@ java {
     withJavadocJar()
 }
 
-// Set env vars GITHUB_GPR_USERNAME and GITHUB_GPR_TOKEN and run:
-// ./gradlew publish
+compileJava {
+    sourceCompatibility = "11"
+    targetCompatibility = "11"
+}
+
 publishing {
-    repositories {
-        maven {
-            name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/gitpod-io/gitpod")
-            credentials {
-                username = project.findProperty("gpr.user") ?: System.getenv("GITHUB_GPR_USERNAME")
-                password = project.findProperty("gpr.key") ?: System.getenv("GITHUB_GPR_TOKEN")
-            }
-        }
-    }
     publications {
-        gpr(MavenPublication) {
-            from(components.java)
+        mavenJava(MavenPublication) {
+            from components.java
         }
-    }
+     }
 }

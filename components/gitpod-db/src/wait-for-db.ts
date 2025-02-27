@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 /**
@@ -9,13 +9,13 @@
  */
 import "reflect-metadata";
 import { Config } from "./config";
-import * as mysql from 'mysql';
+import * as mysql from "mysql";
 
 const retryPeriod = 5000; // [ms]
 const totalAttempts = 30;
-const connCfg = {
+const connCfg: mysql.ConnectionConfig = {
     ...new Config().mysqlConfig,
-    timeout: retryPeriod
+    timeout: retryPeriod,
 };
 
 function connectOrReschedule(attempt: number) {
@@ -30,15 +30,14 @@ function connectOrReschedule(attempt: number) {
                 process.exit(0);
             }
         });
-    } catch(err) {
+    } catch (err) {
         rescheduleConnectionAttempt(attempt, err);
     }
-
 }
 
-function rescheduleConnectionAttempt(attempt: number, err: Error) {
-    if(attempt == totalAttempts) {
-        console.log(`Could not connect within ${totalAttempts} attempts. Stopping.`)
+function rescheduleConnectionAttempt(attempt: number, err: unknown) {
+    if (attempt == totalAttempts) {
+        console.log(`Could not connect within ${totalAttempts} attempts. Stopping.`, err);
         process.exit(1);
     }
     console.log(`Connection attempt ${attempt}/${totalAttempts} failed. Retrying in ${retryPeriod / 1000} seconds.`);

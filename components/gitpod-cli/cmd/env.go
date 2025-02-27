@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
@@ -8,29 +8,53 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/sourcegraph/jsonrpc2"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
-	"google.golang.org/grpc"
 
-	"github.com/gitpod-io/gitpod/gitpod-cli/pkg/theialib"
+	"github.com/gitpod-io/gitpod/gitpod-cli/pkg/supervisor"
+	"github.com/gitpod-io/gitpod/gitpod-cli/pkg/utils"
 	serverapi "github.com/gitpod-io/gitpod/gitpod-protocol"
-	supervisor "github.com/gitpod-io/gitpod/supervisor/api"
+	"github.com/gitpod-io/gitpod/supervisor/api"
+	supervisorapi "github.com/gitpod-io/gitpod/supervisor/api"
 )
 
 var exportEnvs = false
 var unsetEnvs = false
+var scope = string(envScopeRepo)
+
+type envScope string
+
+var (
+	envScopeRepo       envScope = "repo"
+	envScopeUser       envScope = "user"
+	envScopeLegacyUser envScope = "legacy-user"
+)
+
+func envScopeFromString(s string) envScope {
+	switch s {
+	case string(envScopeRepo):
+		return envScopeRepo
+	case string(envScopeUser):
+		return envScopeUser
+	default:
+		return envScopeRepo
+	}
+}
 
 // envCmd represents the env command
 var envCmd = &cobra.Command{
 	Use:   "env",
-	Short: "Controls user-defined, persistent environment variables.",
-	Long: `This command can print and modify the persistent environment variables associated with your user, for this repository.
+	Short: "Controls workspace environment variables.",
+	Long: `This command can print and modify the persistent environment variables associated with your workspace.
 
 To set the persistent environment variable 'foo' to the value 'bar' use:
 	gp env foo=bar
@@ -50,7 +74,7 @@ Note that you can delete/unset variables if their repository pattern matches the
 delete environment variables with a repository pattern of */foo, foo/* or */*.
 `,
 	Args: cobra.ArbitraryArgs,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.SetOutput(io.Discard)
 		f, err := os.OpenFile(os.TempDir()+"/gp-env.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 		if err == nil {
@@ -58,36 +82,59 @@ delete environment variables with a repository pattern of */foo, foo/* or */*.
 			log.SetOutput(f)
 		}
 
+		ctx, cancel := context.WithTimeout(cmd.Context(), 1*time.Minute)
+		defer cancel()
+
 		if len(args) > 0 {
 			if unsetEnvs {
-				deleteEnvs(args)
-				return
+				err = deleteEnvs(ctx, args)
+			} else {
+				setEnvScope := envScopeFromString(scope)
+				err = setEnvs(ctx, setEnvScope, args)
 			}
-
-			setEnvs(args)
 		} else {
-			getEnvs()
+			err = getEnvs(ctx)
 		}
+		return err
 	},
 }
 
 type connectToServerResult struct {
 	repositoryPattern string
+	wsInfo            *supervisorapi.WorkspaceInfoResponse
 	client            *serverapi.APIoverJSONRPC
+	gitpodHost        string
 }
 
-func connectToServer(ctx context.Context) (*connectToServerResult, error) {
-	supervisorAddr := os.Getenv("SUPERVISOR_ADDR")
-	if supervisorAddr == "" {
-		supervisorAddr = "localhost:22999"
+type connectToServerOptions struct {
+	supervisorClient *supervisor.SupervisorClient
+	wsInfo           *api.WorkspaceInfoResponse
+	log              *log.Entry
+
+	setEnvScope envScope
+}
+
+func connectToServer(ctx context.Context, options *connectToServerOptions) (*connectToServerResult, error) {
+	var err error
+	var supervisorClient *supervisor.SupervisorClient
+	if options != nil && options.supervisorClient != nil {
+		supervisorClient = options.supervisorClient
+	} else {
+		supervisorClient, err = supervisor.New(ctx)
+		if err != nil {
+			return nil, xerrors.Errorf("failed connecting to supervisor: %w", err)
+		}
+		defer supervisorClient.Close()
 	}
-	supervisorConn, err := grpc.Dial(supervisorAddr, grpc.WithInsecure())
-	if err != nil {
-		return nil, xerrors.Errorf("failed connecting to supervisor: %w", err)
-	}
-	wsinfo, err := supervisor.NewInfoServiceClient(supervisorConn).WorkspaceInfo(ctx, &supervisor.WorkspaceInfoRequest{})
-	if err != nil {
-		return nil, xerrors.Errorf("failed getting workspace info from supervisor: %w", err)
+
+	var wsinfo *api.WorkspaceInfoResponse
+	if options != nil && options.wsInfo != nil {
+		wsinfo = options.wsInfo
+	} else {
+		wsinfo, err = supervisorClient.Info.WorkspaceInfo(ctx, &supervisorapi.WorkspaceInfoRequest{})
+		if err != nil {
+			return nil, xerrors.Errorf("failed getting workspace info from supervisor: %w", err)
+		}
 	}
 	if wsinfo.Repository == nil {
 		return nil, xerrors.New("workspace info is missing repository")
@@ -99,195 +146,146 @@ func connectToServer(ctx context.Context) (*connectToServerResult, error) {
 		return nil, xerrors.New("repository info is missing name")
 	}
 	repositoryPattern := wsinfo.Repository.Owner + "/" + wsinfo.Repository.Name
-	clientToken, err := supervisor.NewTokenServiceClient(supervisorConn).GetToken(ctx, &supervisor.GetTokenRequest{
+
+	operations := "create/get/update/delete"
+	if options != nil && options.setEnvScope == envScopeUser {
+		// Updating user env vars requires a different token with a special scope
+		repositoryPattern = "*/**"
+		operations = "update"
+	}
+	if options != nil && options.setEnvScope == envScopeLegacyUser {
+		// Updating user env vars requires a different token with a special scope
+		repositoryPattern = "*/*"
+		operations = "update"
+	}
+
+	clientToken, err := supervisorClient.Token.GetToken(ctx, &supervisorapi.GetTokenRequest{
 		Host: wsinfo.GitpodApi.Host,
 		Kind: "gitpod",
 		Scope: []string{
-			"function:getEnvVars",
+			"function:getWorkspaceEnvVars",
 			"function:setEnvVar",
 			"function:deleteEnvVar",
-			"resource:envVar::" + repositoryPattern + "::create/get/update/delete",
+			"resource:envVar::" + repositoryPattern + "::" + operations,
 		},
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("failed getting token from supervisor: %w", err)
 	}
+	var serverLog *log.Entry
+	if options != nil && options.log != nil {
+		serverLog = options.log
+	} else {
+		serverLog = log.NewEntry(log.StandardLogger())
+	}
 	client, err := serverapi.ConnectToServer(wsinfo.GitpodApi.Endpoint, serverapi.ConnectToServerOpts{
 		Token:   clientToken.Token,
 		Context: ctx,
-		Log:     log.NewEntry(log.StandardLogger()),
+		Log:     serverLog,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("failed connecting to server: %w", err)
 	}
-	return &connectToServerResult{repositoryPattern, client}, nil
+	return &connectToServerResult{repositoryPattern, wsinfo, client, wsinfo.GitpodHost}, nil
 }
 
-func getEnvs() {
-	if !isTheiaIDE() {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-		defer cancel()
-		result, err := connectToServer(ctx)
-		if err != nil {
-			fail(err.Error())
-		}
-
-		vars, err := result.client.GetEnvVars(ctx)
-		if err != nil {
-			fail("failed to fetch env vars from server: " + err.Error())
-		}
-
-		for _, v := range vars {
-			printVar(v, exportEnvs)
-		}
-		return
-	}
-
-	service, err := theialib.NewServiceFromEnv()
+func getWorkspaceEnvs(ctx context.Context, options *connectToServerOptions) ([]*serverapi.EnvVar, error) {
+	result, err := connectToServer(ctx, options)
 	if err != nil {
-		fail(err.Error())
+		return nil, err
 	}
+	defer result.client.Close()
 
-	vars, err := service.GetEnvVars(theialib.GetEnvvarsRequest{})
-	if err != nil {
-		fail(fmt.Sprintf("cannot get environment variables: %v", err))
-	}
-
-	for _, v := range vars.Variables {
-		printVarFromTheia(v, exportEnvs)
-	}
+	return result.client.GetWorkspaceEnvVars(ctx, result.wsInfo.WorkspaceId)
 }
 
-func setEnvs(args []string) {
-	if !isTheiaIDE() {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-		defer cancel()
-		result, err := connectToServer(ctx)
-		if err != nil {
-			fail(err.Error())
-		}
-
-		vars, err := parseArgs(args, result.repositoryPattern)
-		if err != nil {
-			fail(err.Error())
-		}
-
-		var exitCode int
-		var wg sync.WaitGroup
-		wg.Add(len(vars))
-		for _, v := range vars {
-			go func(v *serverapi.UserEnvVarValue) {
-				err = result.client.SetEnvVar(ctx, v)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "cannot set %s: %v\n", v.Name, err)
-					exitCode = -1
-				} else {
-					printVar(v, exportEnvs)
-				}
-				wg.Done()
-			}(v)
-		}
-		wg.Wait()
-		os.Exit(exitCode)
-	}
-
-	service, err := theialib.NewServiceFromEnv()
+func getEnvs(ctx context.Context) error {
+	vars, err := getWorkspaceEnvs(ctx, nil)
 	if err != nil {
-		fail(err.Error())
-	}
-
-	vars := make([]theialib.EnvironmentVariable, len(args))
-	for i, arg := range args {
-		kv := strings.Split(arg, "=")
-		if len(kv) != 2 {
-			fail(fmt.Sprintf("%s has no value (correct format is %s=some_value)", arg, arg))
-		}
-
-		key := strings.TrimSpace(kv[0])
-		if key == "" {
-			fail("variable must have a name")
-		}
-		// Do not trim value - the user might want whitespace here
-		// Also do not check if the value is empty, as an empty value means we want to delete the variable
-		val := kv[1]
-		if val == "" {
-			fail("variable must have a value; use -u to unset a variable")
-		}
-
-		vars[i] = theialib.EnvironmentVariable{Name: key, Value: val}
-	}
-
-	_, err = service.SetEnvVar(theialib.SetEnvvarRequest{Variables: vars})
-	if err != nil {
-		fail(fmt.Sprintf("cannot set environment variables: %v", err))
+		return xerrors.Errorf("failed to fetch env vars from server: %w", err)
 	}
 
 	for _, v := range vars {
-		printVarFromTheia(v, exportEnvs)
+		printVar(v.Name, v.Value, exportEnvs)
 	}
+
+	return nil
 }
 
-func deleteEnvs(args []string) {
-	if !isTheiaIDE() {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-		defer cancel()
-		result, err := connectToServer(ctx)
-		if err != nil {
-			fail(err.Error())
-		}
+func setEnvs(ctx context.Context, setEnvScope envScope, args []string) error {
+	options := connectToServerOptions{
+		setEnvScope: setEnvScope,
+	}
+	result, err := connectToServer(ctx, &options)
+	if err != nil {
+		return err
+	}
+	defer result.client.Close()
 
-		var exitCode int
-		var wg sync.WaitGroup
-		wg.Add(len(args))
-		for _, name := range args {
-			go func(name string) {
-				err = result.client.DeleteEnvVar(ctx, &serverapi.UserEnvVarValue{Name: name, RepositoryPattern: result.repositoryPattern})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "cannot unset %s: %v\n", name, err)
-					exitCode = -1
+	vars, err := parseArgs(args, result.repositoryPattern)
+	if err != nil {
+		return err
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	for _, v := range vars {
+		v := v
+		g.Go(func() error {
+			err = result.client.SetEnvVar(ctx, v)
+			if err != nil {
+				if ferr, ok := err.(*jsonrpc2.Error); ok && ferr.Code == http.StatusForbidden && setEnvScope == envScopeUser {
+					// If we tried updating an env var with */** and it doesn't exist, it may exist with the */* scope
+					options.setEnvScope = envScopeLegacyUser
+					result, err := connectToServer(ctx, &options)
+					if err != nil {
+						return err
+					}
+					defer result.client.Close()
+
+					v.RepositoryPattern = "*/*"
+					err = result.client.SetEnvVar(ctx, v)
+					if ferr, ok := err.(*jsonrpc2.Error); ok && ferr.Code == http.StatusForbidden {
+						fmt.Println(ferr.Message, ferr.Data)
+						return fmt.Errorf(""+
+							"Can't automatically create env var `%s` for security reasons.\n"+
+							"Please create the var manually under %s/user/variables using Name=%s, Scope=*/**, Value=foobar", v.Name, result.gitpodHost, v.Name)
+					}
+				} else {
+					return err
 				}
-				wg.Done()
-			}(name)
-		}
-		wg.Wait()
-		os.Exit(exitCode)
+			}
+			printVar(v.Name, v.Value, exportEnvs)
+			return nil
+		})
 	}
+	return g.Wait()
+}
 
-	service, err := theialib.NewServiceFromEnv()
+func deleteEnvs(ctx context.Context, args []string) error {
+	result, err := connectToServer(ctx, nil)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
+	defer result.client.Close()
 
-	resp, err := service.DeleteEnvVar(theialib.DeleteEnvvarRequest{Variables: args})
-	if err != nil {
-		fail(fmt.Sprintf("cannot unset environment variables: %v", err))
+	g, ctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
+	wg.Add(len(args))
+	for _, name := range args {
+		name := name
+		g.Go(func() error {
+			return result.client.DeleteEnvVar(ctx, &serverapi.UserEnvVarValue{Name: name, RepositoryPattern: result.repositoryPattern})
+		})
 	}
-
-	if len(resp.NotDeleted) != 0 {
-		fail(fmt.Sprintf("cannot unset environment variables: %s", strings.Join(resp.NotDeleted, ", ")))
-	}
+	return g.Wait()
 }
 
-func fail(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
-	os.Exit(-1)
-}
-
-func printVar(v *serverapi.UserEnvVarValue, export bool) {
-	val := strings.Replace(v.Value, "\"", "\\\"", -1)
+func printVar(name string, value string, export bool) {
+	val := strings.Replace(value, "\"", "\\\"", -1)
 	if export {
-		fmt.Printf("export %s=\"%s\"\n", v.Name, val)
+		fmt.Printf("export %s=\"%s\"\n", name, val)
 	} else {
-		fmt.Printf("%s=%s\n", v.Name, val)
-	}
-}
-
-func printVarFromTheia(v theialib.EnvironmentVariable, export bool) {
-	val := strings.Replace(v.Value, "\"", "\\\"", -1)
-	if export {
-		fmt.Printf("export %s=\"%s\"\n", v.Name, val)
-	} else {
-		fmt.Printf("%s=%s\n", v.Name, val)
+		fmt.Printf("%s=%s\n", name, val)
 	}
 }
 
@@ -296,18 +294,18 @@ func parseArgs(args []string, pattern string) ([]*serverapi.UserEnvVarValue, err
 	for i, arg := range args {
 		kv := strings.SplitN(arg, "=", 1)
 		if len(kv) != 1 || kv[0] == "" {
-			return nil, xerrors.Errorf("empty string (correct format is key=value)")
+			return nil, GpError{Err: xerrors.Errorf("empty string (correct format is key=value)"), OutCome: utils.Outcome_UserErr, ErrorCode: utils.UserErrorCode_InvalidArguments}
 		}
 
 		if !strings.Contains(kv[0], "=") {
-			return nil, xerrors.Errorf("%s has no equal character (correct format is %s=some_value)", arg, arg)
+			return nil, GpError{Err: xerrors.Errorf("%s has no equal character (correct format is %s=some_value)", arg, arg), OutCome: utils.Outcome_UserErr, ErrorCode: utils.UserErrorCode_InvalidArguments}
 		}
 
 		parts := strings.SplitN(kv[0], "=", 2)
 
 		key := strings.TrimSpace(parts[0])
 		if key == "" {
-			return nil, xerrors.Errorf("variable must have a name")
+			return nil, GpError{Err: xerrors.Errorf("variable must have a name"), OutCome: utils.Outcome_UserErr, ErrorCode: utils.UserErrorCode_InvalidArguments}
 		}
 
 		// Do not trim value - the user might want whitespace here
@@ -319,7 +317,7 @@ func parseArgs(args []string, pattern string) ([]*serverapi.UserEnvVarValue, err
 		val = strings.ReplaceAll(val, `\ `, " ")
 
 		if val == "" {
-			return nil, xerrors.Errorf("variable must have a value; use -u to unset a variable")
+			return nil, GpError{Err: xerrors.Errorf("variable must have a value; use -u to unset a variable"), OutCome: utils.Outcome_UserErr, ErrorCode: utils.UserErrorCode_InvalidArguments}
 		}
 
 		vars[i] = &serverapi.UserEnvVarValue{Name: key, Value: val, RepositoryPattern: pattern}
@@ -333,4 +331,5 @@ func init() {
 
 	envCmd.Flags().BoolVarP(&exportEnvs, "export", "e", false, "produce a script that can be eval'ed in Bash")
 	envCmd.Flags().BoolVarP(&unsetEnvs, "unset", "u", false, "deletes/unsets persisted environment variables")
+	envCmd.Flags().StringVarP(&scope, "scope", "s", "repo", "deletes/unsets persisted environment variables")
 }

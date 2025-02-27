@@ -1,121 +1,67 @@
-// Copyright (c) 2021 Gitpod GmbH. All rights reserved.
-// Licensed under the Gitpod Enterprise Source Code License,
-// See License.enterprise.txt in the project root folder.
+// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Licensed under the GNU Affero General Public License (AGPL).
+// See License.AGPL.txt in the project root for license information.
 
 package detector
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/gitpod-io/gitpod/agent-smith/pkg/common"
 	"github.com/gitpod-io/gitpod/common-go/log"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/procfs"
 )
 
-var _ ProcessDetector = &ProcfsDetector{}
-
-// ProcfsDetector detects processes and workspaces on this node by scanning procfs
-type ProcfsDetector struct {
-	p procfs.FS
-
-	mu sync.RWMutex
-	ps chan Process
-
-	indexSizeGuage prometheus.Gauge
-
-	startOnce sync.Once
+type discoverableProcFS interface {
+	Discover() map[int]*process
+	Environ(pid int) ([]string, error)
 }
 
-func NewProcfsDetector() (*ProcfsDetector, error) {
-	p, err := procfs.NewFS("/proc")
-	if err != nil {
-		return nil, err
-	}
+type realProcfs procfs.FS
 
-	return &ProcfsDetector{
-		indexSizeGuage: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "gitpod",
-			Subsystem: "agent_smith_procfs_detector",
-			Name:      "index_size",
-			Help:      "number of entries in the last procfs scan index",
-		}),
-		p: p,
-	}, nil
-}
+var _ discoverableProcFS = realProcfs{}
 
-func (det *ProcfsDetector) Describe(d chan<- *prometheus.Desc) {
-	det.indexSizeGuage.Describe(d)
-
-}
-
-func (det *ProcfsDetector) Collect(m chan<- prometheus.Metric) {
-	det.indexSizeGuage.Collect(m)
-}
-
-func (det *ProcfsDetector) start() {
-	ps := make(chan Process, 100)
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-
-		for range t.C {
-			det.run(ps)
-		}
-	}()
-	go func() {
-		for p := range ps {
-			det.mu.RLock()
-			if det.ps != nil {
-				det.ps <- p
-			}
-			det.mu.RUnlock()
-		}
-	}()
-}
-
-func (det *ProcfsDetector) run(processes chan<- Process) {
-	procs, err := det.p.AllProcs()
+func (fs realProcfs) Discover() map[int]*process {
+	proc := procfs.FS(fs)
+	procs, err := proc.AllProcs()
 	if err != nil {
 		log.WithError(err).Error("cannot list processes")
 	}
 	sort.Sort(procs)
 
-	type process struct {
-		PID       int
-		Depth     int
-		Path      string
-		Kind      ProcessKind
-		Parent    *process
-		Children  []*process
-		Leaf      bool
-		Cmdline   []string
-		Workspace *common.Workspace
-	}
-
 	idx := make(map[int]*process, len(procs))
 
+	digest := make([]byte, 24)
 	for _, p := range procs {
 		cmdline, err := p.CmdLine()
 		if err != nil {
 			log.WithField("pid", p.PID).WithError(err).Debug("cannot get commandline of process")
 			continue
 		}
-		stat, err := p.Stat()
+		stat, err := statProc(p.PID)
 		if err != nil {
 			log.WithField("pid", p.PID).WithError(err).Debug("cannot stat process")
 			continue
 		}
-		path, err := p.Executable()
-		if err != nil {
-			log.WithField("pid", p.PID).WithError(err).Debug("cannot get process executable")
-			continue
-		}
+		// Note: don't use p.Executable() here because it resolves the exe symlink which yields
+		//       a path that doesn't make sense in this mount namespace. However, reading from this
+		//       file directly works.
+		path := filepath.Join("proc", strconv.Itoa(p.PID), "exe")
 
 		// Even though we loop through a sorted process list (lowest PID first), we cannot
 		// assume that we've seen the parent already due to PID reuse.
@@ -133,9 +79,268 @@ func (det *ProcfsDetector) run(processes chan<- Process) {
 		proc.Kind = ProcessUnknown
 		proc.Path = path
 		parent.Children = append(parent.Children, proc)
-		parent.Leaf = false
+
+		binary.LittleEndian.PutUint64(digest[0:8], uint64(p.PID))
+		binary.LittleEndian.PutUint64(digest[8:16], uint64(stat.PPID))
+		binary.LittleEndian.PutUint64(digest[16:24], stat.Starttime)
+		proc.Hash = xxhash.Sum64(digest)
+
 		idx[p.PID] = proc
 	}
+	return idx
+}
+
+type stat struct {
+	PPID      int
+	Starttime uint64
+}
+
+// statProc returns a limited set of /proc/<pid>/stat content.
+func statProc(pid int) (*stat, error) {
+	f, err := os.Open(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return parseStat(f)
+}
+
+func parseStat(r io.Reader) (res *stat, err error) {
+	var (
+		ppid      uint64
+		foundPPID bool
+		starttime uint64
+		i         = -1
+	)
+
+	scan := bufio.NewScanner(r)
+	// We use a fixed buffer size assuming that none of the env vars we're interested in is any larger.
+	// This is part of the trick to keep allocs down.
+	scan.Buffer(make([]byte, 512), 512)
+	scan.Split(scanFixedSpace(512))
+	for scan.Scan() {
+		text := scan.Bytes()
+		if text[len(text)-1] == ')' {
+			i = 0
+		}
+
+		if i == 2 {
+			ppid, err = strconv.ParseUint(string(text), 10, 64)
+			foundPPID = true
+		}
+		if i == 20 {
+			starttime, err = strconv.ParseUint(string(text), 10, 64)
+		}
+		if err != nil {
+			return
+		}
+
+		if i >= 0 {
+			i++
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := scan.Err(); err != nil {
+		return nil, err
+	}
+
+	if !foundPPID || starttime == 0 {
+		return nil, fmt.Errorf("cannot parse stat")
+	}
+
+	return &stat{
+		PPID:      int(ppid),
+		Starttime: starttime,
+	}, nil
+}
+
+func (p realProcfs) Environ(pid int) ([]string, error) {
+	// Note: procfs.Environ is too expensive becuase it uses io.ReadAll which leaks
+	//       memory over time.
+
+	f, err := os.Open(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return parseGitpodEnviron(f)
+}
+
+func parseGitpodEnviron(r io.Reader) ([]string, error) {
+	// Note: this function is benchmarked in BenchmarkParseGitpodEnviron.
+	//       At the time of this wriging it consumed 3+N allocs where N is the number of
+	//       env vars starting with GITPOD_.
+	//
+	// When making changes to this function, ensure you're not causing more allocs
+	// which could have a too drastic resource usage effect in prod.
+
+	scan := bufio.NewScanner(r)
+	// We use a fixed buffer size assuming that none of the env vars we're interested in is any larger.
+	// This is part of the trick to keep allocs down.
+	scan.Buffer(make([]byte, 512), 512)
+	scan.Split(scanNullTerminatedLines(512))
+
+	// we expect at least 10 relevant env vars
+	res := make([]string, 0, 10)
+	for scan.Scan() {
+		// we only keep GITPOD_ variables for optimisation
+		text := scan.Bytes()
+		if !bytes.HasPrefix(text, []byte("GITPOD_")) {
+			continue
+		}
+
+		res = append(res, string(text))
+	}
+	return res, nil
+}
+
+func scanNullTerminatedLines(fixedBufferSize int) func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+		if i := bytes.IndexByte(data, 0); i >= 0 {
+			// We have a full null-terminated line.
+			return i + 1, data[:i], nil
+		}
+		// If we're at EOF, we have a final, non-terminated line. Return it.
+		if atEOF {
+			return len(data), data, nil
+		}
+		if len(data) == 512 {
+			return len(data), data, nil
+		}
+		// Request more data.
+		return 0, nil, nil
+	}
+}
+
+func scanFixedSpace(fixedBufferSize int) func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	// The returned function behaves like bufio.ScanLines except that it doesn't try to
+	// request lines longer than fixedBufferSize.
+	return func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+		if i := bytes.IndexByte(data, ' '); i >= 0 {
+			// We have a full null-terminated line.
+			return i + 1, data[:i], nil
+		}
+		// If we're at EOF, we have a final, non-terminated line. Return it.
+		if atEOF {
+			return len(data), data, nil
+		}
+		if len(data) == 512 {
+			return len(data), data, nil
+		}
+		// Request more data.
+		return 0, nil, nil
+	}
+}
+
+var _ ProcessDetector = &ProcfsDetector{}
+
+// ProcfsDetector detects processes and workspaces on this node by scanning procfs
+type ProcfsDetector struct {
+	mu sync.RWMutex
+	ps chan Process
+
+	indexSizeGuage     prometheus.Gauge
+	cacheUseCounterVec *prometheus.CounterVec
+	workspaceGauge     prometheus.Gauge
+
+	startOnce sync.Once
+
+	proc  discoverableProcFS
+	cache *lru.Cache
+}
+
+func NewProcfsDetector() (*ProcfsDetector, error) {
+	p, err := procfs.NewFS("/proc")
+	if err != nil {
+		return nil, err
+	}
+
+	cache, err := lru.New(2000)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ProcfsDetector{
+		indexSizeGuage: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "gitpod",
+			Subsystem: "agent_smith_procfs_detector",
+			Name:      "index_size",
+			Help:      "number of entries in the last procfs scan index",
+		}),
+		cacheUseCounterVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "gitpod",
+			Subsystem: "agent_smith_procfs_detector",
+			Name:      "cache_use_total",
+			Help:      "process cache statistics",
+		}, []string{"use"}),
+		workspaceGauge: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "gitpod",
+			Subsystem: "agent_smith_procfs_detector",
+			Name:      "workspace_count",
+			Help:      "number of detected workspaces",
+		}),
+		proc:  realProcfs(p),
+		cache: cache,
+	}, nil
+}
+
+func (det *ProcfsDetector) Describe(d chan<- *prometheus.Desc) {
+	det.indexSizeGuage.Describe(d)
+	det.cacheUseCounterVec.Describe(d)
+	det.workspaceGauge.Describe(d)
+}
+
+func (det *ProcfsDetector) Collect(m chan<- prometheus.Metric) {
+	det.indexSizeGuage.Collect(m)
+	det.cacheUseCounterVec.Collect(m)
+	det.workspaceGauge.Collect(m)
+}
+
+func (det *ProcfsDetector) start() {
+	ps := make(chan Process, 100)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+
+		for {
+			det.run(ps)
+			<-t.C
+		}
+	}()
+	go func() {
+		for p := range ps {
+			det.ps <- p
+		}
+	}()
+	log.Info("procfs detector started")
+}
+
+type process struct {
+	PID       int
+	Depth     int
+	Path      string
+	Kind      ProcessKind
+	Parent    *process
+	Children  []*process
+	Leaf      bool
+	Cmdline   []string
+	Workspace *common.Workspace
+	Hash      uint64
+}
+
+func (det *ProcfsDetector) run(processes chan<- Process) {
+	log.Debug("procfs detector run")
+	idx := det.proc.Discover()
 
 	// We now have a complete view of the process table. Let's calculate the depths
 	root, ok := idx[1]
@@ -146,86 +351,89 @@ func (det *ProcfsDetector) run(processes chan<- Process) {
 	det.indexSizeGuage.Set(float64(len(idx)))
 
 	// let's find all workspaces, from the root down
-	minWSDepth := -1
-	var findWorkspaces func(p *process, d int)
-	findWorkspaces = func(p *process, d int) {
-		p.Depth = d
-		var found bool
+	findWorkspaces(det.proc, root, 0, nil)
+
+	workspaces := 0
+	for _, p := range idx {
+		if p.Workspace == nil {
+			continue
+		}
+
+		if p.Kind == ProcessSandbox {
+			workspaces = workspaces + 1
+		}
+
+		if p.Kind != ProcessUserWorkload {
+			continue
+		}
+
+		if _, ok := det.cache.Get(p.Hash); ok {
+			det.cacheUseCounterVec.WithLabelValues("hit").Inc()
+			continue
+		}
+		det.cacheUseCounterVec.WithLabelValues("miss").Inc()
+		det.cache.Add(p.Hash, struct{}{})
+
+		proc := Process{
+			Path:        p.Path,
+			CommandLine: p.Cmdline,
+			Kind:        p.Kind,
+			Workspace:   p.Workspace,
+		}
+		log.WithField("proc", proc).Debug("found process")
+		processes <- proc
+	}
+
+	det.workspaceGauge.Set(float64(workspaces))
+}
+
+func findWorkspaces(proc discoverableProcFS, p *process, d int, ws *common.Workspace) {
+	p.Depth = d
+	p.Workspace = ws
+	if ws == nil {
+		p.Kind = ProcessUnknown
+
 		if len(p.Cmdline) >= 2 && p.Cmdline[0] == "/proc/self/exe" && p.Cmdline[1] == "ring1" {
 			// we've potentially found a workspacekit process, and expect it's one child to a be a supervisor process
-			if len(p.Children) == 1 {
+			if len(p.Children) > 0 {
 				c := p.Children[0]
 
-				if len(c.Cmdline) != 2 || c.Cmdline[0] != "supervisor" || c.Cmdline[1] != "run" {
+				if isSupervisor(c.Cmdline) {
 					// we've found the corresponding supervisor process - hence the original process must be a workspace
-					p.Workspace = extractWorkspaceFromWorkspacekit(p.PID)
-					found = true
-					if minWSDepth == -1 || p.Depth < minWSDepth {
-						minWSDepth = p.Depth
-					}
+					p.Workspace = extractWorkspaceFromWorkspacekit(proc, p.PID)
 
 					if p.Workspace != nil {
 						// we have actually found a workspace, but extractWorkspaceFromWorkspacekit sets the PID of the workspace
 						// to the PID we extracted that data from, i.e. workspacekit. We want the workspace PID to point to the
 						// supervisor process, so that when we kill that process we hit supervisor, not workspacekit.
 						p.Workspace.PID = c.PID
+						p.Kind = ProcessSandbox
+						c.Kind = ProcessSupervisor
 					}
 				}
 			}
 		}
-		if found {
-			return
-		}
-
-		for _, c := range p.Children {
-			findWorkspaces(c, d+1)
-		}
-	}
-	findWorkspaces(root, 0)
-
-	// we expect all workspaces to sit at the same depth in the process tree - let's filter those which are not at the minimum level
-	var wss []*process
-	for _, p := range idx {
-		if p.Depth != minWSDepth {
-			p.Workspace = nil
-		}
-		if p.Workspace != nil {
-			wss = append(wss, p)
-		}
+	} else if isSupervisor(p.Cmdline) {
+		p.Kind = ProcessSupervisor
+	} else {
+		p.Kind = ProcessUserWorkload
 	}
 
-	// publish all child processes of the workspaces
-	var publishProcess func(p *process)
-	publishProcess = func(p *process) {
-		processes <- Process{
-			Path:        p.Path,
-			CommandLine: p.Cmdline,
-			Kind:        p.Kind,
-			Workspace:   p.Workspace,
-		}
-		for _, c := range p.Children {
-			publishProcess(c)
-		}
-	}
-	for _, ws := range wss {
-		for _, c := range ws.Children {
-			publishProcess(c)
-		}
+	for _, c := range p.Children {
+		findWorkspaces(proc, c, d+1, p.Workspace)
 	}
 }
 
-func extractWorkspaceFromWorkspacekit(pid int) *common.Workspace {
-	proc, err := procfs.NewProc(pid)
-	if err != nil {
-		log.WithField("pid", pid).WithError(err).Debug("extractWorkspaceFromWorkspacekit: cannot get process")
-		return nil
-	}
-	env, err := proc.Environ()
-	if err != nil {
-		log.WithField("pid", pid).WithError(err).Debug("extractWorkspaceFromWorkspacekit: cannot get process environment")
-		return nil
-	}
+func isSupervisor(cmdline []string) bool {
+	return len(cmdline) == 2 && cmdline[0] == "supervisor" && cmdline[1] == "init"
+}
 
+func extractWorkspaceFromWorkspacekit(proc discoverableProcFS, pid int) *common.Workspace {
+	env, err := proc.Environ(pid)
+	if err != nil {
+		log.WithError(err).Debug("cannot get environment from process - might have missed a workspace")
+		return nil
+	}
 	var (
 		ownerID, workspaceID, instanceID string
 		gitURL                           string

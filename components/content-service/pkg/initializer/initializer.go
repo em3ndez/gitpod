@@ -1,18 +1,21 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package initializer
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -40,34 +43,58 @@ const (
 	GitpodGID = 33333
 
 	// otsDownloadAttempts is the number of times we'll attempt to download the one-time secret
-	otsDownloadAttempts = 10
+	otsDownloadAttempts = 20
 )
 
 // Initializer can initialize a workspace with content
 type Initializer interface {
-	Run(ctx context.Context, mappings []archive.IDMapping) (csapi.WorkspaceInitSource, error)
+	Run(ctx context.Context, mappings []archive.IDMapping) (csapi.WorkspaceInitSource, csapi.InitializerMetrics, error)
 }
 
 // EmptyInitializer does nothing
 type EmptyInitializer struct{}
 
 // Run does nothing
-func (e *EmptyInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (csapi.WorkspaceInitSource, error) {
-	return csapi.WorkspaceInitFromOther, nil
+func (e *EmptyInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (csapi.WorkspaceInitSource, csapi.InitializerMetrics, error) {
+	return csapi.WorkspaceInitFromOther, nil, nil
 }
 
 // CompositeInitializer does nothing
-type CompositeInitializer struct {
-	Initializer []Initializer
-}
+type CompositeInitializer []Initializer
 
 // Run calls run on all child initializers
-func (e *CompositeInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (csapi.WorkspaceInitSource, error) {
-	_, ctx = opentracing.StartSpanFromContext(ctx, "CompositeInitializer.Run")
-	for _, init := range e.Initializer {
-		init.Run(ctx, mappings)
+func (e CompositeInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (_ csapi.WorkspaceInitSource, _ csapi.InitializerMetrics, err error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "CompositeInitializer.Run")
+	defer tracing.FinishSpan(span, &err)
+	start := time.Now()
+	initialSize, fsErr := getFsUsage()
+	if fsErr != nil {
+		log.WithError(fsErr).Error("could not get disk usage")
 	}
-	return csapi.WorkspaceInitFromOther, nil
+
+	total := []csapi.InitializerMetric{}
+	for _, init := range e {
+		_, stats, err := init.Run(ctx, mappings)
+		if err != nil {
+			return csapi.WorkspaceInitFromOther, nil, err
+		}
+		total = append(total, stats...)
+	}
+
+	if fsErr == nil {
+		currentSize, fsErr := getFsUsage()
+		if fsErr != nil {
+			log.WithError(fsErr).Error("could not get disk usage")
+		}
+
+		total = append(total, csapi.InitializerMetric{
+			Type:     "composite",
+			Duration: time.Since(start),
+			Size:     currentSize - initialSize,
+		})
+	}
+
+	return csapi.WorkspaceInitFromOther, total, nil
 }
 
 // NewFromRequestOpts configures the initializer produced from a content init request
@@ -99,9 +126,7 @@ func NewFromRequest(ctx context.Context, loc string, rs storage.DirectDownloader
 				return nil, err
 			}
 		}
-		initializer = &CompositeInitializer{
-			Initializer: initializers,
-		}
+		initializer = CompositeInitializer(initializers)
 	} else if ir, ok := spec.(*csapi.WorkspaceInitializer_Git); ok {
 		if ir.Git == nil {
 			return nil, status.Error(codes.InvalidArgument, "missing Git initializer spec")
@@ -112,14 +137,6 @@ func NewFromRequest(ctx context.Context, loc string, rs storage.DirectDownloader
 		if ir.Prebuild == nil {
 			return nil, status.Error(codes.InvalidArgument, "missing prebuild initializer spec")
 		}
-		if ir.Prebuild.Git == nil {
-			return nil, status.Error(codes.InvalidArgument, "missing prebuild Git initializer spec")
-		}
-
-		gitinit, err := newGitInitializer(ctx, loc, ir.Prebuild.Git, opts.ForceGitpodUserForGit)
-		if err != nil {
-			return nil, err
-		}
 		var snapshot *SnapshotInitializer
 		if ir.Prebuild.Prebuild != nil {
 			snapshot, err = newSnapshotInitializer(loc, rs, ir.Prebuild.Prebuild)
@@ -127,10 +144,17 @@ func NewFromRequest(ctx context.Context, loc string, rs storage.DirectDownloader
 				return nil, status.Error(codes.Internal, fmt.Sprintf("cannot setup prebuild init: %v", err))
 			}
 		}
-
+		var gits []*GitInitializer
+		for _, gi := range ir.Prebuild.Git {
+			gitinit, err := newGitInitializer(ctx, loc, gi, opts.ForceGitpodUserForGit)
+			if err != nil {
+				return nil, err
+			}
+			gits = append(gits, gitinit)
+		}
 		initializer = &PrebuildInitializer{
-			Git:      gitinit,
 			Prebuild: snapshot,
+			Git:      gits,
 		}
 	} else if ir, ok := spec.(*csapi.WorkspaceInitializer_Snapshot); ok {
 		initializer, err = newSnapshotInitializer(loc, rs, ir.Snapshot)
@@ -142,7 +166,7 @@ func NewFromRequest(ctx context.Context, loc string, rs storage.DirectDownloader
 		initializer = &EmptyInitializer{}
 	}
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("cannot initialize workspace: %v", err))
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	return initializer, nil
 }
@@ -173,26 +197,54 @@ func newFileDownloadInitializer(loc string, req *csapi.FileDownloadInitializer) 
 // newFromBackupInitializer creates a backup restoration initializer for a request
 func newFromBackupInitializer(loc string, rs storage.DirectDownloader, req *csapi.FromBackupInitializer) (*fromBackupInitializer, error) {
 	return &fromBackupInitializer{
-		Location:      loc,
-		RemoteStorage: rs,
+		Location:           loc,
+		RemoteStorage:      rs,
+		FromVolumeSnapshot: req.FromVolumeSnapshot,
 	}, nil
 }
 
 type fromBackupInitializer struct {
-	Location      string
-	RemoteStorage storage.DirectDownloader
+	Location           string
+	RemoteStorage      storage.DirectDownloader
+	FromVolumeSnapshot bool
 }
 
-func (bi *fromBackupInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (src csapi.WorkspaceInitSource, err error) {
-	hasBackup, err := bi.RemoteStorage.Download(ctx, bi.Location, storage.DefaultBackup, mappings)
-	if !hasBackup {
-		return src, xerrors.Errorf("no backup found")
-	}
-	if err != nil {
-		return src, xerrors.Errorf("cannot restore backup: %w", err)
+func (bi *fromBackupInitializer) Run(ctx context.Context, mappings []archive.IDMapping) (src csapi.WorkspaceInitSource, stats csapi.InitializerMetrics, err error) {
+	if bi.FromVolumeSnapshot {
+		return csapi.WorkspaceInitFromBackup, nil, nil
 	}
 
-	return csapi.WorkspaceInitFromBackup, nil
+	start := time.Now()
+	initialSize, fsErr := getFsUsage()
+	if fsErr != nil {
+		log.WithError(fsErr).Error("could not get disk usage")
+	}
+
+	hasBackup, err := bi.RemoteStorage.Download(ctx, bi.Location, storage.DefaultBackup, mappings)
+	if !hasBackup {
+		if err != nil {
+			return src, nil, xerrors.Errorf("no backup found, error: %w", err)
+		}
+		return src, nil, xerrors.Errorf("no backup found")
+	}
+	if err != nil {
+		return src, nil, xerrors.Errorf("cannot restore backup: %w", err)
+	}
+
+	if fsErr == nil {
+		currentSize, fsErr := getFsUsage()
+		if fsErr != nil {
+			log.WithError(fsErr).Error("could not get disk usage")
+		}
+
+		stats = csapi.InitializerMetrics{csapi.InitializerMetric{
+			Type:     "fromBackup",
+			Duration: time.Since(start),
+			Size:     currentSize - initialSize,
+		}}
+	}
+
+	return csapi.WorkspaceInitFromBackup, stats, nil
 }
 
 // newGitInitializer creates a Git initializer based on the request.
@@ -251,18 +303,21 @@ func newGitInitializer(ctx context.Context, loc string, req *csapi.GitInitialize
 			Config:            req.Config.CustomConfig,
 			AuthMethod:        authMethod,
 			AuthProvider:      authProvider,
+			RunAsGitpodUser:   forceGitpodUser,
+			FullClone:         req.FullClone,
 		},
 		TargetMode:  targetMode,
 		CloneTarget: req.CloneTaget,
-		Chown:       forceGitpodUser,
+		Chown:       false,
 	}, nil
 }
 
 func newSnapshotInitializer(loc string, rs storage.DirectDownloader, req *csapi.SnapshotInitializer) (*SnapshotInitializer, error) {
 	return &SnapshotInitializer{
-		Location: loc,
-		Snapshot: req.Snapshot,
-		Storage:  rs,
+		Location:           loc,
+		Snapshot:           req.Snapshot,
+		Storage:            rs,
+		FromVolumeSnapshot: req.FromVolumeSnapshot,
 	}, nil
 }
 
@@ -316,6 +371,7 @@ func downloadOTS(ctx context.Context, url string) (user, pwd string, err error) 
 		log.WithError(err).WithField("attempt", i).Warn("cannot download OTS")
 	}
 	if err != nil {
+		log.WithError(err).Warn("failed to download OTS")
 		return "", "", err
 	}
 
@@ -361,7 +417,7 @@ func WithChown(uid, gid int) InitializeOpt {
 }
 
 // InitializeWorkspace initializes a workspace from backup or an initializer
-func InitializeWorkspace(ctx context.Context, location string, remoteStorage storage.DirectDownloader, opts ...InitializeOpt) (src csapi.WorkspaceInitSource, err error) {
+func InitializeWorkspace(ctx context.Context, location string, remoteStorage storage.DirectDownloader, opts ...InitializeOpt) (src csapi.WorkspaceInitSource, stats csapi.InitializerMetrics, err error) {
 	//nolint:ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "InitializeWorkspace")
 	span.SetTag("location", location)
@@ -383,63 +439,123 @@ func InitializeWorkspace(ctx context.Context, location string, remoteStorage sto
 	//       If the location were removed that might break the filesystem quota we have put in place prior.
 	if cfg.CleanSlate {
 		// 1. Clean out the workspace directory
-		if _, err := os.Stat(location); os.IsNotExist(err) {
+		if _, err := os.Stat(location); errors.Is(err, fs.ErrNotExist) {
 			// in the very unlikely event that the workspace Pod did not mount (and thus create) the workspace directory, create it
 			err = os.Mkdir(location, 0755)
 			if os.IsExist(err) {
 				log.WithError(err).WithField("location", location).Debug("ran into non-atomic workspace location existence check")
 				span.SetTag("exists", true)
 			} else if err != nil {
-				return src, xerrors.Errorf("cannot create workspace: %w", err)
+				return src, nil, xerrors.Errorf("cannot create workspace: %w", err)
 			}
 		}
 		fs, err := os.ReadDir(location)
 		if err != nil {
-			return src, xerrors.Errorf("cannot clean workspace folder: %w", err)
+			return src, nil, xerrors.Errorf("cannot clean workspace folder: %w", err)
 		}
 		for _, f := range fs {
 			path := filepath.Join(location, f.Name())
 			err := os.RemoveAll(path)
 			if err != nil {
-				return src, xerrors.Errorf("cannot clean workspace folder: %w", err)
+				return src, nil, xerrors.Errorf("cannot clean workspace folder: %w", err)
 			}
 		}
 
 		// Chown the workspace directory
 		err = os.Chown(location, cfg.UID, cfg.GID)
 		if err != nil {
-			return src, xerrors.Errorf("cannot create workspace: %w", err)
+			return src, nil, xerrors.Errorf("cannot create workspace: %w", err)
 		}
 	}
 
-	// Run the initializer
+	// Try to download a backup first
+	initialSize, fsErr := getFsUsage()
+	if fsErr != nil {
+		log.WithError(fsErr).Error("could not get disk usage")
+	}
+	downloadStart := time.Now()
 	hasBackup, err := remoteStorage.Download(ctx, location, storage.DefaultBackup, cfg.mappings)
 	if err != nil {
-		return src, xerrors.Errorf("cannot restore backup: %w", err)
+		return src, nil, xerrors.Errorf("cannot restore backup: %w", err)
 	}
+	downloadDuration := time.Since(downloadStart)
 
 	span.SetTag("hasBackup", hasBackup)
 	if hasBackup {
 		src = csapi.WorkspaceInitFromBackup
-	} else {
-		src, err = cfg.Initializer.Run(ctx, cfg.mappings)
-		if err != nil {
-			return src, xerrors.Errorf("cannot initialize workspace: %w", err)
+
+		currentSize, fsErr := getFsUsage()
+		if fsErr != nil {
+			log.WithError(fsErr).Error("could not get disk usage")
 		}
+		stats = []csapi.InitializerMetric{{
+			Type:     "fromBackup",
+			Duration: downloadDuration,
+			Size:     currentSize - initialSize,
+		}}
+		return
+	}
+
+	// If there is not backup, run the initializer
+	src, stats, err = cfg.Initializer.Run(ctx, cfg.mappings)
+	if err != nil {
+		return src, nil, xerrors.Errorf("cannot initialize workspace: %w", err)
 	}
 
 	return
 }
 
+// Some workspace content may have a `/dst/.gitpod` file or directory. That would break
+// the workspace ready file placement (see https://github.com/gitpod-io/gitpod/issues/7694).
+// This function ensures that workspaces do not have a `.gitpod` file or directory present.
+func EnsureCleanDotGitpodDirectory(ctx context.Context, wspath string) error {
+	var mv func(src, dst string) error
+	if git.IsWorkingCopy(wspath) {
+		c := &git.Client{
+			Location: wspath,
+		}
+		mv = func(src, dst string) error {
+			return c.Git(ctx, "mv", src, dst)
+		}
+	} else {
+		mv = os.Rename
+	}
+
+	dotGitpod := filepath.Join(wspath, ".gitpod")
+	stat, err := os.Stat(dotGitpod)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if stat.IsDir() {
+		// we need this to be a directory, we're probably ok
+		return nil
+	}
+
+	candidateFN := filepath.Join(wspath, ".gitpod.yaml")
+	if _, err := os.Stat(candidateFN); err == nil {
+		// Our candidate file already exists, hence we cannot just move things.
+		// As fallback we'll delete the .gitpod entry.
+		return os.RemoveAll(dotGitpod)
+	}
+
+	err = mv(dotGitpod, candidateFN)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // PlaceWorkspaceReadyFile writes a file in the workspace which indicates that the workspace has been initialized
-func PlaceWorkspaceReadyFile(ctx context.Context, wspath string, initsrc csapi.WorkspaceInitSource, uid, gid int) (err error) {
+func PlaceWorkspaceReadyFile(ctx context.Context, wspath string, initsrc csapi.WorkspaceInitSource, metrics csapi.InitializerMetrics, uid, gid int) (err error) {
 	//nolint:ineffassign,staticcheck
 	span, ctx := opentracing.StartSpanFromContext(ctx, "placeWorkspaceReadyFile")
 	span.SetTag("source", initsrc)
 	defer tracing.FinishSpan(span, &err)
 
 	content := csapi.WorkspaceReadyMessage{
-		Source: initsrc,
+		Source:  initsrc,
+		Metrics: metrics,
 	}
 	fc, err := json.Marshal(content)
 	if err != nil {
@@ -449,30 +565,50 @@ func PlaceWorkspaceReadyFile(ctx context.Context, wspath string, initsrc csapi.W
 	gitpodDir := filepath.Join(wspath, filepath.Dir(WorkspaceReadyFile))
 	err = os.MkdirAll(gitpodDir, 0777)
 	if err != nil {
-		return xerrors.Errorf("cannot write workspace ready file: %w", err)
+		return xerrors.Errorf("cannot create directory for workspace ready file: %w", err)
 	}
 	err = os.Chown(gitpodDir, uid, gid)
 	if err != nil {
-		return xerrors.Errorf("cannot write workspace-ready file: %w", err)
+		return xerrors.Errorf("cannot chown directory for workspace ready file: %w", err)
 	}
 
 	tempWorkspaceReadyFile := WorkspaceReadyFile + ".tmp"
 	fn := filepath.Join(wspath, tempWorkspaceReadyFile)
 	err = os.WriteFile(fn, []byte(fc), 0644)
 	if err != nil {
-		return xerrors.Errorf("cannot write workspace ready file: %w", err)
+		return xerrors.Errorf("cannot write workspace ready file content: %w", err)
 	}
 	err = os.Chown(fn, uid, gid)
 	if err != nil {
-		return xerrors.Errorf("cannot write workspace ready file: %w", err)
+		return xerrors.Errorf("cannot chown workspace ready file: %w", err)
 	}
 
 	// Theia will listen for a rename event as trigger to start the tasks. This is a rename event
 	// because we're writing to the file and this is the most convenient way we can tell Theia that we're done writing.
 	err = os.Rename(fn, filepath.Join(wspath, WorkspaceReadyFile))
 	if err != nil {
-		return xerrors.Errorf("cannot write workspace ready file: %w", err)
+		return xerrors.Errorf("cannot rename workspace ready file: %w", err)
 	}
 
+	log.WithField("content", string(fc)).WithField("destination", wspath).Info("ready file metrics")
+
 	return nil
+}
+
+func getFsUsage() (uint64, error) {
+	var stat syscall.Statfs_t
+
+	err := syscall.Statfs("/dst", &stat)
+	if os.IsNotExist(err) {
+		err = syscall.Statfs("/workspace", &stat)
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	size := uint64(stat.Blocks) * uint64(stat.Bsize)
+	free := uint64(stat.Bfree) * uint64(stat.Bsize)
+
+	return size - free, nil
 }

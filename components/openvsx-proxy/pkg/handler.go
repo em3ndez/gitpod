@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package pkg
 
@@ -43,13 +43,23 @@ func (o *OpenVSXProxy) Handler(p *httputil.ReverseProxy) func(http.ResponseWrite
 			"request_content_length": strconv.FormatInt(r.ContentLength, 10),
 		}
 
-		log.WithFields(logFields).Info("handling request")
+		log.WithFields(logFields).Debug("handling request")
 		r = r.WithContext(context.WithValue(r.Context(), REQUEST_ID_CTX, reqid))
+
+		upstream := o.GetUpstreamUrl(r)
+		r = r.WithContext(context.WithValue(r.Context(), UPSTREAM_CTX, upstream))
+
+		if o.IsDisabledCache(upstream) {
+			log.WithFields(logFields).WithField("upstream", upstream.String()).Debug("go without cache")
+			p.ServeHTTP(rw, r)
+			o.finishLog(logFields, start, false, false)
+			o.metrics.DurationRequestProcessingHistogram.Observe(time.Since(start).Seconds())
+			return
+		}
 
 		key, err := o.key(r)
 		if err != nil {
 			log.WithFields(logFields).WithError(err).Error("cannot create cache key")
-			r.Host = o.upstreamURL.Host
 			p.ServeHTTP(rw, r)
 			o.finishLog(logFields, start, hitCacheRegular, hitCacheBackup)
 			o.metrics.DurationRequestProcessingHistogram.Observe(time.Since(start).Seconds())
@@ -75,7 +85,7 @@ func (o *OpenVSXProxy) Handler(p *httputil.ReverseProxy) func(http.ResponseWrite
 					minDate := time.Now().Add(-time.Duration(o.Config.CacheDurationRegular))
 					if t.After(minDate) {
 						hitCacheRegular = true
-						log.WithFields(logFields).Infof("cached value is younger than %s - using cached value", o.Config.CacheDurationRegular)
+						log.WithFields(logFields).Debugf("cached value is younger than %s - using cached value", o.Config.CacheDurationRegular)
 						for k, v := range cached.Header {
 							for i, val := range v {
 								if i == 0 {
@@ -85,6 +95,9 @@ func (o *OpenVSXProxy) Handler(p *httputil.ReverseProxy) func(http.ResponseWrite
 								}
 							}
 						}
+						if v := rw.Header().Get("Access-Control-Allow-Origin"); v != "" && v != "*" {
+							rw.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+						}
 						rw.Header().Set("X-Cache", "HIT")
 						rw.WriteHeader(cached.StatusCode)
 						rw.Write(cached.Body)
@@ -92,17 +105,16 @@ func (o *OpenVSXProxy) Handler(p *httputil.ReverseProxy) func(http.ResponseWrite
 						o.metrics.DurationRequestProcessingHistogram.Observe(time.Since(start).Seconds())
 						return
 					} else {
-						log.WithFields(logFields).Infof("cached value is older than %s - ignoring cached value", o.Config.CacheDurationRegular)
+						log.WithFields(logFields).Debugf("cached value is older than %s - ignoring cached value", o.Config.CacheDurationRegular)
 					}
 				}
 			}
 		}
 
 		duration := time.Since(start)
-		log.WithFields(logFields).WithFields(o.DurationLogFields(duration)).Info("processing request finished")
+		log.WithFields(logFields).WithFields(o.DurationLogFields(duration)).Debug("processing request finished")
 		o.metrics.DurationRequestProcessingHistogram.Observe(duration.Seconds())
 
-		r.Host = o.upstreamURL.Host
 		p.ServeHTTP(rw, r)
 		o.finishLog(logFields, start, hitCacheRegular, hitCacheBackup)
 	}

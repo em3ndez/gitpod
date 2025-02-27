@@ -1,36 +1,46 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package registry
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	stdlog "log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/gitpod-io/gitpod/registry-facade/api/config"
+	"time"
 
 	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/registry-facade/api"
+	"github.com/gitpod-io/gitpod/registry-facade/api/config"
+	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/remotes"
+	"github.com/distribution/reference"
 	"github.com/docker/distribution"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/api/errcode"
 	distv2 "github.com/docker/distribution/registry/api/v2"
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/gorilla/mux"
+	httpapi "github.com/ipfs/kubo/client/rpc"
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // BuildStaticLayer builds a layer set from a static layer configuration
@@ -45,7 +55,7 @@ func buildStaticLayer(ctx context.Context, cfg []config.StaticLayerCfg, newResol
 			}
 			l = append(l, src)
 		case "image":
-			src, err := NewStaticSourceFromImage(ctx, newResolver(), sl.Ref)
+			src, err := NewStaticSourceFromImage(ctx, newResolver, sl.Ref)
 			if err != nil {
 				return nil, xerrors.Errorf("cannot source layer from %s: %w", sl.Ref, err)
 			}
@@ -64,7 +74,8 @@ type ResolverProvider func() remotes.Resolver
 type Registry struct {
 	Config         config.Config
 	Resolver       ResolverProvider
-	Store          content.Store
+	Store          BlobStore
+	IPFS           *IPFSBlobCache
 	LayerSource    LayerSource
 	ConfigModifier ConfigModifier
 	SpecProvider   map[string]ImageSpecProvider
@@ -76,15 +87,42 @@ type Registry struct {
 
 // NewRegistry creates a new registry
 func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus.Registerer) (*Registry, error) {
-	storePath := cfg.Store
-	if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
-		storePath = filepath.Join(tproot, storePath)
+	var mfStore BlobStore
+
+	if cfg.IPFSCache != nil && cfg.IPFSCache.Enabled {
+		if cfg.RedisCache == nil || !cfg.RedisCache.Enabled {
+			return nil, xerrors.Errorf("IPFS cache requires Redis")
+		}
 	}
-	store, err := local.NewStore(storePath)
-	if err != nil {
-		return nil, err
+
+	if cfg.RedisCache != nil && cfg.RedisCache.Enabled {
+		rdc, err := getRedisClient(cfg.RedisCache)
+		if err != nil {
+			return nil, xerrors.Errorf("cannot connect to Redis: %w", err)
+		}
+
+		mfStore = &RedisBlobStore{Client: rdc}
+		log.Info("using redis to cache manifests and config")
+
+		resolverFactory := &RedisCachedResolver{
+			Client:   rdc,
+			Provider: newResolver,
+		}
+		newResolver = resolverFactory.Factory
+		log.Info("using redis to cache references")
+	} else {
+		storePath := cfg.Store
+		if tproot := os.Getenv("TELEPRESENCE_ROOT"); tproot != "" {
+			storePath = filepath.Join(tproot, storePath)
+		}
+		var err error
+		mfStore, err = local.NewStore(storePath)
+		if err != nil {
+			return nil, err
+		}
+		log.WithField("storePath", storePath).Info("using local filesystem to cache manifests and config")
+		// TODO(cw): GC the store
 	}
-	// TODO: GC the store
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -96,15 +134,7 @@ func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus
 
 	var layerSources []LayerSource
 
-	ideRefSource := func(s *api.ImageSpec) (ref string, err error) {
-		return s.IdeRef, nil
-	}
-	ideLayerSource, err := NewSpecMappedImageSource(newResolver, ideRefSource)
-	if err != nil {
-		return nil, err
-	}
-	layerSources = append(layerSources, ideLayerSource)
-
+	// static layers
 	log.Info("preparing static layer")
 	staticLayer := NewRevisioningLayerSource(CompositeLayerSource{})
 	layerSources = append(layerSources, staticLayer)
@@ -115,6 +145,20 @@ func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus
 		}
 		staticLayer.Update(l)
 	}
+
+	// ide layer
+	ideRefSource := func(s *api.ImageSpec) (ref []string, err error) {
+		ref = append(ref, s.IdeRef, s.SupervisorRef)
+		ref = append(ref, s.IdeLayerRef...)
+		return ref, nil
+	}
+	ideLayerSource, err := NewSpecMappedImageSource(newResolver, ideRefSource)
+	if err != nil {
+		return nil, err
+	}
+	layerSources = append(layerSources, ideLayerSource)
+
+	// content layer
 	clsrc, err := NewContentLayerSource()
 	if err != nil {
 		return nil, xerrors.Errorf("cannot create content layer source: %w", err)
@@ -123,41 +167,164 @@ func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus
 
 	specProvider := map[string]ImageSpecProvider{}
 	if cfg.RemoteSpecProvider != nil {
-		grpcOpts := common_grpc.DefaultClientOptions()
-		if cfg.RemoteSpecProvider.TLS != nil {
-			tlsConfig, err := common_grpc.ClientAuthTLSConfig(
-				cfg.RemoteSpecProvider.TLS.Authority, cfg.RemoteSpecProvider.TLS.Certificate, cfg.RemoteSpecProvider.TLS.PrivateKey,
-				common_grpc.WithSetRootCAs(true),
-				common_grpc.WithServerName("ws-manager"),
-			)
+		var providers []ImageSpecProvider
+		for _, providerCfg := range cfg.RemoteSpecProvider {
+			rsp, err := createRemoteSpecProvider(providerCfg)
 			if err != nil {
-				log.WithField("config", cfg.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
-				return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+				return nil, err
 			}
 
-			grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		} else {
-			grpcOpts = append(grpcOpts, grpc.WithInsecure())
+			providers = append(providers, rsp)
 		}
 
-		specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.RemoteSpecProvider.Addr, grpcOpts))
+		specProvider[api.ProviderPrefixRemote] = NewCompositeSpecProvider(providers...)
+	}
+
+	if cfg.FixedSpecProvider != "" {
+		fc, err := ioutil.ReadFile(cfg.FixedSpecProvider)
 		if err != nil {
-			return nil, xerrors.Errorf("cannot create caching spec provider: %w", err)
+			return nil, xerrors.Errorf("cannot read fixed spec: %w", err)
 		}
-		specProvider[api.ProviderPrefixRemote] = specprov
+
+		f := make(map[string]json.RawMessage)
+		err = json.Unmarshal(fc, &f)
+		if err != nil {
+			return nil, xerrors.Errorf("cannot unmarshal fixed spec: %w", err)
+		}
+
+		prov := make(FixedImageSpecProvider)
+		for k, v := range f {
+			var spec api.ImageSpec
+			err = jsonpb.UnmarshalString(string(v), &spec)
+			if err != nil {
+				return nil, xerrors.Errorf("cannot unmarshal fixed spec: %w", err)
+			}
+			prov[k] = &spec
+		}
+		specProvider[api.ProviderPrefixFixed] = prov
+	}
+
+	var ipfs *IPFSBlobCache
+	if cfg.IPFSCache != nil && cfg.IPFSCache.Enabled {
+		addr := cfg.IPFSCache.IPFSAddr
+		if ipfsHost := os.Getenv("IPFS_HOST"); ipfsHost != "" {
+			addr = strings.ReplaceAll(addr, "$IPFS_HOST", ipfsHost)
+		}
+
+		maddr, err := ma.NewMultiaddr(strings.TrimSpace(addr))
+		if err != nil {
+			return nil, xerrors.Errorf("cannot connect to IPFS: %w", err)
+		}
+
+		core, err := httpapi.NewApiWithClient(maddr, NewRetryableHTTPClient())
+		if err != nil {
+			return nil, xerrors.Errorf("cannot connect to IPFS: %w", err)
+		}
+		rdc, err := getRedisClient(cfg.RedisCache)
+		if err != nil {
+			return nil, xerrors.Errorf("cannot connect to Redis: %w", err)
+		}
+
+		ipfs = &IPFSBlobCache{
+			Redis: rdc,
+			IPFS:  core,
+		}
+		log.WithField("config", cfg.IPFSCache).Info("enabling IPFS caching")
 	}
 
 	layerSource := CompositeLayerSource(layerSources)
 	return &Registry{
 		Config:            cfg,
 		Resolver:          newResolver,
-		Store:             store,
+		Store:             mfStore,
+		IPFS:              ipfs,
 		SpecProvider:      specProvider,
 		LayerSource:       layerSource,
 		staticLayerSource: staticLayer,
 		ConfigModifier:    NewConfigModifierFromLayerSource(layerSource),
 		metrics:           metrics,
 	}, nil
+}
+
+func createRemoteSpecProvider(cfg *config.RSProvider) (ImageSpecProvider, error) {
+	grpcOpts := common_grpc.DefaultClientOptions()
+	if cfg.TLS != nil {
+		tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+			cfg.TLS.Authority, cfg.TLS.Certificate, cfg.TLS.PrivateKey,
+			common_grpc.WithSetRootCAs(true),
+			common_grpc.WithServerName("ws-manager"),
+		)
+		if err != nil {
+			log.WithField("config", cfg.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
+			return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+		}
+
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	} else {
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.Addr, grpcOpts))
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create caching spec provider: %w", err)
+	}
+
+	return specprov, nil
+}
+
+func getRedisClient(cfg *config.RedisCacheConfig) (*redis.Client, error) {
+	if cfg.SingleHostAddress == "" {
+		return nil, xerrors.Errorf("registry-facade setting 'singleHostAddr' is missing")
+	}
+
+	opts := &redis.Options{
+		Addr:     cfg.SingleHostAddress,
+		Username: "default",
+		Password: cfg.Password,
+	}
+
+	if cfg.Username != "" {
+		opts.Username = cfg.Username
+	}
+
+	if cfg.UseTLS {
+		opts.TLSConfig = &tls.Config{
+			// golang tls does not support verify certificate without any SANs
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+		}
+	}
+
+	log.WithField("addr", cfg.SingleHostAddress).WithField("username", cfg.Username).WithField("tls", cfg.UseTLS).Info("connecting to Redis")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rdc := redis.NewClient(opts)
+
+	var lastError error
+	waitErr := wait.ExponentialBackoffWithContext(ctx, wait.Backoff{
+		Steps:    5,
+		Duration: 50 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.2,
+	}, func(ctx context.Context) (bool, error) {
+		_, err := rdc.Ping(ctx).Result()
+		if err != nil {
+			lastError = err
+			return false, nil
+		}
+
+		return true, nil
+	})
+	if waitErr != nil {
+		if waitErr == wait.ErrWaitTimeout {
+			return nil, xerrors.Errorf("cannot check Redis connection: %w", lastError)
+		}
+
+		return nil, waitErr
+	}
+
+	return rdc, nil
 }
 
 // UpdateStaticLayer updates the static layer a registry-facade adds
@@ -188,7 +355,7 @@ func (reg *Registry) Serve() error {
 		// e.g. using curl or another Docker daemon. Using the env var we can enable an additional
 		// HTTP service.
 		//
-		// Note: this is is just meant for a telepresence setup
+		// Note: this is just meant for a telepresence setup
 		go func() {
 			err := http.ListenAndServe(addr, mux)
 			if err != nil {
@@ -204,8 +371,9 @@ func (reg *Registry) Serve() error {
 	}
 
 	reg.srv = &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:     addr,
+		Handler:  mux,
+		ErrorLog: stdlog.New(logrusErrorWriter{}, "", 0),
 	}
 
 	if reg.Config.TLS != nil {
@@ -388,4 +556,17 @@ func getDigest(ctx context.Context) string {
 	}
 
 	return sval
+}
+
+var tlsHandshakeErrorPrefix = []byte("http: TLS handshake error")
+
+type logrusErrorWriter struct{}
+
+func (w logrusErrorWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, tlsHandshakeErrorPrefix) {
+		return len(p), nil
+	}
+
+	log.Errorf("%s", string(p))
+	return len(p), nil
 }

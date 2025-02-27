@@ -1,10 +1,11 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
 import (
+	"context"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -35,7 +36,7 @@ var ablazeCmd = &cobra.Command{
 			log.WithError(err).Fatal("cannot connect to Kubernetes")
 		}
 
-		services, err := client.CoreV1().Services(ns).List(metav1.ListOptions{})
+		services, err := client.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{})
 		if err != nil {
 			log.WithError(err).Fatal("cannot list services")
 		}

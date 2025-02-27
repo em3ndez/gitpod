@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package api
 
@@ -12,4 +12,8 @@ const (
 
 	// ProviderPrefixRemote is the image repository prefix for remotely fetched image specs
 	ProviderPrefixRemote = "remote"
+
+	// ProviderPrefixFixed is the image repository prefix for fixed image spec. This is useful
+	// for debugging only.
+	ProviderPrefixFixed = "fixed"
 )

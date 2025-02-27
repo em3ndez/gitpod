@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package content
 
@@ -9,12 +9,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -29,6 +31,7 @@ import (
 	"github.com/gitpod-io/gitpod/content-service/pkg/archive"
 	wsinit "github.com/gitpod-io/gitpod/content-service/pkg/initializer"
 	"github.com/gitpod-io/gitpod/content-service/pkg/storage"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/libcontainer/specconv"
 )
 
 // RunInitializerOpts configure RunInitializer
@@ -62,7 +65,7 @@ var (
 	errCannotFindSnapshot = errors.New("cannot find snapshot")
 )
 
-func collectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps storage.PresignedAccess, workspaceOwner string, initializer *csapi.WorkspaceInitializer) (rc map[string]storage.DownloadInfo, err error) {
+func CollectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps storage.PresignedAccess, workspaceOwner string, initializer *csapi.WorkspaceInitializer) (rc map[string]storage.DownloadInfo, err error) {
 	rc = make(map[string]storage.DownloadInfo)
 
 	backup, err := ps.SignDownload(ctx, rs.Bucket(workspaceOwner), rs.BackupObject(storage.DefaultBackup), &storage.SignedURLOptions{})
@@ -74,7 +77,19 @@ func collectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps stora
 		rc[storage.DefaultBackup] = *backup
 	}
 
-	if si := initializer.GetSnapshot(); si != nil {
+	si := initializer.GetSnapshot()
+	pi := initializer.GetPrebuild()
+	if ci := initializer.GetComposite(); ci != nil {
+		for _, c := range ci.Initializer {
+			if c.GetSnapshot() != nil {
+				si = c.GetSnapshot()
+			}
+			if c.GetPrebuild() != nil {
+				pi = c.GetPrebuild()
+			}
+		}
+	}
+	if si != nil {
 		bkt, obj, err := storage.ParseSnapshotName(si.Snapshot)
 		if err != nil {
 			return nil, err
@@ -89,8 +104,8 @@ func collectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps stora
 
 		rc[si.Snapshot] = *info
 	}
-	if si := initializer.GetPrebuild(); si != nil && si.Prebuild != nil && si.Prebuild.Snapshot != "" {
-		bkt, obj, err := storage.ParseSnapshotName(si.Prebuild.Snapshot)
+	if pi != nil && pi.Prebuild != nil && pi.Prebuild.Snapshot != "" {
+		bkt, obj, err := storage.ParseSnapshotName(pi.Prebuild.Snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -100,7 +115,7 @@ func collectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps stora
 		} else if err != nil {
 			return nil, xerrors.Errorf("cannot find prebuild: %w", err)
 		} else {
-			rc[si.Prebuild.Snapshot] = *info
+			rc[pi.Prebuild.Snapshot] = *info
 		}
 	}
 
@@ -108,21 +123,22 @@ func collectRemoteContent(ctx context.Context, rs storage.DirectAccess, ps stora
 }
 
 // RunInitializer runs a content initializer in a user, PID and mount namespace to isolate it from ws-daemon
-func RunInitializer(ctx context.Context, destination string, initializer *csapi.WorkspaceInitializer, remoteContent map[string]storage.DownloadInfo, opts RunInitializerOpts) (err error) {
+func RunInitializer(ctx context.Context, destination string, initializer *csapi.WorkspaceInitializer, remoteContent map[string]storage.DownloadInfo, opts RunInitializerOpts) (*csapi.InitializerMetrics, error) {
 	//nolint:ineffassign,staticcheck
 	span, ctx := opentracing.StartSpanFromContext(ctx, "RunInitializer")
+	var err error
 	defer tracing.FinishSpan(span, &err)
 
 	// it's possible the destination folder doesn't exist yet, because the kubelet hasn't created it yet.
 	// If we fail to create the folder, it either already exists, or we'll fail when we try and mount it.
 	err = os.MkdirAll(destination, 0755)
 	if err != nil && !os.IsExist(err) {
-		return xerrors.Errorf("cannot mkdir destination: %w", err)
+		return nil, xerrors.Errorf("cannot mkdir destination: %w", err)
 	}
 
 	init, err := proto.Marshal(initializer)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if opts.GID == 0 {
@@ -134,13 +150,13 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 
 	tmpdir, err := os.MkdirTemp("", "content-init")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.RemoveAll(tmpdir)
 
 	err = os.MkdirAll(filepath.Join(tmpdir, "rootfs"), 0755)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	msg := msgInitContent{
@@ -155,33 +171,17 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 	}
 	fc, err := json.MarshalIndent(msg, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	err = os.WriteFile(filepath.Join(tmpdir, "rootfs", "content.json"), fc, 0644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	cmd := exec.Command("runc", "spec")
-	cmd.Dir = tmpdir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return xerrors.Errorf("cannot create runc spec: %s: %w", string(out), err)
-	}
-
-	cfgFN := filepath.Join(tmpdir, "config.json")
-	var spec specs.Spec
-	fc, err = os.ReadFile(cfgFN)
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(fc, &spec)
-	if err != nil {
-		return err
-	}
+	spec := specconv.Example()
 
 	// we assemble the root filesystem from the ws-daemon container
-	for _, d := range []string{"app", "bin", "dev", "etc", "lib", "opt", "sbin", "sys", "usr", "var"} {
+	for _, d := range []string{"app", "bin", "dev", "etc", "lib", "opt", "sbin", "sys", "usr", "var", "lib32", "lib64", "tmp"} {
 		spec.Mounts = append(spec.Mounts, specs.Mount{
 			Destination: "/" + d,
 			Source:      "/" + d,
@@ -203,7 +203,7 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 	spec.Process.User.GID = opts.GID
 	spec.Process.Args = []string{"/app/content-initializer"}
 	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "JAEGER_") {
+		if strings.HasPrefix(e, "JAEGER_") || strings.HasPrefix(e, "GIT_SSL_CAPATH=") || strings.HasPrefix(e, "GIT_SSL_CAINFO=") {
 			spec.Process.Env = append(spec.Process.Env, e)
 		}
 	}
@@ -228,11 +228,11 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 
 	fc, err = json.MarshalIndent(spec, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = os.WriteFile(cfgFN, fc, 0644)
+	err = os.WriteFile(filepath.Join(tmpdir, "config.json"), fc, 0644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	args := []string{"--root", "state"}
@@ -245,39 +245,117 @@ func RunInitializer(ctx context.Context, destination string, initializer *csapi.
 	if opts.OWI.InstanceID == "" {
 		id, err := uuid.NewRandom()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		name = "init-rnd-" + id.String()
 	} else {
 		name = "init-ws-" + opts.OWI.InstanceID
 	}
 
-	args = append(args, "--log-format", "json", "run", name)
+	// pass a pipe "file" to the content init process as fd 3 to capture the error output
+	errIn, errOut, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+
+	// pass a pipe "file" to the content init process as fd 4 to capture the metrics output
+	statsIn, statsOut, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+
+	args = append(args, "--log-format", "json", "run")
+	extraFiles := []*os.File{errOut, statsOut}
+	args = append(args, "--preserve-fds", strconv.Itoa(len(extraFiles)))
+	args = append(args, name)
 
 	var cmdOut bytes.Buffer
-	cmd = exec.Command("runc", args...)
+	cmd := exec.Command("runc", args...)
 	cmd.Dir = tmpdir
 	cmd.Stdout = &cmdOut
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.ExtraFiles = extraFiles
 	err = cmd.Run()
 	log.FromBuffer(&cmdOut, log.WithFields(opts.OWI.Fields()))
+
+	// read contents of the extra files
+	errOut.Close()
+	statsOut.Close()
+	errmsg, statsBytes := waitForAndReadExtraFiles(errIn, statsIn)
 	if err != nil {
 		if exiterr, ok := err.(*exec.ExitError); ok {
-			// The program has exited with an exit code != 0. If it's 42, it was deliberate.
-			if status, ok := exiterr.Sys().(syscall.WaitStatus); ok && status.ExitStatus() == 42 {
-				return xerrors.Errorf("content initializer failed")
+			// The program has exited with an exit code != 0. If it's FAIL_CONTENT_INITIALIZER_EXIT_CODE, it was deliberate.
+			if status, ok := exiterr.Sys().(syscall.WaitStatus); ok && status.ExitStatus() == FAIL_CONTENT_INITIALIZER_EXIT_CODE {
+				log.WithError(err).WithFields(opts.OWI.Fields()).WithField("errmsgsize", len(errmsg)).WithField("exitCode", status.ExitStatus()).WithField("args", args).Error("content init failed")
+				return nil, xerrors.Errorf(string(errmsg))
 			}
 		}
 
-		return err
+		return nil, err
 	}
 
-	return nil
+	stats := parseStats(statsBytes)
+	return stats, nil
 }
 
+// waitForAndReadExtraFiles tries to read the content of the extra files passed to the content initializer, and waits up to 1s to do so
+func waitForAndReadExtraFiles(errIn *os.File, statsIn *os.File) (errmsg []byte, statsBytes []byte) {
+	// read err
+	errch := make(chan []byte, 1)
+	go func() {
+		errmsg, _ := io.ReadAll(errIn)
+		errch <- errmsg
+	}()
+
+	// read stats
+	statsCh := make(chan []byte, 1)
+	go func() {
+		statsBytes, readErr := io.ReadAll(statsIn)
+		if readErr != nil {
+			log.WithError(readErr).Warn("cannot read stats")
+		}
+		log.WithField("statsBytes", log.TrustedValueWrap{Value: string(statsBytes)}).Debug("read stats")
+		statsCh <- statsBytes
+	}()
+
+	readFiles := 0
+	for {
+		select {
+		case errmsg = <-errch:
+			readFiles += 1
+		case statsBytes = <-statsCh:
+			readFiles += 1
+		case <-time.After(1 * time.Second):
+			if errmsg == nil {
+				errmsg = []byte("failed to read content initializer response")
+			}
+			return
+		}
+		if readFiles == 2 {
+			return
+		}
+	}
+}
+
+func parseStats(statsBytes []byte) *csapi.InitializerMetrics {
+	var stats csapi.InitializerMetrics
+	err := json.Unmarshal(statsBytes, &stats)
+	if err != nil {
+		log.WithError(err).WithField("bytes", log.TrustedValueWrap{Value: statsBytes}).Warn("cannot unmarshal stats")
+		return nil
+	}
+	return &stats
+}
+
+// RUN_INITIALIZER_CHILD_ERROUT_FD is the fileDescriptor of the "errout" file descriptor passed to the content initializer
+const RUN_INITIALIZER_CHILD_ERROUT_FD = 3
+
+// RUN_INITIALIZER_CHILD_STATS_FD is the fileDescriptor of the "stats" file descriptor passed to the content initializer
+const RUN_INITIALIZER_CHILD_STATS_FD = 4
+
 // RunInitializerChild is the function that's expected to run when we call `/proc/self/exe content-initializer`
-func RunInitializerChild() (err error) {
+func RunInitializerChild(statsFd *os.File) (err error) {
 	fc, err := os.ReadFile("/content.json")
 	if err != nil {
 		return err
@@ -308,12 +386,13 @@ func RunInitializerChild() (err error) {
 
 	rs := &remoteContentStorage{RemoteContent: initmsg.RemoteContent}
 
-	initializer, err := wsinit.NewFromRequest(ctx, "/dst", rs, &req, wsinit.NewFromRequestOpts{ForceGitpodUserForGit: false})
+	dst := initmsg.Destination
+	initializer, err := wsinit.NewFromRequest(ctx, dst, rs, &req, wsinit.NewFromRequestOpts{ForceGitpodUserForGit: false})
 	if err != nil {
 		return err
 	}
 
-	initSource, err := wsinit.InitializeWorkspace(ctx, "/dst", rs,
+	initSource, stats, err := wsinit.InitializeWorkspace(ctx, dst, rs,
 		wsinit.WithInitializer(initializer),
 		wsinit.WithMappings(initmsg.IDMappings),
 		wsinit.WithChown(initmsg.UID, initmsg.GID),
@@ -323,13 +402,43 @@ func RunInitializerChild() (err error) {
 		return err
 	}
 
-	// Place the ready file to make Theia "open its gates"
-	err = wsinit.PlaceWorkspaceReadyFile(ctx, "/dst", initSource, initmsg.UID, initmsg.GID)
+	// some workspace content may have a `/dst/.gitpod` file or directory. That would break
+	// the workspace ready file placement (see https://github.com/gitpod-io/gitpod/issues/7694).
+	err = wsinit.EnsureCleanDotGitpodDirectory(ctx, dst)
 	if err != nil {
 		return err
 	}
 
+	// Place the ready file to make Theia "open its gates"
+	err = wsinit.PlaceWorkspaceReadyFile(ctx, dst, initSource, stats, initmsg.UID, initmsg.GID)
+	if err != nil {
+		return err
+	}
+
+	// Serialize metrics, so we can pass them back to the caller
+	if statsFd != nil {
+		defer statsFd.Close()
+		writeInitializerStats(statsFd, &stats)
+	} else {
+		log.Warn("no stats file descriptor provided")
+	}
+
 	return nil
+}
+
+func writeInitializerStats(statsFd *os.File, stats *csapi.InitializerMetrics) {
+	serializedStats, err := json.Marshal(stats)
+	if err != nil {
+		log.WithError(err).Warn("cannot serialize initializer stats")
+		return
+	}
+
+	log.WithField("stats", log.TrustedValueWrap{Value: string(serializedStats)}).Debug("writing initializer stats to fd")
+	_, writeErr := statsFd.Write(serializedStats)
+	if writeErr != nil {
+		log.WithError(writeErr).Warn("error writing initializer stats to fd")
+		return
+	}
 }
 
 var _ storage.DirectAccess = &remoteContentStorage{}
@@ -350,21 +459,59 @@ func (rs *remoteContentStorage) EnsureExists(ctx context.Context) error {
 
 // Download always returns false and does nothing
 func (rs *remoteContentStorage) Download(ctx context.Context, destination string, name string, mappings []archive.IDMapping) (exists bool, err error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "remoteContentStorage.Download")
+	span.SetTag("destination", destination)
+	span.SetTag("name", name)
+	defer tracing.FinishSpan(span, &err)
+
 	info, exists := rs.RemoteContent[name]
 	if !exists {
 		return false, nil
 	}
 
-	resp, err := http.Get(info.URL)
-	if err != nil {
-		return true, err
-	}
-	defer resp.Body.Close()
+	span.SetTag("URL", info.URL)
 
-	err = archive.ExtractTarbal(ctx, resp.Body, destination, archive.WithUIDMapping(mappings), archive.WithGIDMapping(mappings))
+	// create a temporal file to download the content
+	tempFile, err := os.CreateTemp("", "remote-content-*")
+	if err != nil {
+		return true, xerrors.Errorf("cannot create temporal file: %w", err)
+	}
+	tempFile.Close()
+
+	args := []string{
+		"-s10", "-x16", "-j12",
+		"--retry-wait=5",
+		"--log-level=error",
+		"--allow-overwrite=true", // rewrite temporal empty file
+		info.URL,
+		"-o", tempFile.Name(),
+	}
+
+	downloadStart := time.Now()
+	cmd := exec.Command("aria2c", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.WithError(err).WithField("out", string(out)).Error("unexpected error downloading file")
+		return true, xerrors.Errorf("unexpected error downloading file")
+	}
+	downloadDuration := time.Since(downloadStart)
+	log.WithField("downloadDuration", downloadDuration.String()).Info("aria2c download duration")
+
+	tempFile, err = os.Open(tempFile.Name())
+	if err != nil {
+		return true, xerrors.Errorf("unexpected error downloading file")
+	}
+
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	extractStart := time.Now()
+	err = archive.ExtractTarbal(ctx, tempFile, destination, archive.WithUIDMapping(mappings), archive.WithGIDMapping(mappings))
 	if err != nil {
 		return true, xerrors.Errorf("tar %s: %s", destination, err.Error())
 	}
+	extractDuration := time.Since(extractStart)
+	log.WithField("extractDuration", extractDuration.String()).Info("extract tarbal duration")
 
 	return true, nil
 }

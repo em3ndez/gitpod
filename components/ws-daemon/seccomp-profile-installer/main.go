@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package main
 
@@ -31,6 +31,7 @@ func main() {
 		specs.LinuxSyscall{
 			Names: []string{
 				"clone",
+				"clone3",
 				"mount",
 				"umount2",
 				"chroot",
@@ -38,11 +39,14 @@ func main() {
 				"setdomainname",
 				"sethostname",
 				"unshare",
+				"keyctl",
+				"add_key",
+				"request_key",
 			},
 			Action: specs.ActAllow,
 		},
 
-		// slirp4netns requires setns, as do we for debugging
+		// Running docker on a workspace requires setns
 		// TODO(cw): find means to make this more precise, maybe an eBPF program that checks if
 		//           arg zero is a child of this netns. The kernel already does that (from the setns(2) man page):
 		//              In order to reassociate itself with a new network, IPC, time,
@@ -52,14 +56,6 @@ func main() {
 		specs.LinuxSyscall{
 			Names:  []string{"setns"},
 			Action: specs.ActAllow,
-		},
-		specs.LinuxSyscall{
-			Names: []string{
-				"keyctl",
-			},
-			// prevent call and return ENOSYS to make runc happy
-			// (see https://github.com/opencontainers/runc/issues/1889)
-			Action: specs.ActTrace,
 		},
 	)
 

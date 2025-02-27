@@ -1,16 +1,16 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package content
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/gitpod-io/gitpod/common-go/util"
 	cntntcfg "github.com/gitpod-io/gitpod/content-service/api/config"
 	"github.com/gitpod-io/gitpod/ws-daemon/api"
-	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
 	"golang.org/x/xerrors"
 )
 
@@ -27,9 +27,6 @@ type Config struct {
 
 	// TmpDir is the temp working diretory for creating tar files during upload
 	TmpDir string `json:"tempDir"`
-
-	// Limit limits the size of a sandbox
-	WorkspaceSizeLimit quota.Size `json:"workspaceSizeLimit"`
 
 	// Storage is some form of permanent file store to which we back up workspaces
 	Storage cntntcfg.StorageConfig `json:"storage"`
@@ -62,6 +59,16 @@ type UserNamespacesConfig struct {
 }
 
 type FSShiftMethod api.FSShiftMethod
+
+// MarshalJSON marshals the api.FSShiftMethod to the api.FSShiftMethod_value
+func (m FSShiftMethod) MarshalJSON() ([]byte, error) {
+	methodInt := int32(m)
+	v, ok := api.FSShiftMethod_name[methodInt]
+	if !ok {
+		return nil, xerrors.Errorf("invalid shift method: %i", methodInt)
+	}
+	return json.Marshal(v)
+}
 
 // UnmarshalJSON unmarshals the lowercase shift method string as defined in
 // api.FSShiftMethod_value to api.FSShiftMethod

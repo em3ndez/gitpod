@@ -1,41 +1,39 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
-
-import * as express from 'express';
-import { AuthProviderInfo, User, OAuth2Config, AuthProviderEntry } from "@gitpod/gitpod-protocol";
-import { saveSession } from '../express-util';
+import express from "express";
+import { AuthProviderInfo, User, AuthProviderEntry, Token } from "@gitpod/gitpod-protocol";
 
 import { UserEnvVarValue } from "@gitpod/gitpod-protocol";
 
 export const AuthProviderParams = Symbol("AuthProviderParams");
 export interface AuthProviderParams extends AuthProviderEntry {
-    readonly builtin: boolean; // true, if `ownerId` == ""
-    readonly verified: boolean; // true, if `status` == "verified"
+    /**
+     * computed value: `true`, if `ownerId` == ""
+     */
+    readonly builtin: boolean;
+    /**
+     * computed value: `true`, if `status` == "verified"
+     */
+    readonly verified: boolean;
 
-    readonly oauth: OAuth2Config & {
-        // extending:
-        readonly configFn?: string;
-    }
-
-    // for special auth providers only
-    readonly params?: {
-        [key: string]: string;
-        readonly authUrl: string;
-        readonly callBackUrl: string;
-        readonly githubToken: string;
-    }
-
-    // properties to control behavior
     readonly hiddenOnDashboard?: boolean;
-    readonly loginContextMatcher?: string;
-    readonly disallowLogin?: boolean;
-    readonly requireTOS?: boolean;
 
+    /**
+     * @deprecated unused
+     */
+    readonly disallowLogin?: boolean;
+
+    /**
+     * @deprecated unused
+     */
     readonly description: string;
+    /**
+     * @deprecated unused
+     */
     readonly icon: string;
 }
 export function parseAuthProviderParamsFromEnv(json: object): AuthProviderParams[] {
@@ -44,7 +42,9 @@ export function parseAuthProviderParamsFromEnv(json: object): AuthProviderParams
     }
     return [];
 }
-export function normalizeAuthProviderParams(params: Omit<AuthProviderParams, "ownerId" | "builtin" | "status" | "verified">[]): AuthProviderParams[] {
+export function normalizeAuthProviderParams(
+    params: Omit<AuthProviderParams, "ownerId" | "builtin" | "status" | "verified">[],
+): AuthProviderParams[] {
     const result: AuthProviderParams[] = [];
     for (const p of params) {
         result.push({
@@ -53,7 +53,7 @@ export function normalizeAuthProviderParams(params: Omit<AuthProviderParams, "ow
             builtin: true,
             status: "verified",
             verified: true,
-        })
+        });
     }
     return result;
 }
@@ -71,17 +71,26 @@ export interface AuthUser {
     readonly primaryEmail: string;
     readonly name?: string;
     readonly avatarUrl?: string;
+    readonly company?: string;
+    readonly created_at?: string;
 }
 
-export const AuthProvider = Symbol('AuthProvider');
+export const AuthProvider = Symbol("AuthProvider");
 export interface AuthProvider {
     readonly authProviderId: string;
     readonly params: AuthProviderParams;
     readonly info: AuthProviderInfo;
     readonly authCallbackPath: string;
     callback(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void>;
-    authorize(req: express.Request, res: express.Response, next: express.NextFunction, scopes?: string[]): void;
-    refreshToken?(user: User): Promise<void>;
+    authorize(
+        req: express.Request,
+        res: express.Response,
+        next: express.NextFunction,
+        state: string,
+        scopes?: string[],
+    ): void;
+    refreshToken?(user: User, requestedLifetimeDate: Date): Promise<Token>;
+    requiresOpportunisticRefresh?(): boolean;
 }
 
 export interface AuthFlow {
@@ -90,20 +99,18 @@ export interface AuthFlow {
     readonly overrideScopes?: boolean;
 }
 export namespace AuthFlow {
-    const storageKey = "authFlow";
-    export function get(session: Express.Session | undefined): AuthFlow | undefined {
-        if (session) {
-            return session[storageKey] as AuthFlow | undefined;
+    export function is(obj: any): obj is AuthFlow {
+        if (obj === undefined) {
+            return false;
         }
-    }
-    export async function attach(session: Express.Session, authFlow: AuthFlow): Promise<void> {
-        session[storageKey] = authFlow;
-        return saveSession(session);
-    }
-    export async function clear(session: Express.Session | undefined) {
-        if (session) {
-            session[storageKey] = undefined;
-            return saveSession(session);
+        if (typeof obj !== "object") {
+            return false;
         }
+
+        if (!("host" in obj) || !("returnTo" in obj)) {
+            return false;
+        }
+
+        return true;
     }
 }

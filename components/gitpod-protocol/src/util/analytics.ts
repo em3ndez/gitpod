@@ -1,18 +1,20 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import Analytics = require("analytics-node");
 import { IAnalyticsWriter, IdentifyMessage, TrackMessage, PageMessage } from "../analytics";
-import { log } from './logging';
-
+import { log } from "./logging";
 
 export function newAnalyticsWriterFromEnv(): IAnalyticsWriter {
     switch (process.env.GITPOD_ANALYTICS_WRITER) {
         case "segment":
-            return new SegmentAnalyticsWriter(process.env.GITPOD_ANALYTICS_SEGMENT_KEY || "");
+            return new SegmentAnalyticsWriter(
+                process.env.GITPOD_ANALYTICS_SEGMENT_KEY || "",
+                process.env.GITPOD_ANALYTICS_SEGMENT_ENDPOINT || "",
+            );
         case "log":
             return new LogAnalyticsWriter();
         default:
@@ -21,20 +23,30 @@ export function newAnalyticsWriterFromEnv(): IAnalyticsWriter {
 }
 
 class SegmentAnalyticsWriter implements IAnalyticsWriter {
-
     protected readonly analytics: Analytics;
 
-    constructor(writeKey: string) {
-        this.analytics = new Analytics(writeKey);
+    constructor(writeKey: string, endpoint: string) {
+        this.analytics = new Analytics(writeKey, {
+            host: endpoint,
+        });
     }
 
-        identify(msg: IdentifyMessage) {
+    identify(msg: IdentifyMessage) {
         try {
-            this.analytics.identify(msg, (err: Error) => {
-                if (err) {
-                    log.warn("analytics.identify failed", err);
-                }
-            });
+            this.analytics.identify(
+                {
+                    ...msg,
+                    integrations: {
+                        All: true,
+                        Mixpanel: !!msg.userId,
+                    },
+                },
+                (err: Error) => {
+                    if (err) {
+                        log.warn("analytics.identify failed", err);
+                    }
+                },
+            );
         } catch (err) {
             log.warn("analytics.identify failed", err);
         }
@@ -42,32 +54,48 @@ class SegmentAnalyticsWriter implements IAnalyticsWriter {
 
     track(msg: TrackMessage) {
         try {
-            this.analytics.track(msg, (err: Error) => {
-                if (err) {
-                    log.warn("analytics.track failed", err);
-                }
-            });
+            this.analytics.track(
+                {
+                    ...msg,
+                    integrations: {
+                        All: true,
+                        Mixpanel: !!msg.userId,
+                    },
+                },
+                (err: Error) => {
+                    if (err) {
+                        log.warn("analytics.track failed", err);
+                    }
+                },
+            );
         } catch (err) {
             log.warn("analytics.track failed", err);
         }
     }
 
     page(msg: PageMessage) {
-        try{
-            this.analytics.page(msg, (err: Error) => {
-                if (err) {
-                    log.warn("analytics.page failed", err);
-                }
-            });
+        try {
+            this.analytics.page(
+                {
+                    ...msg,
+                    integrations: {
+                        All: true,
+                        Mixpanel: !!msg.userId,
+                    },
+                },
+                (err: Error) => {
+                    if (err) {
+                        log.warn("analytics.page failed", err);
+                    }
+                },
+            );
         } catch (err) {
             log.warn("analytics.page failed", err);
         }
     }
-
 }
 
 class LogAnalyticsWriter implements IAnalyticsWriter {
-
     identify(msg: IdentifyMessage): void {
         log.debug("analytics identify", msg);
     }
@@ -77,7 +105,6 @@ class LogAnalyticsWriter implements IAnalyticsWriter {
     page(msg: PageMessage): void {
         log.debug("analytics page", msg);
     }
-
 }
 
 class NoAnalyticsWriter implements IAnalyticsWriter {

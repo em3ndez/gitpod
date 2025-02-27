@@ -61,6 +61,9 @@ message GitInitializer {
 
     // config specifies the Git configuration for this workspace
     GitConfig config = 6;
+
+    // full_clone determines if the entire repository should be cloned, instead of with `--depth=1`
+    bool full_clone = 7;
 }
 
 // CloneTargetMode is the target state in which we want to leave a GitWorkspace
@@ -112,17 +115,22 @@ enum GitAuthMethod {
 message SnapshotInitializer {
     // name of the snapshot to restore
     string snapshot = 1;
+    // if snapshot string is volume snapshot and not GCS url
+    bool from_volume_snapshot = 2;
 }
 
 // A prebuild initializer combines snapshots with Git: first we try the snapshot, then apply the Git clone target.
-// If restoring the snapshot fails, we fall back to a regular Git initializer.
+// If restoring the snapshot fails, we fall back to a regular Git initializer, which might be composite git initializer for multi-repo projects.
 message PrebuildInitializer {
     SnapshotInitializer prebuild = 1;
-    GitInitializer git = 2;
+    repeated GitInitializer git = 2;
 }
 
 // FromBackupInitializer initializes content from a previously made backup
-message FromBackupInitializer {}
+message FromBackupInitializer {
+    string checkout_location = 1;
+    bool from_volume_snapshot = 2;
+}
 
 // GitStatus describes the current Git working copy status, akin to a combination of "git status" and "git branch"
 message GitStatus {

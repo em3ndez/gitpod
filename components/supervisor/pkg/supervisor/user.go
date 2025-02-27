@@ -1,17 +1,22 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package supervisor
 
 import (
+	"fmt"
+	"io/ioutil"
+	"os"
 	"os/exec"
 	"os/user"
+	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/gitpod-io/gitpod/common-go/log"
 	"golang.org/x/xerrors"
+
+	"github.com/gitpod-io/gitpod/common-go/log"
 )
 
 type lookup interface {
@@ -40,6 +45,9 @@ func AddGitpodUserIfNotExists() error {
 		if err != nil {
 			return err
 		}
+	}
+	if err := addSudoer(gitpodGroupName); err != nil {
+		log.WithError(err).Error("add gitpod sudoers")
 	}
 
 	targetUser := &user.User{
@@ -85,7 +93,7 @@ func hasGroup(name string, gid int) (bool, error) {
 	}
 	if grpByID == nil && grpByName != nil {
 		// a group with this name already exists, but has a different GID
-		return true, xerrors.Errorf("group named %s exists but uses different GID %s", name, grpByName.Gid)
+		return true, xerrors.Errorf("group named %s exists but uses different GID %s, should be: %d", name, grpByName.Gid, gitpodGID)
 	}
 
 	// group exists and all is well
@@ -119,7 +127,7 @@ func hasUser(u *user.User) (bool, error) {
 	}
 	if userByID == nil && userByName != nil {
 		// a user with this name already exists, but has a different GID
-		return true, xerrors.Errorf("user named %s exists but uses different UID %s", u.Username, userByName.Uid)
+		return true, xerrors.Errorf("user named %s exists but uses different UID %s, should be: %d", u.Username, userByName.Uid, gitpodUID)
 	}
 
 	// at this point it doesn't matter if we use userByID or byName - they're likely the same
@@ -137,12 +145,12 @@ func hasUser(u *user.User) (bool, error) {
 }
 
 func addGroup(name string, gid int) error {
-	flavour := determineAdduserFlavour()
-	if flavour == adduserUnknown {
+	flavour := determineAddgroupFlavour()
+	if flavour == cmdUnknown {
 		return xerrors.Errorf("no addgroup command found")
 	}
 
-	args := addgroupCommand[flavour](name, gid)
+	args := addgroupCommands[flavour](name, gid)
 	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
 	if err != nil {
 		return xerrors.Errorf("%w: %s", err, string(out))
@@ -154,11 +162,11 @@ func addGroup(name string, gid int) error {
 
 func addUser(opts *user.User) error {
 	flavour := determineAdduserFlavour()
-	if flavour == adduserUnknown {
+	if flavour == cmdUnknown {
 		return xerrors.Errorf("no adduser command found")
 	}
 
-	args := adduserCommand[flavour](opts)
+	args := adduserCommands[flavour](opts)
 	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
 	if err != nil {
 		return xerrors.Errorf("%v: %w: %s", args, err, string(out))
@@ -168,66 +176,100 @@ func addUser(opts *user.User) error {
 	return nil
 }
 
-func determineAdduserFlavour() adduserFlavour {
-	for flavour, gen := range adduserCommand {
-		args := gen(&user.User{})
-		var flags []string
-		for _, a := range args {
-			if len(a) > 0 && a[0] == '-' {
-				flags = append(flags, a)
-			}
-		}
+// addSudoer check and add group to /etc/sudoers
+func addSudoer(group string) error {
+	if group == "" {
+		return xerrors.Errorf("group name should not be empty")
+	}
+	sudoersPath := "/etc/sudoers"
+	finfo, err := os.Stat(sudoersPath)
+	if err != nil {
+		return err
+	}
+	b, err := ioutil.ReadFile(sudoersPath)
+	if err != nil {
+		return err
+	}
+	gitpodSudoer := []byte(fmt.Sprintf("%%%s ALL=NOPASSWD:ALL", group))
+	// Line starts with "%gitpod ..."
+	re := regexp.MustCompile(fmt.Sprintf("(?m)^%%%s\\s+.*?$", group))
+	if len(re.FindStringIndex(string(b))) > 0 {
+		nb := re.ReplaceAll(b, gitpodSudoer)
+		return os.WriteFile(sudoersPath, nb, finfo.Mode().Perm())
+	}
+	file, err := os.OpenFile(sudoersPath, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append([]byte("\n"), gitpodSudoer...))
+	return err
+}
 
-		rout, _ := exec.Command(args[0], "-h").CombinedOutput()
-		var (
-			out   = string(rout)
-			found = true
-		)
-		for _, f := range flags {
-			if !strings.Contains(out, f) {
-				found = false
-				break
-			}
-		}
-		if found {
-			return flavour
+func determineCmdFlavour(args []string) bool {
+	var flags []string
+	for _, a := range args {
+		if len(a) > 0 && a[0] == '-' {
+			flags = append(flags, a)
 		}
 	}
 
-	return adduserUnknown
+	rout, _ := exec.Command(args[0], "-h").CombinedOutput()
+	var (
+		out   = string(rout)
+		found = true
+	)
+	for _, f := range flags {
+		// FIXME: use regexp to fix help with some flags like --global --gid which -g included
+		if !strings.Contains(out, f) {
+			found = false
+			break
+		}
+	}
+	return found
 }
 
-type adduserFlavour int
+func determineAddgroupFlavour() int {
+	for flavour, gen := range addgroupCommands {
+		args := gen("", 0)
+		if determineCmdFlavour(args) {
+			return flavour
+		}
+	}
+	return cmdUnknown
+}
+
+func determineAdduserFlavour() int {
+	for flavour, gen := range adduserCommands {
+		args := gen(&user.User{})
+		if determineCmdFlavour(args) {
+			return flavour
+		}
+	}
+	return cmdUnknown
+}
 
 const (
-	adduserUnknown adduserFlavour = iota
-	adduserBusybox
-	adduserDebian
-	adduserUseradd
+	cmdUnknown = -1
 )
 
 const defaultShell = "/bin/sh"
 
-var adduserCommand = map[adduserFlavour]func(*user.User) []string{
-	adduserBusybox: func(opts *user.User) []string {
-		return []string{"adduser", "-h", opts.HomeDir, "-s", defaultShell, "-D", "-G", opts.Gid, "-u", opts.Uid, opts.Username}
-	},
-	adduserDebian: func(opts *user.User) []string {
+var adduserCommands = []func(*user.User) []string{
+	func(opts *user.User) []string {
 		return []string{"adduser", "--home", opts.HomeDir, "--shell", defaultShell, "--disabled-login", "--gid", opts.Gid, "--uid", opts.Uid, opts.Username}
-	},
-	adduserUseradd: func(opts *user.User) []string {
+	}, // Debian
+	func(opts *user.User) []string {
+		return []string{"adduser", "-h", opts.HomeDir, "-s", defaultShell, "-D", "-G", opts.Gid, "-u", opts.Uid, opts.Username}
+	}, // Busybox
+	func(opts *user.User) []string {
 		return []string{"useradd", "-m", "--home-dir", opts.HomeDir, "--shell", defaultShell, "--gid", opts.Gid, "--uid", opts.Uid, opts.Username}
-	},
+	}, // Useradd
 }
 
-var addgroupCommand = map[adduserFlavour]func(name string, gid int) []string{
-	adduserBusybox: func(name string, gid int) []string {
-		return []string{"addgroup", "-g", strconv.Itoa(gid), name}
-	},
-	adduserDebian: func(name string, gid int) []string {
-		return []string{"addgroup", "--gid", strconv.Itoa(gid), name}
-	},
-	adduserUseradd: func(name string, gid int) []string {
-		return []string{"groupadd", "--gid", strconv.Itoa(gid), name}
-	},
+// addgroupCommands check long flag first to avoid --gid contains -g which -g flag doesn't realy exist
+var addgroupCommands = []func(name string, gid int) []string{
+	func(name string, gid int) []string { return []string{"addgroup", "--gid", strconv.Itoa(gid), name} }, // Debian
+	func(name string, gid int) []string { return []string{"groupadd", "--gid", strconv.Itoa(gid), name} }, // Useradd
+	func(name string, gid int) []string { return []string{"addgroup", "-g", strconv.Itoa(gid), name} },    // Busybox
 }

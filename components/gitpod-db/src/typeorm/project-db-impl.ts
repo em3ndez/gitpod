@@ -1,26 +1,58 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
-import { inject, injectable } from "inversify";
-import { TypeORM } from "./typeorm";
-import { Repository } from "typeorm";
-import { ProjectDB } from "../project-db";
+import { PartialProject, Project, ProjectEnvVar, ProjectEnvVarWithValue, ProjectUsage } from "@gitpod/gitpod-protocol";
+import { EncryptionService } from "@gitpod/gitpod-protocol/lib/encryption/encryption-service";
+import { inject, injectable, optional } from "inversify";
+import { Brackets, EntityManager, FindConditions, Repository } from "typeorm";
+import { v4 as uuidv4 } from "uuid";
+import { ProjectDB, FindProjectsBySearchTermArgs } from "../project-db";
 import { DBProject } from "./entity/db-project";
-import { Project, ProjectConfig } from "@gitpod/gitpod-protocol";
+import { DBProjectEnvVar } from "./entity/db-project-env-vars";
+import { DBProjectInfo } from "./entity/db-project-info";
+import { DBProjectUsage } from "./entity/db-project-usage";
+import { TransactionalDBImpl } from "./transactional-db-impl";
+import { TypeORM } from "./typeorm";
+import { ApplicationError, ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { filter } from "../utils";
+
+function toProjectEnvVar(envVarWithValue: DBProjectEnvVar): ProjectEnvVar {
+    const envVar = { ...envVarWithValue };
+    delete (envVar as any)["value"];
+    return envVar;
+}
 
 @injectable()
-export class ProjectDBImpl implements ProjectDB {
-    @inject(TypeORM) typeORM: TypeORM;
-
-    protected async getEntityManager() {
-        return (await this.typeORM.getConnection()).manager;
+export class ProjectDBImpl extends TransactionalDBImpl<ProjectDB> implements ProjectDB {
+    constructor(
+        @inject(TypeORM) typeorm: TypeORM,
+        @inject(EncryptionService) private readonly encryptionService: EncryptionService,
+        @optional() transactionalEM?: EntityManager,
+    ) {
+        super(typeorm, transactionalEM);
     }
 
-    async getRepo(): Promise<Repository<DBProject>> {
+    protected createTransactionalDB(transactionalEM: EntityManager): ProjectDB {
+        return new ProjectDBImpl(this.typeorm, this.encryptionService, transactionalEM);
+    }
+
+    private async getRepo(): Promise<Repository<DBProject>> {
         return (await this.getEntityManager()).getRepository<DBProject>(DBProject);
+    }
+
+    private async getProjectEnvVarRepo(): Promise<Repository<DBProjectEnvVar>> {
+        return (await this.getEntityManager()).getRepository<DBProjectEnvVar>(DBProjectEnvVar);
+    }
+
+    private async getProjectInfoRepo(): Promise<Repository<DBProjectInfo>> {
+        return (await this.getEntityManager()).getRepository<DBProjectInfo>(DBProjectInfo);
+    }
+
+    private async getProjectUsageRepo(): Promise<Repository<DBProjectUsage>> {
+        return (await this.getEntityManager()).getRepository<DBProjectUsage>(DBProjectUsage);
     }
 
     public async findProjectById(projectId: string): Promise<Project | undefined> {
@@ -28,36 +60,73 @@ export class ProjectDBImpl implements ProjectDB {
         return repo.findOne({ id: projectId, markedDeleted: false });
     }
 
-    public async findProjectByCloneUrl(cloneUrl: string): Promise<Project | undefined> {
+    public async findProjectsByCloneUrl(cloneUrl: string, organizationId?: string): Promise<Project[]> {
         const repo = await this.getRepo();
-        return repo.findOne({ cloneUrl, markedDeleted: false });
-    }
-
-    public async findProjectsByCloneUrls(cloneUrls: string[]): Promise<Project[]> {
-        if (cloneUrls.length === 0) {
-            return [];
+        const conditions: FindConditions<DBProject> = { cloneUrl, markedDeleted: false };
+        if (organizationId) {
+            conditions.teamId = organizationId;
         }
+        return repo.find(conditions);
+    }
+
+    public async findProjects(orgId: string, limit?: number): Promise<Project[]> {
         const repo = await this.getRepo();
-        const q = repo.createQueryBuilder("project")
+
+        const queryBuilder = repo
+            .createQueryBuilder("project")
+            .where("project.teamId = :teamId", { teamId: orgId })
+            .orderBy("project.creationTime", "DESC")
+            .andWhere("project.markedDeleted = false");
+
+        if (limit) {
+            queryBuilder.take(limit);
+        }
+
+        return queryBuilder.getMany();
+    }
+
+    public async findProjectsBySearchTerm({
+        offset,
+        limit,
+        orderBy,
+        orderDir,
+        searchTerm,
+        organizationId,
+        prebuildsEnabled,
+    }: FindProjectsBySearchTermArgs): Promise<{ total: number; rows: Project[] }> {
+        const projectRepo = await this.getRepo();
+        const normalizedSearchTerm = searchTerm?.trim();
+
+        const queryBuilder = projectRepo
+            .createQueryBuilder("project")
             .where("project.markedDeleted = false")
-            .andWhere(`project.cloneUrl in (${ cloneUrls.map(u => `'${u}'`).join(", ") })`)
-        const result = await q.getMany();
-        return result;
-    }
+            .skip(offset)
+            .take(limit)
+            .orderBy(orderBy, orderDir);
 
-    public async findProjectByTeamAndName(teamId: string, projectName: string): Promise<Project | undefined> {
-        const projects = await this.findTeamProjects(teamId);
-        return projects.find(p => p.name === projectName);
-    }
+        if (organizationId) {
+            queryBuilder.andWhere("project.teamId = :organizationId", { organizationId });
+        }
 
-    public async findTeamProjects(teamId: string): Promise<Project[]> {
-        const repo = await this.getRepo();
-        return repo.find({ teamId, markedDeleted: false });
-    }
+        if (normalizedSearchTerm) {
+            queryBuilder.andWhere(
+                new Brackets((qb) => {
+                    qb.where("project.cloneUrl LIKE :searchTerm", { searchTerm: `%${normalizedSearchTerm}%` }).orWhere(
+                        "project.name LIKE :searchTerm",
+                        { searchTerm: `%${normalizedSearchTerm}%` },
+                    );
+                }),
+            );
+        }
 
-    public async findUserProjects(userId: string): Promise<Project[]> {
-        const repo = await this.getRepo();
-        return repo.find({ userId, markedDeleted: false });
+        if (prebuildsEnabled !== undefined) {
+            queryBuilder.andWhere("project.settings->>'$.prebuilds.enable' = :enabled", {
+                enabled: prebuildsEnabled ? "true" : "false",
+            });
+        }
+
+        const [rows, total] = await queryBuilder.getManyAndCount();
+        return { total, rows };
     }
 
     public async storeProject(project: Project): Promise<Project> {
@@ -65,14 +134,19 @@ export class ProjectDBImpl implements ProjectDB {
         return repo.save(project);
     }
 
-    public async setProjectConfiguration(projectId: string, config: ProjectConfig): Promise<void> {
+    public async updateProject(partialProject: PartialProject): Promise<DBProject> {
         const repo = await this.getRepo();
-        const project = await repo.findOne({ id: projectId, markedDeleted: false });
-        if (!project) {
-            throw new Error('A project with this ID could not be found');
+        const count = await repo.count({ id: partialProject.id, markedDeleted: false });
+        if (count < 1) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `project with ID ${partialProject.id} not found`);
         }
-        project.config = config;
-        await repo.save(project);
+        await repo.update(partialProject.id, partialProject);
+        const project = await repo.findOne({ id: partialProject.id, markedDeleted: false });
+        if (!project) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, `project with ID ${partialProject.id} not found`);
+        }
+
+        return project;
     }
 
     public async markDeleted(projectId: string): Promise<void> {
@@ -82,5 +156,128 @@ export class ProjectDBImpl implements ProjectDB {
             project.markedDeleted = true;
             await repo.save(project);
         }
+        // Delete any additional cached infos about this project
+        const projectInfoRepo = await this.getProjectInfoRepo();
+        const info = await projectInfoRepo.findOne({ projectId, deleted: false });
+        if (info) {
+            await projectInfoRepo.update(projectId, { deleted: true });
+        }
+        const projectUsageRepo = await this.getProjectUsageRepo();
+        await projectUsageRepo.delete({ projectId });
+    }
+
+    public async findProjectEnvironmentVariableByName(
+        projectId: string,
+        name: string,
+    ): Promise<ProjectEnvVar | undefined> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        return envVarRepo.findOne({ projectId, name, deleted: false });
+    }
+
+    public async addProjectEnvironmentVariable(
+        projectId: string,
+        envVar: ProjectEnvVarWithValue,
+    ): Promise<ProjectEnvVar> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        const insertedEnvVar = await envVarRepo.save({
+            id: uuidv4(),
+            projectId,
+            name: envVar.name,
+            value: envVar.value,
+            censored: envVar.censored,
+            creationTime: new Date().toISOString(),
+            deleted: false,
+        });
+        return toProjectEnvVar(insertedEnvVar);
+    }
+
+    public async updateProjectEnvironmentVariable(
+        projectId: string,
+        envVar: Partial<ProjectEnvVarWithValue>,
+    ): Promise<ProjectEnvVar | undefined> {
+        if (!envVar.id) {
+            throw new ApplicationError(ErrorCodes.NOT_FOUND, "An environment variable with this ID could not be found");
+        }
+
+        return await this.transaction(async (_, ctx) => {
+            const envVarRepo = ctx.entityManager.getRepository<DBProjectEnvVar>(DBProjectEnvVar);
+
+            await envVarRepo.update(
+                { id: envVar.id, projectId },
+                filter(envVar, (_, v) => v !== null && v !== undefined),
+            );
+
+            const found = await envVarRepo.findOne({ id: envVar.id, projectId, deleted: false });
+            if (!found) {
+                return;
+            }
+            return toProjectEnvVar(found);
+        });
+    }
+
+    public async getProjectEnvironmentVariables(projectId: string): Promise<ProjectEnvVar[]> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        const envVarsWithValue = await envVarRepo.find({ projectId, deleted: false });
+        const envVars = envVarsWithValue.map(toProjectEnvVar);
+        return envVars;
+    }
+
+    public async getProjectEnvironmentVariableById(id: string): Promise<ProjectEnvVar | undefined> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        const envVarWithValue = await envVarRepo.findOne({ id, deleted: false });
+        if (!envVarWithValue) {
+            return undefined;
+        }
+        const envVar = toProjectEnvVar(envVarWithValue);
+        return envVar;
+    }
+
+    public async deleteProjectEnvironmentVariable(variableId: string): Promise<void> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        await envVarRepo.delete({ id: variableId });
+    }
+
+    public async getProjectEnvironmentVariableValues(
+        envVars: Pick<ProjectEnvVar, "id" | "projectId">[],
+    ): Promise<ProjectEnvVarWithValue[]> {
+        const envVarRepo = await this.getProjectEnvVarRepo();
+        const envVarsWithValues = await envVarRepo.findByIds(
+            envVars.map((v) => ({ id: v.id, projectId: v.projectId })),
+        );
+        return envVarsWithValues;
+    }
+
+    public async findCachedProjectOverview(projectId: string): Promise<Project.Overview | undefined> {
+        const projectInfoRepo = await this.getProjectInfoRepo();
+        const info = await projectInfoRepo.findOne({ projectId });
+        return info?.overview;
+    }
+
+    public async storeCachedProjectOverview(projectId: string, overview: Project.Overview): Promise<void> {
+        const projectInfoRepo = await this.getProjectInfoRepo();
+        await projectInfoRepo.save({
+            projectId,
+            overview,
+            creationTime: new Date().toISOString(),
+        });
+    }
+
+    public async getProjectUsage(projectId: string): Promise<ProjectUsage | undefined> {
+        const projectUsageRepo = await this.getProjectUsageRepo();
+        const usage = await projectUsageRepo.findOne({ projectId });
+        if (usage) {
+            return {
+                lastWebhookReceived: usage.lastWebhookReceived,
+                lastWorkspaceStart: usage.lastWorkspaceStart,
+            };
+        }
+    }
+
+    public async updateProjectUsage(projectId: string, usage: Partial<ProjectUsage>): Promise<void> {
+        const projectUsageRepo = await this.getProjectUsageRepo();
+        await projectUsageRepo.save({
+            projectId,
+            ...usage,
+        });
     }
 }

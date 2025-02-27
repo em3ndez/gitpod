@@ -1,7 +1,7 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2024 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 // package: wsdaemon
@@ -26,14 +26,10 @@ export class InitWorkspaceRequest extends jspb.Message {
     clearInitializer(): void;
     getInitializer(): content_service_api_initializer_pb.WorkspaceInitializer | undefined;
     setInitializer(value?: content_service_api_initializer_pb.WorkspaceInitializer): InitWorkspaceRequest;
-    getFullWorkspaceBackup(): boolean;
-    setFullWorkspaceBackup(value: boolean): InitWorkspaceRequest;
-    getContentManifest(): Uint8Array | string;
-    getContentManifest_asU8(): Uint8Array;
-    getContentManifest_asB64(): string;
-    setContentManifest(value: Uint8Array | string): InitWorkspaceRequest;
     getRemoteStorageDisabled(): boolean;
     setRemoteStorageDisabled(value: boolean): InitWorkspaceRequest;
+    getStorageQuotaBytes(): number;
+    setStorageQuotaBytes(value: number): InitWorkspaceRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): InitWorkspaceRequest.AsObject;
@@ -50,9 +46,8 @@ export namespace InitWorkspaceRequest {
         id: string,
         metadata?: WorkspaceMetadata.AsObject,
         initializer?: content_service_api_initializer_pb.WorkspaceInitializer.AsObject,
-        fullWorkspaceBackup: boolean,
-        contentManifest: Uint8Array | string,
         remoteStorageDisabled: boolean,
+        storageQuotaBytes: number,
     }
 }
 
@@ -133,9 +128,51 @@ export namespace WaitForInitResponse {
     }
 }
 
+export class IsWorkspaceExistsRequest extends jspb.Message {
+    getId(): string;
+    setId(value: string): IsWorkspaceExistsRequest;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): IsWorkspaceExistsRequest.AsObject;
+    static toObject(includeInstance: boolean, msg: IsWorkspaceExistsRequest): IsWorkspaceExistsRequest.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: IsWorkspaceExistsRequest, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): IsWorkspaceExistsRequest;
+    static deserializeBinaryFromReader(message: IsWorkspaceExistsRequest, reader: jspb.BinaryReader): IsWorkspaceExistsRequest;
+}
+
+export namespace IsWorkspaceExistsRequest {
+    export type AsObject = {
+        id: string,
+    }
+}
+
+export class IsWorkspaceExistsResponse extends jspb.Message {
+    getExists(): boolean;
+    setExists(value: boolean): IsWorkspaceExistsResponse;
+
+    serializeBinary(): Uint8Array;
+    toObject(includeInstance?: boolean): IsWorkspaceExistsResponse.AsObject;
+    static toObject(includeInstance: boolean, msg: IsWorkspaceExistsResponse): IsWorkspaceExistsResponse.AsObject;
+    static extensions: {[key: number]: jspb.ExtensionFieldInfo<jspb.Message>};
+    static extensionsBinary: {[key: number]: jspb.ExtensionFieldBinaryInfo<jspb.Message>};
+    static serializeBinaryToWriter(message: IsWorkspaceExistsResponse, writer: jspb.BinaryWriter): void;
+    static deserializeBinary(bytes: Uint8Array): IsWorkspaceExistsResponse;
+    static deserializeBinaryFromReader(message: IsWorkspaceExistsResponse, reader: jspb.BinaryReader): IsWorkspaceExistsResponse;
+}
+
+export namespace IsWorkspaceExistsResponse {
+    export type AsObject = {
+        exists: boolean,
+    }
+}
+
 export class TakeSnapshotRequest extends jspb.Message {
     getId(): string;
     setId(value: string): TakeSnapshotRequest;
+    getReturnImmediately(): boolean;
+    setReturnImmediately(value: boolean): TakeSnapshotRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): TakeSnapshotRequest.AsObject;
@@ -150,6 +187,7 @@ export class TakeSnapshotRequest extends jspb.Message {
 export namespace TakeSnapshotRequest {
     export type AsObject = {
         id: string,
+        returnImmediately: boolean,
     }
 }
 

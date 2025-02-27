@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package archive
 
@@ -12,11 +12,12 @@ import (
 	"os/exec"
 	"path"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/moby/moby/pkg/system"
 	"github.com/opentracing/opentracing-go"
+	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -25,20 +26,12 @@ import (
 
 // TarConfig configures tarbal creation/extraction
 type TarConfig struct {
-	MaxSizeBytes int64
-	UIDMaps      []IDMapping
-	GIDMaps      []IDMapping
+	UIDMaps []IDMapping
+	GIDMaps []IDMapping
 }
 
 // BuildTarbalOption configures the tarbal creation
 type TarOption func(o *TarConfig)
-
-// TarbalMaxSize limits the size of a tarbal
-func TarbalMaxSize(n int64) TarOption {
-	return func(o *TarConfig) {
-		o.MaxSizeBytes = n
-	}
-}
 
 // IDMapping maps user or group IDs
 type IDMapping struct {
@@ -63,6 +56,12 @@ func WithGIDMapping(mappings []IDMapping) TarOption {
 
 // ExtractTarbal extracts an OCI compatible tar file src to the folder dst, expecting the overlay whiteout format
 func ExtractTarbal(ctx context.Context, src io.Reader, dst string, opts ...TarOption) (err error) {
+	type Info struct {
+		UID, GID  int
+		IsSymlink bool
+		Xattrs    map[string]string
+	}
+
 	//nolint:staticcheck,ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "extractTarbal")
 	span.LogKV("dst", dst)
@@ -74,19 +73,15 @@ func ExtractTarbal(ctx context.Context, src io.Reader, dst string, opts ...TarOp
 		opt(&cfg)
 	}
 
-	pr, pw := io.Pipe()
-	src = io.TeeReader(src, pw)
-	tarReader := tar.NewReader(pr)
+	pipeReader, pipeWriter := io.Pipe()
+	teeReader := io.TeeReader(src, pipeWriter)
 
-	type Info struct {
-		UID, GID  int
-		IsSymlink bool
-		Xattrs    map[string]string
-	}
+	tarReader := tar.NewReader(pipeReader)
 
 	finished := make(chan bool)
 	m := make(map[string]Info)
 
+	unpackSpan := opentracing.StartSpan("unpackTarbal", opentracing.ChildOf(span.Context()))
 	go func() {
 		defer close(finished)
 		for {
@@ -116,18 +111,22 @@ func ExtractTarbal(ctx context.Context, src io.Reader, dst string, opts ...TarOp
 		"tar",
 		"--extract",
 		"--preserve-permissions",
-		"--xattrs", "--xattrs-include=security.capability",
 	)
 	tarcmd.Dir = dst
-	tarcmd.Stdin = src
+	tarcmd.Stdin = teeReader
 
 	var msg []byte
 	msg, err = tarcmd.CombinedOutput()
 	if err != nil {
 		return xerrors.Errorf("tar %s: %s", dst, err.Error()+";"+string(msg))
 	}
-	<-finished
 
+	log.WithField("log", string(msg)).Debug("decompressing tar stream log")
+
+	<-finished
+	tracing.FinishSpan(unpackSpan, &err)
+
+	chownSpan := opentracing.StartSpan("chown", opentracing.ChildOf(span.Context()))
 	// lets create a sorted list of pathes and chown depth first.
 	paths := make([]string, 0, len(m))
 	for path := range m {
@@ -138,18 +137,20 @@ func ExtractTarbal(ctx context.Context, src io.Reader, dst string, opts ...TarOp
 	// We need to remap the UID and GID between the host and the container to avoid permission issues.
 	for _, p := range paths {
 		v := m[p]
-		uid := toHostID(v.UID, cfg.UIDMaps)
-		gid := toHostID(v.GID, cfg.GIDMaps)
 
 		if v.IsSymlink {
 			continue
 		}
 
+		uid := toHostID(v.UID, cfg.UIDMaps)
+		gid := toHostID(v.GID, cfg.GIDMaps)
+
 		err = remapFile(path.Join(dst, p), uid, gid, v.Xattrs)
 		if err != nil {
-			log.WithError(err).WithField("uid", uid).WithField("gid", gid).WithField("path", p).Warn("cannot chown")
+			log.WithError(err).WithField("uid", uid).WithField("gid", gid).WithField("path", p).Debug("cannot chown")
 		}
 	}
+	tracing.FinishSpan(chownSpan, &err)
 
 	log.WithField("duration", time.Since(start).Milliseconds()).Debug("untar complete")
 	return nil
@@ -191,13 +192,25 @@ func remapFile(name string, uid, gid int, xattrs map[string]string) error {
 	}
 
 	for key, value := range xattrs {
-		if err := system.Lsetxattr(name, key, []byte(value), 0); err != nil {
-			log.WithField("name", key).WithField("value", value).WithField("file", name).WithError(err).Error("restoring extended attributes")
+		// do not set trusted attributes
+		if strings.HasPrefix(key, "trusted.") {
+			continue
+		}
+
+		if strings.HasPrefix(key, "user.") {
+			// This is a marker to match inodes, such as when an upper layer copies a lower layer file in overlayfs.
+			// However, when restoring a content, the container in the workspace is not always running, so there is no problem ignoring the failure.
+			if strings.HasSuffix(key, ".overlay.impure") || strings.HasSuffix(key, ".overlay.origin") {
+				continue
+			}
+		}
+
+		if err := unix.Lsetxattr(name, key, []byte(value), 0); err != nil {
 			if err == syscall.ENOTSUP || err == syscall.EPERM {
 				continue
 			}
 
-			return err
+			log.WithField("name", key).WithField("value", value).WithField("file", name).WithError(err).Warn("restoring extended attributes")
 		}
 	}
 

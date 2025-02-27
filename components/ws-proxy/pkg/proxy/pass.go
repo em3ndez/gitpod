@@ -1,11 +1,10 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package proxy
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -15,38 +14,94 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/gitpod-io/gitpod/ws-proxy/pkg/common"
 )
 
-// ProxyPassConfig is used as intermediate struct to assemble a configurable proxy
+// ProxyPassConfig is used as intermediate struct to assemble a configurable proxy.
 type proxyPassConfig struct {
 	TargetResolver  targetResolver
 	ResponseHandler []responseHandler
 	ErrorHandler    errorHandler
 	Transport       http.RoundTripper
+	UseTargetHost   bool
 }
 
 func (ppc *proxyPassConfig) appendResponseHandler(handler responseHandler) {
 	ppc.ResponseHandler = append(ppc.ResponseHandler, handler)
 }
 
-// proxyPassOpt allows to compose ProxyHandler options
+// proxyPassOpt allows to compose ProxyHandler options.
 type proxyPassOpt func(h *proxyPassConfig)
 
-// errorHandler is a function that handles an error that occurred during proxying of a HTTP request
+// errorHandler is a function that handles an error that occurred during proxying of a HTTP request.
 type errorHandler func(http.ResponseWriter, *http.Request, error)
 
-// targetResolver is a function that determines to which target to forward the given HTTP request to
-type targetResolver func(*Config, *http.Request) (*url.URL, error)
+// targetResolver is a function that determines to which target to forward the given HTTP request to.
+type targetResolver func(*Config, common.WorkspaceInfoProvider, *http.Request) (*url.URL, string, error)
 
 type responseHandler func(*http.Response, *http.Request) error
 
-// proxyPass is the function that assembles a ProxyHandler from the config, a resolver and various options and returns a http.HandlerFunc
-func proxyPass(config *RouteHandlerConfig, resolver targetResolver, opts ...proxyPassOpt) http.HandlerFunc {
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
+}
+
+func joinURLPath(a, b *url.URL) (path, rawpath string) {
+	if a.RawPath == "" && b.RawPath == "" {
+		return singleJoiningSlash(a.Path, b.Path), ""
+	}
+	// Same as singleJoiningSlash, but uses EscapedPath to determine
+	// whether a slash should be added
+	apath := a.EscapedPath()
+	bpath := b.EscapedPath()
+
+	aslash := strings.HasSuffix(apath, "/")
+	bslash := strings.HasPrefix(bpath, "/")
+
+	switch {
+	case aslash && bslash:
+		return a.Path + b.Path[1:], apath + bpath[1:]
+	case !aslash && !bslash:
+		return a.Path + "/" + b.Path, apath + "/" + bpath
+	}
+	return a.Path + b.Path, apath + bpath
+}
+
+func NewSingleHostReverseProxy(target *url.URL, useTargetHost bool) *httputil.ReverseProxy {
+	targetQuery := target.RawQuery
+	director := func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		if useTargetHost {
+			req.Host = target.Host
+		}
+		req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
+		if targetQuery == "" || req.URL.RawQuery == "" {
+			req.URL.RawQuery = targetQuery + req.URL.RawQuery
+		} else {
+			req.URL.RawQuery = targetQuery + "&" + req.URL.RawQuery
+		}
+		if _, ok := req.Header["User-Agent"]; !ok {
+			// explicitly disable User-Agent so it's not set to default value
+			req.Header.Set("User-Agent", "")
+		}
+	}
+	return &httputil.ReverseProxy{Director: director}
+}
+
+// proxyPass is the function that assembles a ProxyHandler from the config, a resolver and various options and returns a http.HandlerFunc.
+func proxyPass(config *RouteHandlerConfig, infoProvider common.WorkspaceInfoProvider, resolver targetResolver, opts ...proxyPassOpt) http.HandlerFunc {
 	h := proxyPassConfig{
 		Transport: config.DefaultTransport,
 	}
@@ -64,7 +119,7 @@ func proxyPass(config *RouteHandlerConfig, resolver targetResolver, opts ...prox
 	}
 
 	return func(w http.ResponseWriter, req *http.Request) {
-		targetURL, err := h.TargetResolver(config.Config, req)
+		targetURL, targetResource, err := h.TargetResolver(config.Config, infoProvider, req)
 		if err != nil {
 			if h.ErrorHandler != nil {
 				h.ErrorHandler(w, req, err)
@@ -73,11 +128,14 @@ func proxyPass(config *RouteHandlerConfig, resolver targetResolver, opts ...prox
 			}
 			return
 		}
+		req = withResourceMetricsLabel(req, targetResource)
+		req = withHttpVersionMetricsLabel(req)
 
-		var originalURL = *req.URL
+		originalURL := *req.URL
 
 		// TODO(cw): we should cache the proxy for some time for each target URL
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+		proxy := NewSingleHostReverseProxy(targetURL, h.UseTargetHost)
 		proxy.Transport = h.Transport
 		proxy.ModifyResponse = func(resp *http.Response) error {
 			url := resp.Request.URL
@@ -108,9 +166,7 @@ func proxyPass(config *RouteHandlerConfig, resolver targetResolver, opts ...prox
 				return
 			}
 
-			var dnsError *net.DNSError
-			if !errors.As(err, &dnsError) && !strings.HasPrefix(originalURL.Path, "/_supervisor/") {
-				// skip "no such host" errors (workspace service not available, yet) and not
+			if !strings.HasPrefix(originalURL.Path, "/_supervisor/") {
 				log.WithField("url", originalURL.String()).WithError(err).Debug("proxied request failed")
 			}
 
@@ -156,10 +212,16 @@ func withHTTPErrorHandler(h http.Handler) proxyPassOpt {
 	}
 }
 
-func createDefaultTransport(config *TransportConfig) *http.Transport {
+func withErrorHandler(h errorHandler) proxyPassOpt {
+	return func(cfg *proxyPassConfig) {
+		cfg.ErrorHandler = h
+	}
+}
+
+func createDefaultTransport(config *TransportConfig) http.RoundTripper {
 	// TODO equivalent of client_max_body_size 2048m; necessary ???
 	// this is based on http.DefaultTransport, with some values exposed to config
-	return &http.Transport{
+	return instrumentClientMetrics(&http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   time.Duration(config.ConnectTimeout), // default: 30s
@@ -172,16 +234,17 @@ func createDefaultTransport(config *TransportConfig) *http.Transport {
 		IdleConnTimeout:       time.Duration(config.IdleConnTimeout), // default: 90s
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-	}
+	})
 }
 
-// tell the browser to cache for 1 year and don't ask the server during this period
+// tell the browser to cache for 1 year and don't ask the server during this period.
 func withLongTermCaching() proxyPassOpt {
 	return func(cfg *proxyPassConfig) {
 		cfg.appendResponseHandler(func(resp *http.Response, req *http.Request) error {
 			if resp.StatusCode < http.StatusBadRequest {
 				resp.Header.Set("Cache-Control", "public, max-age=31536000")
 			}
+
 			return nil
 		})
 	}
@@ -196,21 +259,8 @@ func withXFrameOptionsFilter() proxyPassOpt {
 	}
 }
 
-type workspaceTransport struct {
-	transport http.RoundTripper
-}
-
-func (t *workspaceTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	vars := mux.Vars(req)
-	if vars[foreignPathIdentifier] != "" {
-		req = req.Clone(req.Context())
-		req.URL.Path = vars[foreignPathIdentifier]
-	}
-	return t.transport.RoundTrip(req)
-}
-
-func withWorkspaceTransport() proxyPassOpt {
-	return func(h *proxyPassConfig) {
-		h.Transport = &workspaceTransport{h.Transport}
+func withUseTargetHost() proxyPassOpt {
+	return func(cfg *proxyPassConfig) {
+		cfg.UseTargetHost = true
 	}
 }

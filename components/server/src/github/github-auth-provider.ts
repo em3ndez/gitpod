@@ -1,33 +1,32 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
-import { injectable } from 'inversify';
-import * as express from "express"
-import { AuthProviderInfo } from '@gitpod/gitpod-protocol';
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { GitHubScope } from "./scopes";
+import { injectable } from "inversify";
+import express from "express";
+import { AuthProviderInfo } from "@gitpod/gitpod-protocol";
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { AuthUserSetup } from "../auth/auth-provider";
-import { Octokit } from "@octokit/rest"
+import { Octokit } from "@octokit/rest";
 import { GitHubApiError } from "./api";
 import { GenericAuthProvider } from "../auth/generic-auth-provider";
 import { oauthUrls } from "./github-urls";
+import { GitHubOAuthScopes } from "@gitpod/public-api-common/lib/auth-providers";
 
 @injectable()
 export class GitHubAuthProvider extends GenericAuthProvider {
-
     get info(): AuthProviderInfo {
         return {
             ...this.defaultInfo(),
-            scopes: GitHubScope.All,
+            scopes: GitHubOAuthScopes.ALL,
             requirements: {
-                default: GitHubScope.Requirements.DEFAULT,
-                publicRepo: GitHubScope.Requirements.PUBLIC_REPO,
-                privateRepo: GitHubScope.Requirements.PRIVATE_REPO,
+                default: GitHubOAuthScopes.Requirements.DEFAULT,
+                publicRepo: GitHubOAuthScopes.Requirements.PUBLIC_REPO,
+                privateRepo: GitHubOAuthScopes.Requirements.PRIVATE_REPO,
             },
-        }
+        };
     }
 
     /**
@@ -41,13 +40,19 @@ export class GitHubAuthProvider extends GenericAuthProvider {
             ...oauth!,
             authorizationUrl: oauth.authorizationUrl || defaultUrls.authorizationUrl,
             tokenUrl: oauth.tokenUrl || defaultUrls.tokenUrl,
-            scope: GitHubScope.All.join(scopeSeparator),
-            scopeSeparator
+            scope: GitHubOAuthScopes.ALL.join(scopeSeparator),
+            scopeSeparator,
         };
     }
 
-    authorize(req: express.Request, res: express.Response, next: express.NextFunction, scope?: string[]): void {
-        super.authorize(req, res, next, scope ? scope : GitHubScope.Requirements.DEFAULT);
+    authorize(
+        req: express.Request,
+        res: express.Response,
+        next: express.NextFunction,
+        state: string,
+        scope?: string[],
+    ) {
+        super.authorize(req, res, next, state, scope ? scope : GitHubOAuthScopes.Requirements.DEFAULT);
     }
 
     /**
@@ -59,17 +64,17 @@ export class GitHubAuthProvider extends GenericAuthProvider {
      * +----+------------------------------------------+--------------------------------+
      */
     protected get baseURL() {
-        return (this.params.host === 'github.com') ? 'https://api.github.com' : `https://${this.params.host}/api/v3`;
+        return this.params.host === "github.com" ? "https://api.github.com" : `https://${this.params.host}/api/v3`;
     }
 
-    protected readAuthUserSetup = async (accessToken: string, _tokenResponse: object) => {
+    protected async readAuthUserSetup(accessToken: string, _tokenResponse: object) {
         const api = new Octokit({
             auth: accessToken,
             request: {
                 timeout: 5000,
             },
             userAgent: this.USER_AGENT,
-            baseUrl: this.baseURL
+            baseUrl: this.baseURL,
         });
         const fetchCurrentUser = async () => {
             const response = await api.users.getAuthenticated();
@@ -77,66 +82,78 @@ export class GitHubAuthProvider extends GenericAuthProvider {
                 throw new GitHubApiError(response);
             }
             return response;
-        }
+        };
         const fetchUserEmails = async () => {
             const response = await api.users.listEmailsForAuthenticated({});
             if (response.status !== 200) {
                 throw new GitHubApiError(response);
             }
             return response.data;
-        }
+        };
         const currentUserPromise = this.retry(() => fetchCurrentUser());
         const userEmailsPromise = this.retry(() => fetchUserEmails());
 
         try {
-            const [ { data: { id, login, avatar_url, name }, headers }, userEmails ] = await Promise.all([ currentUserPromise, userEmailsPromise ]);
+            const [currentUser, userEmails] = await Promise.all([currentUserPromise, userEmailsPromise]);
+            const {
+                data: { id, login, avatar_url, name, company, created_at },
+                headers,
+            } = currentUser;
+            const publicAvatarURL = new URL(avatar_url);
+            if (publicAvatarURL.host === "private-avatars.githubusercontent.com") {
+                // github has recently been rolling out private JWT-signed avatar URLs which expire after a short time
+                // we need to use the public avatar URL instead so that the avatar is displayed correctly and fits into our database column (which is capped at 255 chars)
+                publicAvatarURL.host = "avatars.githubusercontent.com";
+                publicAvatarURL.searchParams.delete("jwt");
+            }
 
             // https://developer.github.com/apps/building-oauth-apps/understanding-scopes-for-oauth-apps/
             // e.g. X-OAuth-Scopes: repo, user
-            const currentScopes = this.normalizeScopes((headers as any)["x-oauth-scopes"]
-                .split(this.oauthConfig.scopeSeparator!)
-                .map((s: string) => s.trim())
+            const currentScopes = this.normalizeScopes(
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+                (headers as any)["x-oauth-scopes"].split(this.oauthConfig.scopeSeparator!).map((s: string) => s.trim()),
             );
 
             const filterPrimaryEmail = (emails: typeof userEmails) => {
                 if (this.config.blockNewUsers) {
                     // if there is any verified email with a domain that is in the blockNewUsersPassList then use this email as primary email
-                    const emailDomainInPasslist = (mail: string) => this.config.blockNewUsers.passlist.some(e => mail.endsWith(`@${e}`));
-                    const result = emails.filter(e => e.verified).filter(e => emailDomainInPasslist(e.email))
+                    const emailDomainInPasslist = (mail: string) =>
+                        this.config.blockNewUsers.passlist.some((e) => mail.endsWith(`@${e}`));
+                    const result = emails.filter((e) => e.verified).filter((e) => emailDomainInPasslist(e.email));
                     if (result.length > 0) {
                         return result[0].email;
                     }
                 }
                 // otherwise use GitHub's primary email as Gitpod's primary email
-                return emails.filter(e => e.primary)[0].email;
+                return emails.filter((e) => e.primary)[0].email;
             };
 
             return <AuthUserSetup>{
                 authUser: {
                     authId: String(id),
                     authName: login,
-                    avatarUrl: avatar_url,
+                    avatarUrl: publicAvatarURL.toString(),
                     name,
-                    primaryEmail: filterPrimaryEmail(userEmails)
+                    primaryEmail: filterPrimaryEmail(userEmails),
+                    company,
+                    created_at: created_at ? new Date(created_at).toISOString() : undefined,
                 },
-                currentScopes
-            }
-
+                currentScopes,
+            };
         } catch (error) {
-            log.error(`(${this.strategyName}) Reading current user info failed`, error, { accessToken, error });
+            log.error(`(${this.strategyName}) Reading current user info failed`, error, { error });
             throw error;
         }
     }
 
     protected normalizeScopes(scopes: string[]) {
         const set = new Set(scopes);
-        if (set.has('repo')) {
-            set.add('public_repo');
+        if (set.has("repo")) {
+            set.add("public_repo");
         }
-        if (set.has('user')) {
-            set.add('user:email');
+        if (set.has("user")) {
+            set.add("user:email");
         }
         return Array.from(set).sort();
     }
-
 }

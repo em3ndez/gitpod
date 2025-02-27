@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package builder
 
@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/moby/buildkit/client"
 	"golang.org/x/xerrors"
 )
 
@@ -30,6 +29,8 @@ type Config struct {
 	localCacheImport   string
 }
 
+var DockerfilePathNotExists = xerrors.Errorf("BOB_DOCKERFILE_PATH does not exist or isn't a file")
+
 // GetConfigFromEnv extracts configuration from environment variables
 func GetConfigFromEnv() (*Config, error) {
 	cfg := &Config{
@@ -46,10 +47,10 @@ func GetConfigFromEnv() (*Config, error) {
 	}
 
 	if cfg.BaseRef == "" {
-		return nil, xerrors.Errorf("BOB_BASE_REF must not be empty")
+		cfg.BaseRef = "localhost:8080/base:latest"
 	}
 	if cfg.TargetRef == "" {
-		return nil, xerrors.Errorf("BOB_TARGET_REF must not be empty")
+		cfg.TargetRef = "localhost:8080/target:latest"
 	}
 	if cfg.BuildBase {
 		if cfg.Dockerfile == "" {
@@ -64,7 +65,7 @@ func GetConfigFromEnv() (*Config, error) {
 			return nil, xerrors.Errorf("BOB_DOCKERFILE_PATH must begin with /workspace")
 		}
 		if stat, err := os.Stat(cfg.Dockerfile); err != nil || stat.IsDir() {
-			return nil, xerrors.Errorf("BOB_DOCKERFILE_PATH does not exist or isn't a file")
+			return nil, DockerfilePathNotExists
 		}
 	}
 
@@ -76,8 +77,7 @@ func GetConfigFromEnv() (*Config, error) {
 
 		// we have an authkey, hence assume that the auth fields are base64 encoded and encrypted
 		if cfg.BaseLayerAuth != "" {
-			dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(cfg.BaseLayerAuth)))
-			_, err := base64.RawStdEncoding.Decode(dec, []byte(cfg.BaseLayerAuth))
+			dec, err := base64.RawStdEncoding.DecodeString(cfg.BaseLayerAuth)
 			if err != nil {
 				return nil, xerrors.Errorf("BOB_BASELAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
 			}
@@ -87,8 +87,7 @@ func GetConfigFromEnv() (*Config, error) {
 			}
 		}
 		if cfg.WorkspaceLayerAuth != "" {
-			dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(cfg.WorkspaceLayerAuth)))
-			_, err := base64.RawStdEncoding.Decode(dec, []byte(cfg.WorkspaceLayerAuth))
+			dec, err := base64.RawStdEncoding.DecodeString(cfg.WorkspaceLayerAuth)
 			if err != nil {
 				return nil, xerrors.Errorf("BOB_WSLAYER_AUTH is not base64 encoded but BOB_AUTH_KEY is present")
 			}
@@ -100,22 +99,6 @@ func GetConfigFromEnv() (*Config, error) {
 	}
 
 	return cfg, nil
-}
-
-// LocalCacheImport produces a cache option that imports from a local cache
-func (c Config) LocalCacheImport() []client.CacheOptionsEntry {
-	if c.localCacheImport == "" {
-		return nil
-	}
-
-	return []client.CacheOptionsEntry{
-		{
-			Type: "local",
-			Attrs: map[string]string{
-				"src": c.localCacheImport,
-			},
-		},
-	}
 }
 
 // source: https://astaxie.gitbooks.io/build-web-application-with-golang/en/09.6.html

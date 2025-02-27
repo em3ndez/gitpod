@@ -1,27 +1,28 @@
 # Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 # Licensed under the GNU Affero General Public License (AGPL).
-# See License-AGPL.txt in the project root for license information.
+# See License.AGPL.txt in the project root for license information.
 
-FROM golang:1.17 as builder
-
-RUN curl -fsSL https://github.com/caddyserver/xcaddy/releases/download/v0.2.0/xcaddy_0.2.0_linux_amd64.tar.gz \
-  | tar -xzv -C /usr/local/bin/ xcaddy
+FROM caddy:2.7.6-builder AS builder
 
 WORKDIR /plugins
 
 COPY plugins /plugins
 
 # build caddy
-RUN xcaddy build v2.4.5 \
+RUN xcaddy build v2.7.6 \
   --output /caddy \
   --with github.com/gitpod-io/gitpod/proxy/plugins/corsorigin=/plugins/corsorigin \
   --with github.com/gitpod-io/gitpod/proxy/plugins/secwebsocketkey=/plugins/secwebsocketkey \
   --with github.com/gitpod-io/gitpod/proxy/plugins/workspacedownload=/plugins/workspacedownload \
   --with github.com/gitpod-io/gitpod/proxy/plugins/headlesslogdownload=/plugins/headlesslogdownload \
+  --with github.com/gitpod-io/gitpod/proxy/plugins/configcat=/plugins/configcat \
+  --with github.com/gitpod-io/gitpod/proxy/plugins/analytics=/plugins/analytics \
   --with github.com/gitpod-io/gitpod/proxy/plugins/logif=/plugins/logif \
-  --with github.com/gitpod-io/gitpod/proxy/plugins/jsonselect=/plugins/jsonselect
+  --with github.com/gitpod-io/gitpod/proxy/plugins/jsonselect=/plugins/jsonselect \
+  --with github.com/gitpod-io/gitpod/proxy/plugins/sshtunnel=/plugins/sshtunnel \
+  --with github.com/gitpod-io/gitpod/proxy/plugins/frontend_dev=/plugins/frontend_dev
 
-FROM alpine:3.14
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:95be65e511213e5adfae48f3dc55f97f5578b6facbbe2e6d53ea1b153ba6a15b
 
 # Ensure latest packages are present, like security updates.
 RUN  apk upgrade --no-cache \
@@ -35,5 +36,12 @@ COPY --from=builder /caddy /usr/bin/caddy
 
 COPY conf/Caddyfile /etc/caddy/Caddyfile
 COPY conf/vhost.empty /etc/caddy/vhosts/vhost.empty
+COPY conf/workspace-handler.* /etc/caddy/workspace-handler/
 
-CMD [ "caddy", "run", "-watch", "-config", "/etc/caddy/Caddyfile" ]
+ARG __GIT_COMMIT
+ARG VERSION
+
+ENV GITPOD_BUILD_GIT_COMMIT=${__GIT_COMMIT}
+ENV GITPOD_BUILD_VERSION=${VERSION}
+
+CMD [ "caddy", "run", "--adapter", "inject-ssh-tunnel" , "--watch", "--config", "/etc/caddy/Caddyfile" ]

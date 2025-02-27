@@ -1,43 +1,44 @@
 /**
  * Copyright (c) 2020 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
-const URL = require('url').URL || window.URL;
-import { log } from './logging';
+const URL = require("url").URL || window.URL;
+import { log } from "./logging";
 
 export interface UrlChange {
-    (old: URL): Partial<URL>
+    (old: URL): Partial<URL>;
 }
 export type UrlUpdate = UrlChange | Partial<URL>;
 
-const basewoWkspaceIDRegex = "(([a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|([0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8}))";
+const baseWorkspaceIDRegex =
+    "(([a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})|([0-9a-z]{2,16}-[0-9a-z]{2,16}-[0-9a-z]{8,11}))";
 
 // this pattern matches v4 UUIDs as well as the new generated workspace ids (e.g. pink-panda-ns35kd21)
-const workspaceIDRegex = RegExp(`^${basewoWkspaceIDRegex}$`);
+const workspaceIDRegex = RegExp(`^(?:debug-)?${baseWorkspaceIDRegex}$`);
 
 // this pattern matches URL prefixes of workspaces
-const workspaceUrlPrefixRegex = RegExp(`^([0-9]{4,6}-)?${basewoWkspaceIDRegex}\\.`);
+const workspaceUrlPrefixRegex = RegExp(`^(([0-9]{4,6}|debug)-)?${baseWorkspaceIDRegex}\\.`);
 
 export class GitpodHostUrl {
     readonly url: URL;
 
-    constructor(urlParam?: string | URL) {
-        if (urlParam === undefined || typeof urlParam === 'string') {
-            this.url = new URL(urlParam || 'https://gitpod.io');
-            this.url.search = '';
-            this.url.hash = '';
-            this.url.pathname = '';
+    constructor(url: string) {
+        //HACK - we don't want clients to pass in a URL object, but we need to use it internally
+        const urlParam = url as any;
+        if (typeof urlParam === "string") {
+            // public constructor
+            this.url = new URL(url);
+            this.url.search = "";
+            this.url.hash = "";
+            this.url.pathname = "";
         } else if (urlParam instanceof URL) {
+            // internal constructor, see with
             this.url = urlParam;
         } else {
-            log.error('Unexpected urlParam', { urlParam });
+            log.error("Unexpected urlParam", { urlParam });
         }
-    }
-
-    static fromWorkspaceUrl(url: string) {
-        return new GitpodHostUrl(new URL(url));
     }
 
     withWorkspacePrefix(workspaceId: string, region: string) {
@@ -45,7 +46,7 @@ export class GitpodHostUrl {
     }
 
     withDomainPrefix(prefix: string): GitpodHostUrl {
-        return this.with(url => ({ host: prefix + url.host }));;
+        return this.with((url) => ({ host: prefix + url.host }));
     }
 
     withoutWorkspacePrefix(): GitpodHostUrl {
@@ -58,65 +59,79 @@ export class GitpodHostUrl {
     }
 
     withoutDomainPrefix(removeSegmentsCount: number): GitpodHostUrl {
-        return this.with(url => ({ host: url.host.split('.').splice(removeSegmentsCount).join('.') }));
+        return this.with((url) => ({ host: url.host.split(".").splice(removeSegmentsCount).join(".") }));
     }
 
     with(urlUpdate: UrlUpdate) {
-        const update = typeof urlUpdate === 'function' ? urlUpdate(this.url) : urlUpdate;
-        const addSlashToPath = update.pathname && update.pathname.length > 0 && !update.pathname.startsWith('/');
+        const update = typeof urlUpdate === "function" ? urlUpdate(this.url) : urlUpdate;
+        const addSlashToPath = update.pathname && update.pathname.length > 0 && !update.pathname.startsWith("/");
         if (addSlashToPath) {
-            update.pathname = '/' + update.pathname;
+            update.pathname = "/" + update.pathname;
         }
         const result = Object.assign(new URL(this.toString()), update);
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         return new GitpodHostUrl(result);
     }
 
     withApi(urlUpdate?: UrlUpdate) {
         const updated = urlUpdate ? this.with(urlUpdate) : this;
-        return updated.with(url => ({ pathname: `/api${url.pathname}` }));
+        return updated.with((url) => ({ pathname: `/api${url.pathname}` }));
     }
 
-    withContext(contextUrl: string) {
-        return this.with(url => ({ hash: contextUrl }));
+    withContext(
+        contextUrl: string,
+        startOptions?: { showOptions?: boolean; editor?: string; workspaceClass?: string },
+    ) {
+        const searchParams = new URLSearchParams();
+        if (startOptions?.showOptions) {
+            searchParams.append("showOptions", "true");
+        }
+        return this.with((url) => ({ hash: contextUrl, search: searchParams.toString() }));
     }
 
     asWebsocket(): GitpodHostUrl {
-        return this.with(url => ({ protocol: url.protocol === 'https:' ? 'wss:' : 'ws:' }));
+        return this.with((url) => ({ protocol: url.protocol === "https:" ? "wss:" : "ws:" }));
+    }
+
+    asWorkspacePage(): GitpodHostUrl {
+        return this.with((url) => ({ pathname: "/workspaces" }));
     }
 
     asDashboard(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/workspaces/' }));
+        return this.with((url) => ({ pathname: "/" }));
+    }
+
+    asBilling(): GitpodHostUrl {
+        return this.with((url) => ({ pathname: "/user/billing" }));
     }
 
     asLogin(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/login/' }));
-    }
-
-    asUpgradeSubscription(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/plans/' }));
+        return this.with((url) => ({ pathname: "/login" }));
     }
 
     asAccessControl(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/access-control/' }));
+        return this.with((url) => ({ pathname: "/user/integrations" }));
     }
 
     asSettings(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/settings/' }));
+        return this.with((url) => ({ pathname: "/user/account" }));
     }
 
-    asGraphQLApi(): GitpodHostUrl {
-        return this.with(url => ({ pathname: '/graphql/' }));
+    asPreferences(): GitpodHostUrl {
+        return this.with((url) => ({ pathname: "/user/preferences" }));
     }
 
     asStart(workspaceId = this.workspaceId): GitpodHostUrl {
-        return this.withoutWorkspacePrefix().with({
-            pathname: '/start/',
-            hash: '#' + workspaceId
+        return this.with({
+            pathname: "/start/",
+            hash: "#" + workspaceId,
         });
     }
 
-    asWorkspaceAuth(instanceID: string, redirect?: boolean): GitpodHostUrl {
-        return this.with(url => ({ pathname: `/api/auth/workspace-cookie/${instanceID}`, search: redirect ? "redirect" : "" }));
+    asWorkspaceAuth(instanceID: string): GitpodHostUrl {
+        return this.with((url) => ({
+            pathname: `/api/auth/workspace-cookie/${instanceID}`,
+        }));
     }
 
     toString() {
@@ -125,10 +140,14 @@ export class GitpodHostUrl {
 
     toStringWoRootSlash() {
         let result = this.toString();
-        if (result.endsWith('/')) {
+        if (result.endsWith("/")) {
             result = result.slice(0, result.length - 1);
         }
         return result;
+    }
+
+    get debugWorkspace(): boolean {
+        return this.url.host.match(workspaceUrlPrefixRegex)?.[2] === "debug";
     }
 
     get workspaceId(): string | undefined {
@@ -138,34 +157,71 @@ export class GitpodHostUrl {
             if (matchResults) {
                 // URL has a workspace prefix
                 // port prefixes are excluded
-                return matchResults[0];
+                return matchResults[1];
             }
         }
 
-        const pathSegs = this.url.pathname.split("/")
+        const pathSegs = this.url.pathname.split("/");
         if (pathSegs.length > 3 && pathSegs[1] === "workspace") {
             return pathSegs[2];
+        }
+
+        const cleanHash = this.url.hash.replace(/^#/, "");
+        if (this.url.pathname == "/start/" && cleanHash.match(workspaceIDRegex)) {
+            return cleanHash;
         }
 
         return undefined;
     }
 
-    get blobServe(): boolean {
+    get blobServe(): boolean {
         const hostSegments = this.url.host.split(".");
-        if (hostSegments[0] === 'blobserve') {
+        if (hostSegments[0] === "blobserve") {
             return true;
         }
 
-        const pathSegments = this.url.pathname.split("/")
+        const pathSegments = this.url.pathname.split("/");
         return pathSegments[0] === "blobserve";
     }
 
     asSorry(message: string) {
-        return this.with({ pathname: '/sorry', hash: message });
+        return this.with({ pathname: "/sorry", hash: message });
     }
 
     asApiLogout(): GitpodHostUrl {
-        return this.withApi(url => ({ pathname: '/logout/' }));
+        return this.withApi((url) => ({ pathname: "/logout/" }));
     }
 
+    asIDEProxy(): GitpodHostUrl {
+        const hostSegments = this.url.host.split(".");
+        if (hostSegments[0] === "ide") {
+            return this;
+        }
+        return this.with((url) => ({ host: "ide." + url.host }));
+    }
+
+    asPublicServices(): GitpodHostUrl {
+        const hostSegments = this.url.host.split(".");
+        if (hostSegments[0] === "services") {
+            return this;
+        }
+        return this.with((url) => ({ host: "services." + url.host }));
+    }
+
+    asIDEMetrics(): GitpodHostUrl {
+        let newUrl: GitpodHostUrl = this;
+        const hostSegments = this.url.host.split(".");
+        if (hostSegments[0] !== "ide") {
+            newUrl = newUrl.asIDEProxy();
+        }
+        return newUrl.with((url) => ({ pathname: "/metrics-api" }));
+    }
+
+    asLoginWithOTS(userId: string, key: string, returnToUrl?: string) {
+        const result = this.withApi({ pathname: `/login/ots/${userId}/${key}` });
+        if (returnToUrl) {
+            return result.with({ search: `returnTo=${encodeURIComponent(returnToUrl)}` });
+        }
+        return result;
+    }
 }

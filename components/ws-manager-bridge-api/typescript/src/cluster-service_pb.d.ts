@@ -1,7 +1,7 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2024 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 // package: workspacemanagerbridge
@@ -31,6 +31,8 @@ export class RegisterRequest extends jspb.Message {
     getAdmissionConstraintsList(): Array<AdmissionConstraint>;
     setAdmissionConstraintsList(value: Array<AdmissionConstraint>): RegisterRequest;
     addAdmissionConstraints(value?: AdmissionConstraint, index?: number): AdmissionConstraint;
+    getRegion(): string;
+    setRegion(value: string): RegisterRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): RegisterRequest.AsObject;
@@ -49,6 +51,7 @@ export namespace RegisterRequest {
         tls?: TlsConfig.AsObject,
         hints?: RegistrationHints.AsObject,
         admissionConstraintsList: Array<AdmissionConstraint.AsObject>,
+        region: string,
     }
 }
 
@@ -100,8 +103,6 @@ export class RegistrationHints extends jspb.Message {
     setPerfereability(value: Preferability): RegistrationHints;
     getCordoned(): boolean;
     setCordoned(value: boolean): RegistrationHints;
-    getGovern(): boolean;
-    setGovern(value: boolean): RegistrationHints;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): RegistrationHints.AsObject;
@@ -117,7 +118,6 @@ export namespace RegistrationHints {
     export type AsObject = {
         perfereability: Preferability,
         cordoned: boolean,
-        govern: boolean,
     }
 }
 
@@ -211,12 +211,14 @@ export class ClusterStatus extends jspb.Message {
     setMaxScore(value: number): ClusterStatus;
     getGoverned(): boolean;
     setGoverned(value: boolean): ClusterStatus;
-    clearAdmissionConstraintsList(): void;
-    getAdmissionConstraintsList(): Array<AdmissionConstraint>;
-    setAdmissionConstraintsList(value: Array<AdmissionConstraint>): ClusterStatus;
-    addAdmissionConstraints(value?: AdmissionConstraint, index?: number): AdmissionConstraint;
+    clearAdmissionConstraintList(): void;
+    getAdmissionConstraintList(): Array<AdmissionConstraint>;
+    setAdmissionConstraintList(value: Array<AdmissionConstraint>): ClusterStatus;
+    addAdmissionConstraint(value?: AdmissionConstraint, index?: number): AdmissionConstraint;
     getStatic(): boolean;
     setStatic(value: boolean): ClusterStatus;
+    getRegion(): string;
+    setRegion(value: string): ClusterStatus;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): ClusterStatus.AsObject;
@@ -236,8 +238,9 @@ export namespace ClusterStatus {
         score: number,
         maxScore: number,
         governed: boolean,
-        admissionConstraintsList: Array<AdmissionConstraint.AsObject>,
+        admissionConstraintList: Array<AdmissionConstraint.AsObject>,
         pb_static: boolean,
+        region: string,
     }
 }
 
@@ -260,10 +263,15 @@ export class UpdateRequest extends jspb.Message {
     getCordoned(): boolean;
     setCordoned(value: boolean): UpdateRequest;
 
-    hasAdmissionConstraints(): boolean;
-    clearAdmissionConstraints(): void;
-    getAdmissionConstraints(): ModifyAdmissionConstraint | undefined;
-    setAdmissionConstraints(value?: ModifyAdmissionConstraint): UpdateRequest;
+    hasAdmissionConstraint(): boolean;
+    clearAdmissionConstraint(): void;
+    getAdmissionConstraint(): ModifyAdmissionConstraint | undefined;
+    setAdmissionConstraint(value?: ModifyAdmissionConstraint): UpdateRequest;
+
+    hasTls(): boolean;
+    clearTls(): void;
+    getTls(): TlsConfig | undefined;
+    setTls(value?: TlsConfig): UpdateRequest;
 
     getPropertyCase(): UpdateRequest.PropertyCase;
 
@@ -283,7 +291,8 @@ export namespace UpdateRequest {
         score: number,
         maxScore: number,
         cordoned: boolean,
-        admissionConstraints?: ModifyAdmissionConstraint.AsObject,
+        admissionConstraint?: ModifyAdmissionConstraint.AsObject,
+        tls?: TlsConfig.AsObject,
     }
 
     export enum PropertyCase {
@@ -291,7 +300,8 @@ export namespace UpdateRequest {
         SCORE = 2,
         MAX_SCORE = 3,
         CORDONED = 4,
-        ADMISSION_CONSTRAINTS = 5,
+        ADMISSION_CONSTRAINT = 5,
+        TLS = 7,
     }
 
 }
@@ -342,6 +352,8 @@ export namespace UpdateResponse {
 export class DeregisterRequest extends jspb.Message {
     getName(): string;
     setName(value: string): DeregisterRequest;
+    getForce(): boolean;
+    setForce(value: boolean): DeregisterRequest;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): DeregisterRequest.AsObject;
@@ -356,6 +368,7 @@ export class DeregisterRequest extends jspb.Message {
 export namespace DeregisterRequest {
     export type AsObject = {
         name: string,
+        force: boolean,
     }
 }
 

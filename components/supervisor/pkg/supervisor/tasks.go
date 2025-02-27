@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package supervisor
 
@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -33,7 +34,7 @@ func (sub *tasksSubscription) Updates() <-chan []*api.TaskStatus {
 	return sub.updates
 }
 
-const maxSubscriptions = 10
+const maxSubscriptions = 100
 
 func (tm *tasksManager) Subscribe() *tasksSubscription {
 	tm.mu.Lock()
@@ -106,9 +107,11 @@ type tasksManager struct {
 	terminalService *terminal.MuxTerminalService
 	contentState    ContentState
 	reporter        headlessTaskProgressReporter
+	ideReady        *ideReadyState
+	desktopIdeReady *ideReadyState
 }
 
-func newTasksManager(config *Config, terminalService *terminal.MuxTerminalService, contentState ContentState, reporter headlessTaskProgressReporter) *tasksManager {
+func newTasksManager(config *Config, terminalService *terminal.MuxTerminalService, contentState ContentState, reporter headlessTaskProgressReporter, ideReady *ideReadyState, desktopIdeReady *ideReadyState) *tasksManager {
 	return &tasksManager{
 		config:          config,
 		terminalService: terminalService,
@@ -117,6 +120,8 @@ func newTasksManager(config *Config, terminalService *terminal.MuxTerminalServic
 		subscriptions:   make(map[*tasksSubscription]struct{}),
 		ready:           make(chan struct{}),
 		storeLocation:   logs.TerminalStoreLocation,
+		ideReady:        ideReady,
+		desktopIdeReady: desktopIdeReady,
 	}
 }
 
@@ -125,6 +130,18 @@ func (tm *tasksManager) Status() []*api.TaskStatus {
 	defer tm.mu.RUnlock()
 
 	return tm.getStatus()
+}
+
+func (tm *tasksManager) getTaskStatus(taskID string) *api.TaskStatus {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	for _, t := range tm.tasks {
+		if t.Id == taskID {
+			return &t.TaskStatus
+		}
+	}
+	return nil
 }
 
 // getStatus produces an API compatible task status list.
@@ -176,11 +193,8 @@ func (tm *tasksManager) init(ctx context.Context) {
 		log.WithError(err).Error()
 		return
 	}
-	if tasks == nil && tm.config.isHeadless() {
+	if len(tasks) == 0 && tm.config.isHeadless() {
 		return
-	}
-	if tasks == nil {
-		tasks = &[]TaskConfig{{}}
 	}
 
 	select {
@@ -192,15 +206,16 @@ func (tm *tasksManager) init(ctx context.Context) {
 	contentSource, _ := tm.contentState.ContentSource()
 	tm.contentSource = contentSource
 
-	for i, config := range *tasks {
+	// give 1s window between content and tasks for IDE to startup, i.e. no competition for resources
+	tm.waitForIde(ctx, 1*time.Second)
+
+	for i, config := range tasks {
 		id := strconv.Itoa(i)
 		presentation := &api.TaskPresentation{}
-		title := ""
 		if config.Name != nil {
 			presentation.Name = *config.Name
-			title = *config.Name
 		} else {
-			presentation.Name = tm.terminalService.DefaultWorkdir
+			presentation.Name = "Gitpod Task " + strconv.Itoa(i+1)
 		}
 		if config.OpenIn != nil {
 			presentation.OpenIn = *config.OpenIn
@@ -216,14 +231,36 @@ func (tm *tasksManager) init(ctx context.Context) {
 			},
 			config:      config,
 			successChan: make(chan taskSuccess, 1),
-			title:       title,
+			title:       presentation.Name,
 		}
-		task.command = getCommand(task, tm.config.isHeadless(), tm.contentSource, tm.storeLocation)
+		task.command = getCommand(task, tm.config.isHeadless(), tm.config.isPrebuild(), tm.contentSource, tm.storeLocation)
 		if tm.config.isHeadless() && task.command == "exit" {
 			task.State = api.TaskState_closed
 			task.successChan <- taskSuccessful
 		}
 		tm.tasks = append(tm.tasks, task)
+	}
+}
+
+func (tm *tasksManager) waitForIde(parent context.Context, timeout time.Duration) {
+	if tm.ideReady == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return
+	case <-tm.ideReady.Wait():
+	}
+
+	if tm.desktopIdeReady == nil {
+		return
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-tm.desktopIdeReady.Wait():
 	}
 }
 
@@ -243,20 +280,23 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		if t.config.Env != nil {
 			openRequest.Env = make(map[string]string, len(*t.config.Env))
 			for key, value := range *t.config.Env {
-				v, err := json.Marshal(value)
-				if err != nil {
-					taskLog.WithError(err).WithField("key", key).Error("cannot marshal env var")
+				// Required check because a string is considered valid JSON (e.g. "hello")
+				// We don't want to marshall basic strings otherwise we get a double quoted environment variable
+				// See: https://github.com/gitpod-io/gitpod/issues/5887
+				if val, ok := value.(string); ok {
+					openRequest.Env[key] = val
 				} else {
-					openRequest.Env[key] = string(v)
+					v, err := json.Marshal(value)
+					if err != nil {
+						taskLog.WithError(err).WithField("key", key).Error("cannot marshal env var")
+					} else {
+						openRequest.Env[key] = string(v)
+					}
 				}
 			}
 		}
-		var readTimeout time.Duration
-		if !tm.config.isHeadless() {
-			readTimeout = 5 * time.Second
-		}
 		resp, err := tm.terminalService.OpenWithOptions(ctx, openRequest, terminal.TermOptions{
-			ReadTimeout: readTimeout,
+			ReadTimeout: 5 * time.Second,
 			Title:       t.title,
 		})
 		if err != nil {
@@ -283,16 +323,24 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 			return true
 		})
 
+		taskWatchWg := &sync.WaitGroup{}
+
 		go func(t *task, term *terminal.Term) {
 			state, err := term.Wait()
-			if state != nil {
+			taskLog.Info("task terminal has been closed. Waiting for watch() to finish...")
+			taskWatchWg.Wait()
+			taskLog.Info("watch() has finished, setting task state to closed")
+
+			if term.ForceSuccess {
+				// Simulate state.Success()
+				t.successChan <- taskSuccessful
+			} else if state != nil {
 				if state.Success() {
 					t.successChan <- taskSuccessful
 				} else {
 					t.successChan <- taskFailed(state.String())
 				}
-			} else if err != nil && strings.Contains(err.Error(), "no child process") {
-				// our own reaper broke Go's child process handling
+			} else if err != nil {
 				t.successChan <- taskSuccessful
 			} else {
 				msg := "cannot wait for task"
@@ -302,11 +350,10 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 
 				t.successChan <- taskFailed(fmt.Sprintf("%s: %s", msg, t.lastOutput))
 			}
-			taskLog.Info("task terminal has been closed")
 			tm.setTaskState(t, api.TaskState_closed)
 		}(t, term)
 
-		tm.watch(t, term)
+		tm.watch(t, term, taskWatchWg)
 
 		if t.command != "" {
 			term.PTY.Write([]byte(t.command + "\n"))
@@ -325,14 +372,14 @@ func (tm *tasksManager) Run(ctx context.Context, wg *sync.WaitGroup, successChan
 		}
 	}
 
-	if tm.config.isHeadless() && tm.reporter != nil {
+	if tm.config.isPrebuild() && tm.reporter != nil {
 		tm.reporter.done(success)
 	}
 	successChan <- success
 }
 
-func getCommand(task *task, isHeadless bool, contentSource csapi.WorkspaceInitSource, storeLocation string) string {
-	commands := getCommands(task, isHeadless, contentSource, storeLocation)
+func getCommand(task *task, isHeadless bool, isPrebuild bool, contentSource csapi.WorkspaceInitSource, storeLocation string) string {
+	commands := getCommands(task, isPrebuild, contentSource, storeLocation)
 	command := composeCommand(composeCommandOptions{
 		commands: commands,
 		format:   "{\n%s\n}",
@@ -372,7 +419,7 @@ func getHistfileCommand(task *task, commands []*string, contentSource csapi.Work
 	}
 
 	histfile := storeLocation + "/cmd-" + task.Id
-	err := os.WriteFile(histfile, []byte(histfileContent), 0644)
+	err := os.WriteFile(histfile, []byte(histfileContent), 0o644)
 	if err != nil {
 		log.WithField("histfile", histfile).WithError(err).Error("cannot write histfile")
 		return ""
@@ -383,8 +430,8 @@ func getHistfileCommand(task *task, commands []*string, contentSource csapi.Work
 	return " HISTFILE=" + histfile + " history -r"
 }
 
-func getCommands(task *task, isHeadless bool, contentSource csapi.WorkspaceInitSource, storeLocation string) []*string {
-	if isHeadless {
+func getCommands(task *task, isPrebuild bool, contentSource csapi.WorkspaceInitSource, storeLocation string) []*string {
+	if isPrebuild {
 		// prebuild
 		return []*string{task.config.Before, task.config.Init, task.config.Prebuild}
 	}
@@ -407,18 +454,24 @@ func prebuildLogFileName(task *task, storeLocation string) string {
 	return logs.PrebuildLogFileName(storeLocation, task.Id)
 }
 
-func (tm *tasksManager) watch(task *task, terminal *terminal.Term) {
-	if !tm.config.isHeadless() {
+func (tm *tasksManager) watch(task *task, term *terminal.Term, wg *sync.WaitGroup) {
+	if !tm.config.isPrebuild() {
 		return
 	}
 
 	var (
-		terminalLog = log.WithField("pid", terminal.Command.Process.Pid)
-		stdout      = terminal.Stdout.Listen()
-		start       = time.Now()
+		terminalLog = log.WithField("pid", term.Command.Process.Pid)
+		stdout      = term.Stdout.ListenWithOptions(terminal.TermListenOptions{
+			// ensure logging of entire task output
+			ReadTimeout: terminal.NoTimeout,
+		})
+		start = time.Now()
 	)
 	go func() {
 		defer stdout.Close()
+
+		wg.Add(1)
+		defer wg.Done()
 
 		var (
 			fileName    = prebuildLogFileName(task, tm.storeLocation)
@@ -444,43 +497,39 @@ func (tm *tasksManager) watch(task *task, terminal *terminal.Term) {
 		// Import any parent prebuild logs and parse their total duration if available
 		parentElapsed := importParentLogAndGetDuration(oldFileName, fileWriter)
 
-		buf := make([]byte, 4096)
-		for {
-			n, err := stdout.Read(buf)
-			if err == io.EOF {
-				elapsed := time.Since(start)
-				if parentElapsed > elapsed {
-					elapsed = parentElapsed
-				}
-				duration := ""
-				if elapsed >= 1*time.Minute {
-					elapsedInMinutes := strconv.Itoa(int(elapsed.Minutes()))
-					duration = "🎉 Well done on saving " + elapsedInMinutes + " minute"
-					if elapsedInMinutes != "1" {
-						duration += "s"
-					}
-					duration += "\r\n"
-				}
-				data := string(buf[:n])
-				fileWriter.Write(buf[:n])
-				if tm.reporter != nil {
-					tm.reporter.write(data, task, terminal)
-				}
+		var writer io.Writer
 
-				endMessage := "\r\n🤙 This task ran as a workspace prebuild\r\n" + duration + "\r\n"
-				fileWriter.WriteString(endMessage)
-				break
+		if os.Getenv("SUPERVISOR_DEBUG_ENABLE") == "true" {
+			writer = io.MultiWriter(fileWriter, os.Stdout)
+		} else {
+			writer = fileWriter
+		}
+
+		_, err = io.Copy(writer, stdout)
+		if err != nil {
+			log.WithError(err).Error("cannot copy from terminal")
+		}
+
+		elapsed := time.Since(start)
+		if parentElapsed > elapsed {
+			elapsed = parentElapsed
+		}
+
+		duration := ""
+		if elapsed >= 1*time.Minute {
+			elapsedInMinutes := strconv.Itoa(int(math.Round(elapsed.Minutes())))
+			duration = "⏱️ Well done on saving " + elapsedInMinutes + " minute"
+			if elapsedInMinutes != "1" {
+				duration += "s"
 			}
-			if err != nil {
-				terminalLog.WithError(err).Error("cannot read from a task terminal")
-				return
-			}
-			data := string(buf[:n])
-			fileWriter.Write(buf[:n])
-			if tm.reporter != nil {
-				task.lastOutput = string(buf[:n])
-				tm.reporter.write(data, task, terminal)
-			}
+			duration += "\r\n"
+		}
+
+		endMessage := "\r\n🍊 This task ran as a workspace prebuild\r\n" + duration + "\r\n"
+		_, _ = writer.Write([]byte(endMessage))
+
+		if tm.reporter != nil {
+			task.lastOutput = endMessage
 		}
 	}()
 }
@@ -502,7 +551,7 @@ func importParentLogAndGetDuration(fn string, out io.Writer) time.Duration {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		l := scanner.Text()
-		if strings.Contains(l, "🤙 This task ran as a workspace prebuild") {
+		if strings.Contains(l, "🍊 This task ran as a workspace prebuild") {
 			break
 		}
 		out.Write([]byte(l + "\n"))
@@ -510,7 +559,7 @@ func importParentLogAndGetDuration(fn string, out io.Writer) time.Duration {
 	if !scanner.Scan() {
 		return 0
 	}
-	reg, err := regexp.Compile(`🎉 Well done on saving (\d+) minute`)
+	reg, err := regexp.Compile(`⏱️ Well done on saving (\d+) minute`)
 	if err != nil {
 		return 0
 	}

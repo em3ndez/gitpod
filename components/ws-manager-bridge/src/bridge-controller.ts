@@ -1,42 +1,36 @@
 /**
  * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 import { inject, injectable, interfaces } from "inversify";
 import { WorkspaceClusterInfo, WorkspaceManagerBridge, WorkspaceManagerBridgeFactory } from "./bridge";
 import { Configuration } from "./config";
-import { WorkspaceManagerClientProvider } from '@gitpod/ws-manager/lib/client-provider';
-import { WorkspaceManagerClientProviderSource } from '@gitpod/ws-manager/lib/client-provider-source';
-import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
-import { TLSConfig, WorkspaceClusterDB, WorkspaceClusterWoTLS } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
+import { WorkspaceManagerClientProvider } from "@gitpod/ws-manager/lib/client-provider";
+import { WorkspaceManagerClientProviderSource } from "@gitpod/ws-manager/lib/client-provider-source";
+import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
+import { TLSConfig, WorkspaceClusterWoTLS } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import { WorkspaceCluster } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import { Queue } from "@gitpod/gitpod-protocol";
-import { defaultGRPCOptions } from '@gitpod/gitpod-protocol/lib/util/grpc';
-import * as grpc from '@grpc/grpc-js';
-import { PrometheusMetricsExporter } from "./prometheus-metrics-exporter";
+import { defaultGRPCOptions } from "@gitpod/gitpod-protocol/lib/util/grpc";
+import * as grpc from "@grpc/grpc-js";
+import { Metrics } from "./metrics";
+import { TrustedValue } from "@gitpod/gitpod-protocol/lib/util/scrubbing";
 
 @injectable()
 export class BridgeController {
-    @inject(Configuration)
-    protected readonly config: Configuration;
+    constructor(
+        @inject(Configuration) private readonly config: Configuration,
+        @inject(WorkspaceManagerBridgeFactory)
+        private readonly bridgeFactory: interfaces.Factory<WorkspaceManagerBridge>,
+        @inject(WorkspaceManagerClientProvider) private readonly clientProvider: WorkspaceManagerClientProvider,
+        @inject(Metrics) private readonly metrics: Metrics,
+    ) {}
 
-    @inject(WorkspaceManagerBridgeFactory)
-    protected readonly bridgeFactory: interfaces.Factory<WorkspaceManagerBridge>;
-
-    @inject(WorkspaceManagerClientProvider)
-    protected readonly clientProvider: WorkspaceManagerClientProvider;
-
-    @inject(WorkspaceClusterDB)
-    protected readonly db: WorkspaceClusterDB;
-
-    @inject(PrometheusMetricsExporter)
-    protected readonly metrics: PrometheusMetricsExporter;
-
-    protected readonly bridges: Map<string, WorkspaceManagerBridge> = new Map();
-    protected readonly reconcileQueue: Queue = new Queue();
-    protected reconcileTimer: NodeJS.Timeout | undefined = undefined;
+    private readonly bridges: Map<string, WorkspaceManagerBridge> = new Map();
+    private readonly reconcileQueue: Queue = new Queue();
+    private reconcileTimer: NodeJS.Timeout | undefined = undefined;
 
     public async start() {
         const scheduleReconcile = async () => {
@@ -45,7 +39,10 @@ export class BridgeController {
             } catch (err) {
                 log.error("error reconciling WorkspaceCluster", err);
             } finally {
-                this.reconcileTimer = setTimeout(scheduleReconcile, this.config.wsClusterDBReconcileIntervalSeconds * 1000);
+                this.reconcileTimer = setTimeout(
+                    scheduleReconcile,
+                    this.config.wsClusterDBReconcileIntervalSeconds * 1000,
+                );
             }
         };
         await scheduleReconcile();
@@ -58,16 +55,19 @@ export class BridgeController {
         await this.reconcile();
     }
 
-    protected async reconcile() {
+    private async reconcile() {
         return this.reconcileQueue.enqueue(async () => {
             const allClusters = await this.getAllWorkspaceClusters();
-            log.info("reconciling clusters...", { allClusters });
+            log.info("reconciling clusters...", {
+                allClusters: new TrustedValue(Array.from(allClusters.keys())),
+                bridges: new TrustedValue(Array.from(this.bridges.keys())),
+            });
             const toDelete: string[] = [];
             try {
                 for (const [name, bridge] of this.bridges) {
-                    let cluster = allClusters.get(name);
+                    const cluster = allClusters.get(name);
                     if (!cluster) {
-                        log.debug("reconcile: cluster not present anymore, stopping", { name });
+                        log.info("reconcile: cluster not present anymore, stopping", { name });
                         bridge.stop();
                         toDelete.push(name);
                     } else {
@@ -81,24 +81,27 @@ export class BridgeController {
                 }
             }
 
-            this.metrics.updateClusterMetrics(Array.from(allClusters).map(c => c[1]));
+            this.metrics.updateClusterMetrics(Array.from(allClusters).map(([_, c]) => c));
             for (const [name, newCluster] of allClusters) {
-                log.debug("reconcile: create bridge for new cluster", { name });
+                log.info("reconcile: create bridge for new cluster", { name });
                 const bridge = await this.createAndStartBridge(newCluster);
                 this.bridges.set(newCluster.name, bridge);
             }
-            log.info("done reconciling.", { allClusters });
+            log.info("done reconciling.", {
+                newClusters: new TrustedValue(Array.from(allClusters.keys())),
+                bridges: new TrustedValue(Array.from(this.bridges.keys())),
+            });
         });
     }
 
-    protected async createAndStartBridge(cluster: WorkspaceClusterInfo): Promise<WorkspaceManagerBridge> {
+    private async createAndStartBridge(cluster: WorkspaceClusterInfo): Promise<WorkspaceManagerBridge> {
         const bridge = this.bridgeFactory() as WorkspaceManagerBridge;
         const grpcOptions: grpc.ClientOptions = {
             ...defaultGRPCOptions,
         };
         const clientProvider = async () => {
             return this.clientProvider.get(cluster.name, grpcOptions);
-        }
+        };
         bridge.start(cluster, clientProvider);
         return bridge;
     }
@@ -129,19 +132,18 @@ export class BridgeController {
 
 @injectable()
 export class WorkspaceManagerClientProviderConfigSource implements WorkspaceManagerClientProviderSource {
-    @inject(Configuration)
-    protected readonly config: Configuration;
+    constructor(@inject(Configuration) private readonly config: Configuration) {}
 
     public async getWorkspaceCluster(name: string): Promise<WorkspaceCluster | undefined> {
-        return this.clusters.find(m => m.name === name);
+        return this.clusters.find((m) => m.name === name);
     }
 
     public async getAllWorkspaceClusters(): Promise<WorkspaceClusterWoTLS[]> {
         return this.clusters;
     }
 
-    protected get clusters(): WorkspaceCluster[] {
-        return this.config.staticBridges.map(c => {
+    private get clusters(): WorkspaceCluster[] {
+        return this.config.staticBridges.map((c) => {
             if (!c.tls) {
                 return c;
             }
@@ -152,8 +154,8 @@ export class WorkspaceManagerClientProviderConfigSource implements WorkspaceMana
                     ca: TLSConfig.loadFromBase64File(c.tls.ca),
                     crt: TLSConfig.loadFromBase64File(c.tls.crt),
                     key: TLSConfig.loadFromBase64File(c.tls.key),
-                }
-            }
+                },
+            };
         });
     }
 }

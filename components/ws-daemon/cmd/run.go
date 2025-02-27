@@ -1,27 +1,32 @@
 // Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 
 package cmd
 
 import (
-	"net"
-	"net/http"
+	"context"
 	"os"
-	"os/signal"
+	"os/exec"
 	"syscall"
+	"time"
 
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/xerrors"
+	"k8s.io/klog/v2"
+
+	"github.com/bombsimon/logrusr/v2"
+	"github.com/heptiolabs/healthcheck"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
+	ctrl "sigs.k8s.io/controller-runtime"
 
-	common_grpc "github.com/gitpod-io/gitpod/common-go/grpc"
+	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	"github.com/gitpod-io/gitpod/common-go/log"
-	"github.com/gitpod-io/gitpod/common-go/pprof"
+	"github.com/gitpod-io/gitpod/common-go/watch"
+	"github.com/gitpod-io/gitpod/ws-daemon/pkg/config"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/daemon"
 )
+
+const grpcServerName = "wsdaemon"
 
 // serveCmd represents the serve command
 var runCmd = &cobra.Command{
@@ -29,89 +34,110 @@ var runCmd = &cobra.Command{
 	Short: "Connects to the messagebus and starts the workspace monitor",
 
 	Run: func(cmd *cobra.Command, args []string) {
-		cfg := getConfig()
-		reg := prometheus.NewRegistry()
-		dmn, err := daemon.NewDaemon(cfg.Daemon, prometheus.WrapRegistererWithPrefix("gitpod_ws_daemon_", reg))
+		cfg, err := config.Read(configFile)
 		if err != nil {
-			log.WithError(err).Fatal("cannot create daemon")
+			log.WithError(err).Fatal("Cannot read configuration. Maybe missing --config?")
 		}
 
-		common_grpc.SetupLogging()
+		createLVMDevices()
 
-		grpcMetrics := grpc_prometheus.NewServerMetrics()
-		grpcMetrics.EnableHandlingTimeHistogram()
-		reg.MustRegister(grpcMetrics)
+		baseLogger := logrusr.New(log.Log)
+		ctrl.SetLogger(baseLogger)
+		// Set the logger used by k8s (e.g. client-go).
+		klog.SetLogger(baseLogger)
 
-		grpcOpts := common_grpc.ServerOptionsWithInterceptors(
-			[]grpc.StreamServerInterceptor{grpcMetrics.StreamServerInterceptor()},
-			[]grpc.UnaryServerInterceptor{grpcMetrics.UnaryServerInterceptor()},
+		dmn, err := daemon.NewDaemon(cfg.Daemon)
+		if err != nil {
+			log.WithError(err).Fatal("Cannot create daemon.")
+		}
+
+		health := healthcheck.NewHandler()
+		srv, err := baseserver.New(grpcServerName,
+			baseserver.WithGRPC(&cfg.Service),
+			baseserver.WithHealthHandler(health),
+			baseserver.WithMetricsRegistry(dmn.MetricsRegistry()),
+			baseserver.WithVersion(Version),
 		)
-		tlsOpt, err := cfg.Service.TLS.ServerOption()
 		if err != nil {
-			log.WithError(err).Fatal("cannot use TLS config")
-		}
-		if tlsOpt != nil {
-			log.WithField("crt", cfg.Service.TLS.Certificate).WithField("key", cfg.Service.TLS.PrivateKey).Debug("securing gRPC server with TLS")
-			grpcOpts = append(grpcOpts, tlsOpt)
-		} else {
-			log.Warn("no TLS configured - gRPC server will be unsecured")
+			log.WithError(err).Fatal("Cannot set up server.")
 		}
 
-		server := grpc.NewServer(grpcOpts...)
-		dmn.Register(server)
-		lis, err := net.Listen("tcp", cfg.Service.Addr)
-		if err != nil {
-			log.WithError(err).Fatalf("cannot listen on %s", cfg.Service.Addr)
-		}
-		go func() {
-			err := server.Serve(lis)
-			if err != nil {
-				log.WithError(err).Fatal("cannot start server")
-			}
-		}()
-		log.WithField("addr", cfg.Service.Addr).Info("started gRPC server")
-
-		if cfg.Prometheus.Addr != "" {
-			reg.MustRegister(
-				prometheus.NewGoCollector(),
-				prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
-			)
-
-			handler := http.NewServeMux()
-			handler.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-
-			go func() {
-				err := http.ListenAndServe(cfg.Prometheus.Addr, handler)
-				if err != nil {
-					log.WithError(err).Error("Prometheus metrics server failed")
-				}
-			}()
-			log.WithField("addr", cfg.Prometheus.Addr).Info("started Prometheus metrics server")
-		}
-
-		if cfg.PProf.Addr != "" {
-			go pprof.Serve(cfg.PProf.Addr)
-		}
+		health.AddReadinessCheck("ws-daemon", dmn.ReadinessProbe())
+		health.AddReadinessCheck("disk-space", freeDiskSpace(cfg.Daemon))
 
 		err = dmn.Start()
 		if err != nil {
-			log.WithError(err).Fatal("cannot start daemon")
+			log.WithError(err).Fatal("Cannot start daemon.")
 		}
 
-		// run until we're told to stop
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		log.Info("🧫 ws-daemon is up and running. Stop with SIGINT or CTRL+C")
-		<-sigChan
-		server.Stop()
-		err = dmn.Stop()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err = watch.File(ctx, configFile, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			cfg, err := config.Read(configFile)
+			if err != nil {
+				log.WithError(err).Warn("Cannot reload configuration.")
+				return
+			}
+
+			err = dmn.ReloadConfig(ctx, &cfg.Daemon)
+			if err != nil {
+				log.WithError(err).Warn("Cannot reload configuration.")
+			}
+		})
 		if err != nil {
-			log.WithError(err).Error("cannot shut down gracefully")
+			log.WithError(err).Fatal("Cannot start watch of configuration file.")
 		}
-		log.Info("Received SIGINT - shutting down")
+
+		err = syscall.Setpriority(syscall.PRIO_PROCESS, os.Getpid(), -19)
+		if err != nil {
+			log.WithError(err).Error("cannot change ws-daemon priority")
+		}
+
+		err = srv.ListenAndServe()
+		if err != nil {
+			log.WithError(err).Fatal("Failed to listen and serve.")
+		}
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(runCmd)
+}
+
+// createLVMDevices creates LVM logical volume special files missing when we run inside a container.
+// Without this devices we cannot enforce disk quotas. In installations without LVM this is a NOOP.
+func createLVMDevices() {
+	cmd := exec.Command("/usr/sbin/vgmknodes")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.WithError(err).WithField("out", string(out)).Error("cannot recreate LVM files in /dev/mapper")
+	}
+}
+
+func freeDiskSpace(cfg daemon.Config) func() error {
+	return func() error {
+		var diskDiskAvailable uint64 = 1
+		for _, loc := range cfg.DiskSpaceGuard.Locations {
+			if loc.Path == cfg.Content.WorkingArea {
+				diskDiskAvailable = loc.MinBytesAvail
+			}
+		}
+
+		var stat syscall.Statfs_t
+		err := syscall.Statfs(cfg.Content.WorkingArea, &stat)
+		if err != nil {
+			return xerrors.Errorf("cannot get disk space details from path %s: %w", cfg.Content.WorkingArea, err)
+		}
+
+		diskAvailable := stat.Bavail * uint64(stat.Bsize) * (1024 * 1024 * 1024) // In GB
+		if diskAvailable < diskDiskAvailable {
+			return xerrors.Errorf("not enough disk available (%v)", diskAvailable)
+		}
+
+		return nil
+	}
 }

@@ -1,6 +1,6 @@
 // Copyright (c) 2021 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
-// See License-AGPL.txt in the project root for license information.
+// See License.AGPL.txt in the project root for license information.
 //
 // Based on https://github.com/leodido/rn2md with kind permission from the author
 package main
@@ -16,13 +16,14 @@ import (
 )
 
 type PullRequestOptions struct {
-	Title      string
-	Body       string
-	Token      string
-	Org        string
-	Repo       string
-	BaseBranch string
-	HeadBranch string
+	Title         string
+	Body          string
+	Token         string
+	ApprovalToken string
+	Org           string
+	Repo          string
+	BaseBranch    string
+	HeadBranch    string
 }
 
 var prOpts = &PullRequestOptions{}
@@ -33,6 +34,9 @@ var pullRequestCommand = &cobra.Command{
 	Short: "Creates a PR to update the changelog.",
 	Run: func(c *cobra.Command, args []string) {
 		client := NewClient(prOpts.Token)
+		// PRs can't be approved by the author of the PR. Thus we need two clients.
+		// One for creating the PR and one for approving it.
+		approvalClient := NewClient(prOpts.ApprovalToken)
 		context := context.Background()
 		newPr := &github.NewPullRequest{
 			Title: &prOpts.Title,
@@ -100,6 +104,22 @@ var pullRequestCommand = &cobra.Command{
 			l += *label.Name
 		}
 		logger.WithField("labels", l).WithField("pr", pr.Number).Info("PR labels successfully added")
+
+		retries = 0
+		for {
+			retries++
+			if retries > 60 {
+				logger.WithError(err).Fatal("Timeout trying to approve PR")
+			}
+			event := "APPROVE"
+			_, _, err := approvalClient.PullRequests.CreateReview(context, prOpts.Org, prOpts.Repo, *pr.Number, &github.PullRequestReviewRequest{Event: &event})
+			if err != nil {
+				logger.WithError(err).Error("Error approving PR. Trying again in a bit.")
+				time.Sleep(time.Second)
+			} else {
+				break
+			}
+		}
 	},
 }
 
@@ -107,11 +127,12 @@ func init() {
 	// Setup prFlags before the command is initialized
 	prFlags := pullRequestCommand.PersistentFlags()
 	prFlags.StringVarP(&prOpts.Token, "token", "t", prOpts.Token, "a GitHub personal API token to perform authenticated requests")
+	prFlags.StringVarP(&prOpts.ApprovalToken, "approval-token", "a", prOpts.Token, "a GitHub personal API token to perform PR approval")
 	prFlags.StringVarP(&prOpts.Org, "org", "o", prOpts.Org, "the github organization")
 	prFlags.StringVarP(&prOpts.Repo, "repo", "r", prOpts.Repo, "the github repository name")
 	prFlags.StringVarP(&prOpts.HeadBranch, "head", "H", "main", "the head branch for pull requests")
 	prFlags.StringVarP(&prOpts.BaseBranch, "base", "b", "main", "the base branch for pull requests")
 	prFlags.StringVarP(&prOpts.Title, "title", "T", "[changelog] updated changelog", "the title of the PR")
-	prFlags.StringVarP(&prOpts.Body, "body", "B", "Updated the changelog from recent PR descriptions\n\n```release-note\nNONE\n```\n/werft no-preview\n/werft no-test", "the body of the PR")
+	prFlags.StringVarP(&prOpts.Body, "body", "B", "Updated the changelog from recent PR descriptions\n\n```release-note\nNONE\n```\n/werft no-test", "the body of the PR")
 	rootCommand.AddCommand(pullRequestCommand)
 }

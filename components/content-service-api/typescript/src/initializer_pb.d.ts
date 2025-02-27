@@ -1,7 +1,7 @@
 /**
- * Copyright (c) 2021 Gitpod GmbH. All rights reserved.
+ * Copyright (c) 2023 Gitpod GmbH. All rights reserved.
  * Licensed under the GNU Affero General Public License (AGPL).
- * See License-AGPL.txt in the project root for license information.
+ * See License.AGPL.txt in the project root for license information.
  */
 
 // package: contentservice
@@ -193,6 +193,8 @@ export class GitInitializer extends jspb.Message {
     clearConfig(): void;
     getConfig(): GitConfig | undefined;
     setConfig(value?: GitConfig): GitInitializer;
+    getFullClone(): boolean;
+    setFullClone(value: boolean): GitInitializer;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): GitInitializer.AsObject;
@@ -212,6 +214,7 @@ export namespace GitInitializer {
         cloneTaget: string,
         checkoutLocation: string,
         config?: GitConfig.AsObject,
+        fullClone: boolean,
     }
 }
 
@@ -252,6 +255,8 @@ export namespace GitConfig {
 export class SnapshotInitializer extends jspb.Message {
     getSnapshot(): string;
     setSnapshot(value: string): SnapshotInitializer;
+    getFromVolumeSnapshot(): boolean;
+    setFromVolumeSnapshot(value: boolean): SnapshotInitializer;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): SnapshotInitializer.AsObject;
@@ -266,6 +271,7 @@ export class SnapshotInitializer extends jspb.Message {
 export namespace SnapshotInitializer {
     export type AsObject = {
         snapshot: string,
+        fromVolumeSnapshot: boolean,
     }
 }
 
@@ -275,11 +281,10 @@ export class PrebuildInitializer extends jspb.Message {
     clearPrebuild(): void;
     getPrebuild(): SnapshotInitializer | undefined;
     setPrebuild(value?: SnapshotInitializer): PrebuildInitializer;
-
-    hasGit(): boolean;
-    clearGit(): void;
-    getGit(): GitInitializer | undefined;
-    setGit(value?: GitInitializer): PrebuildInitializer;
+    clearGitList(): void;
+    getGitList(): Array<GitInitializer>;
+    setGitList(value: Array<GitInitializer>): PrebuildInitializer;
+    addGit(value?: GitInitializer, index?: number): GitInitializer;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): PrebuildInitializer.AsObject;
@@ -294,11 +299,15 @@ export class PrebuildInitializer extends jspb.Message {
 export namespace PrebuildInitializer {
     export type AsObject = {
         prebuild?: SnapshotInitializer.AsObject,
-        git?: GitInitializer.AsObject,
+        gitList: Array<GitInitializer.AsObject>,
     }
 }
 
 export class FromBackupInitializer extends jspb.Message {
+    getCheckoutLocation(): string;
+    setCheckoutLocation(value: string): FromBackupInitializer;
+    getFromVolumeSnapshot(): boolean;
+    setFromVolumeSnapshot(value: boolean): FromBackupInitializer;
 
     serializeBinary(): Uint8Array;
     toObject(includeInstance?: boolean): FromBackupInitializer.AsObject;
@@ -312,6 +321,8 @@ export class FromBackupInitializer extends jspb.Message {
 
 export namespace FromBackupInitializer {
     export type AsObject = {
+        checkoutLocation: string,
+        fromVolumeSnapshot: boolean,
     }
 }
 

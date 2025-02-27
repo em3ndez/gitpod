@@ -1,6 +1,10 @@
 {
   "compilerOptions": {
-    "target": "es5",
+    "incremental": true,
+    "paths": {
+      "@podkit/*": ["./src/components/podkit/*"]
+    },
+    "target": "es6",
     "lib": [
       "dom",
       "dom.iterable",
@@ -13,14 +17,15 @@
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
+    "noUnusedLocals": false,
     "module": "esnext",
     "moduleResolution": "node",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "downlevelIteration": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "useUnknownInCatchVariables": false
   },
   "include": [
     "src",
